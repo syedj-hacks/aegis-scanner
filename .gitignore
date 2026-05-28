@@ -8,3 +8,4 @@ __pycache__/
 *.json
 .DS_Store
 modules/utils/config.py
+venv/
