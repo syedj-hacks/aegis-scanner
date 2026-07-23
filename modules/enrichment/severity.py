@@ -128,6 +128,52 @@ _PORT_SEVERITY = {
 }
 _DEFAULT_PORT_SEVERITY = "LOW"
 
+# Fallback by nmap service name, for the same services running on a
+# non-standard port (Metasploitable, for instance, runs a second FTP on
+# 2121 and IRC on 6697). Without this a relocated telnet/VNC/database
+# would be graded LOW purely because of its port number.
+_SERVICE_SEVERITY = {
+    "ftp": "HIGH",
+    "ftp-data": "HIGH",
+    "telnet": "HIGH",
+    "tftp": "HIGH",
+    "rexec": "HIGH",
+    "rlogin": "HIGH",
+    "shell": "HIGH",
+    "exec": "HIGH",
+    "login": "HIGH",
+    "microsoft-ds": "HIGH",
+    "netbios-ssn": "HIGH",
+    "msrpc": "HIGH",
+    "rpcbind": "HIGH",
+    "nfs": "HIGH",
+    "mysql": "HIGH",
+    "postgresql": "HIGH",
+    "ms-sql-s": "HIGH",
+    "oracle": "HIGH",
+    "mongodb": "HIGH",
+    "redis": "HIGH",
+    "elasticsearch": "HIGH",
+    "vnc": "HIGH",
+    "vnc-http": "HIGH",
+    "ms-wbt-server": "HIGH",
+    "x11": "HIGH",
+    "java-rmi": "HIGH",
+    "rmiregistry": "HIGH",
+    "ajp13": "HIGH",
+    "irc": "HIGH",
+    "ircd": "HIGH",
+    "bindshell": "HIGH",
+    "ingreslock": "HIGH",
+    "smtp": "MEDIUM",
+    "pop3": "MEDIUM",
+    "imap": "MEDIUM",
+    "domain": "MEDIUM",
+    "http": "MEDIUM",
+    "http-alt": "MEDIUM",
+    "http-proxy": "MEDIUM",
+}
+
 # Nikto emits free text, so it is graded by keyword. First match wins, so
 # the list is ordered worst-first.
 _NIKTO_KEYWORDS = [
@@ -307,8 +353,13 @@ def _heuristic_severity(finding: dict, kind: str) -> str:
         try:
             port = int(finding.get("port"))
         except (TypeError, ValueError):
-            return _DEFAULT_PORT_SEVERITY
-        return _PORT_SEVERITY.get(port, _DEFAULT_PORT_SEVERITY)
+            port = None
+        if port in _PORT_SEVERITY:
+            return _PORT_SEVERITY[port]
+        # Same service on a non-standard port still carries the same
+        # exposure — grade it by name before falling back to the floor.
+        service = str(finding.get("service") or "").strip().lower()
+        return _SERVICE_SEVERITY.get(service, _DEFAULT_PORT_SEVERITY)
 
     if kind == "cve":
         # A CVE with no score at all: NVD has published it but not yet

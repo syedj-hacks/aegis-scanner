@@ -275,9 +275,15 @@ def _extract_references(cve: dict) -> list:
     return refs
 
 
-def _parse_cves(payload) -> list:
+def _parse_cves(payload, product: str = "", version=None) -> list:
     """
     Turn an NVD 2.0 response body into this module's clean CVE dicts.
+
+    The product/version that produced the match are stamped onto every CVE
+    so a single CVE dict stands on its own downstream: severity.py and
+    remediation.py can name the affected software, and database/db.py's
+    findings row (service, version, cve_id, cvss, severity) can be filled
+    without carrying the parent result around.
 
     Sorted worst-first so a caller that only shows the top few gets the
     ones that matter; unscored CVEs sort last.
@@ -293,6 +299,8 @@ def _parse_cves(payload) -> list:
 
         cves.append({
             "cve_id": cve_id,
+            "product": product,
+            "version": version,
             "description": _extract_description(cve),
             "cvss_score": score,
             "cvss_severity": severity,
@@ -324,10 +332,13 @@ def lookup_cves(product, version=None, target: str = "nvd",
     dict:
         product : str
         version : str | None
-        cves    : list[dict]  {cve_id, description, cvss_score,
-                               cvss_severity, cvss_version, published_date,
+        cves    : list[dict]  {cve_id, product, version, description,
+                               cvss_score, cvss_severity, cvss_version,
+                               published_date,
                                references[{url, source, tags}]}
-                              sorted highest CVSS first
+                              sorted highest CVSS first; product/version are
+                              echoed onto each CVE so it stands alone
+                              downstream
         source  : str         always "nvd"
         error   : str | None  human-readable failure reason, if any
 
@@ -416,7 +427,7 @@ def lookup_cves(product, version=None, target: str = "nvd",
         print_error(f"[CVE] NVD lookup failed for '{keyword}': {err}")
         return result
 
-    result["cves"] = _parse_cves(data.get("json"))
+    result["cves"] = _parse_cves(data.get("json"), result["product"], result["version"])
     log_tool_success(target, "nvd-cve-lookup")
 
     if not result["cves"]:
