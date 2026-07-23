@@ -40,7 +40,9 @@ _DEFAULT_WORDLISTS = [
 
 # -q  : suppress banner/noise so only result lines reach stdout
 # --np: no progress meter (it would otherwise pollute captured output)
-# -k  : skip TLS validation; test targets use self-signed certs
+# -t  : threads
+# (-k, to skip TLS validation on self-signed test certs, is appended only
+#  when use_https is set)
 _GOBUSTER_BASE_ARGS = ["-q", "--np", "-t", "30"]
 
 # Matches gobuster's result lines, e.g.

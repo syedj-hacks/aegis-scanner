@@ -54,9 +54,15 @@ _METADATA_PREFIXES = (
     "No CGI Directories",
 )
 
-# "+ 1 host(s) tested" and similar trailers.
+# Trailer lines that carry a leading count instead of a fixed prefix:
+#   "+ 1 host(s) tested"
+#   "+ 8877 requests: 2 errors and 25 items reported on the remote host"
+# The second form is how nikto 2.6 ends a scan that ran to completion;
+# a scan cut short by -maxtime ends with "Scan terminated:" instead, so
+# both spellings have to be filtered.
 _METADATA_PATTERNS = (
     re.compile(r"^\d+\s+host\(s\)\s+tested", re.IGNORECASE),
+    re.compile(r"^\d+\s+requests?:", re.IGNORECASE),
     re.compile(r"^ERROR:", re.IGNORECASE),
 )
 
