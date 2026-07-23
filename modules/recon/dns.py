@@ -12,7 +12,7 @@ import re
 import socket
 
 from modules.utils.error_handler import run_tool
-from modules.utils.logger import get_logger
+from modules.utils.logger import log_tool_start, log_tool_success, log_tool_failure, log_finding
 from modules.utils.display import print_info, print_success, print_warning, print_error, print_panel
 
 _ADDRESS_LINE = re.compile(r"^Address:\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})", re.MULTILINE)
@@ -73,8 +73,7 @@ def resolve_dns(target: str) -> dict:
         raw_output   : str   raw nslookup stdout, kept for debugging/logging
         error        : str | None
     """
-    logger = get_logger(target)
-    logger.log_tool_start("dns_resolve", target)
+    log_tool_start(target, "dns_resolve")
 
     result = {
         "target": target,
@@ -94,15 +93,16 @@ def resolve_dns(target: str) -> dict:
             result["resolved"] = True
             result["ip_addresses"] = ips
             result["method"] = "nslookup"
-            logger.log_tool_success("dns_resolve", f"{len(ips)} address(es) via nslookup")
+            log_tool_success(target, "dns_resolve", tool_result.get("duration"))
+            log_finding(target, {"type": "dns_resolution", "method": "nslookup", "ip_addresses": ips})
             print_success(f"[DNS] {target} -> {', '.join(ips)} (nslookup)")
             return result
 
-        logger.log_tool_failure("dns_resolve", "nslookup succeeded but returned no parsable addresses")
+        log_tool_failure(target, "dns_resolve", "nslookup succeeded but returned no parsable addresses")
         print_warning(f"[DNS] nslookup ran but returned nothing usable for {target}, falling back to socket")
     else:
         err = tool_result.get("error") or tool_result.get("stderr") or "nslookup failed"
-        logger.log_tool_failure("dns_resolve", err)
+        log_tool_failure(target, "dns_resolve", err)
         print_warning(f"[DNS] nslookup failed for {target} ({err}), falling back to socket resolution")
 
     # --- Fallback: socket.gethostbyname ---
@@ -111,13 +111,14 @@ def resolve_dns(target: str) -> dict:
         result["resolved"] = True
         result["ip_addresses"] = [ip]
         result["method"] = "socket"
-        logger.log_tool_success("dns_resolve", f"resolved via socket fallback: {ip}")
+        log_tool_success(target, "dns_resolve")
+        log_finding(target, {"type": "dns_resolution", "method": "socket", "ip_addresses": [ip]})
         print_success(f"[DNS] {target} -> {ip} (socket fallback)")
     except socket.gaierror as exc:
         result["resolved"] = False
         result["method"] = "failed"
         result["error"] = str(exc)
-        logger.log_tool_failure("dns_resolve", str(exc))
+        log_tool_failure(target, "dns_resolve", str(exc))
         print_error(f"[DNS] Could not resolve {target}: {exc}")
 
     return result
