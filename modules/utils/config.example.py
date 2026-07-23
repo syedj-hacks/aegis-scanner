@@ -6,10 +6,12 @@ a real API key.
 Setup (every teammate, once, after cloning):
 
     cp modules/utils/config.example.py modules/utils/config.py
+    echo "AEGIS_NVD_API_KEY=<your-key>" >> .env && chmod 600 .env
 
-then either export NVD_API_KEY in your shell / .env, or paste your key as
-the fallback in NVD_API_KEY below. Nothing imports this file directly —
-the rest of the framework imports modules.utils.config.
+The key belongs in the gitignored .env at the repo root (or a shell
+export) — never pasted into a source file, where one `git add -f` or one
+screen share discloses it. Nothing imports this file directly; the rest of
+the framework imports modules.utils.config.
 
 Keep this file in sync when you add a config key, otherwise teammates get
 an AttributeError on a key they never knew existed.
@@ -17,12 +19,44 @@ an AttributeError on a key they never knew existed.
 
 import os
 
+# ---- .env loading ----
+# Parsed with the stdlib so no new dependency is needed. A real shell
+# export always wins over .env; a missing .env is a normal state.
+_ENV_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    ".env",
+)
+
+
+def _load_dotenv(path: str = _ENV_PATH):
+    """Populate os.environ from a KEY=value file, overriding nothing."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return
+
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv()
+
 # ---- NVD API ----
 # Get a free key at https://nvd.nist.gov/developers/request-an-api-key
 # Raises rate limit from 5 req/30s (no key) to 50 req/30s (with key)
-# NEVER commit a real key here — this file IS tracked. Put it in your
-# gitignored config.py or in the NVD_API_KEY environment variable.
-NVD_API_KEY = os.environ.get("NVD_API_KEY", "")
+# Set AEGIS_NVD_API_KEY in .env or your shell. NVD_API_KEY is accepted as
+# a legacy alias so older local setups keep working. NEVER paste a real
+# key here — this file IS tracked. An empty key degrades gracefully: the
+# scan just uses the slower anonymous rate limit.
+NVD_API_KEY = os.environ.get("AEGIS_NVD_API_KEY") or os.environ.get("NVD_API_KEY", "")
 NVD_BASE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 NVD_RATE_LIMIT_WINDOW = 30          # seconds
 NVD_RATE_LIMIT_REQUESTS = 50 if NVD_API_KEY else 5
