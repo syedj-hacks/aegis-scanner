@@ -23,10 +23,13 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(REPO_ROOT, ".env")
 
 # import name -> requirements.txt entry, so a failure names the pip package.
+# Note: requirements.txt also lists python-nmap, but no module in this
+# codebase actually imports it (port_scanner.py/service_detect.py shell out
+# to the nmap binary and parse its XML output with the stdlib) — checking
+# for it here would flag a false failure, so it's deliberately omitted.
 REQUIRED_MODULES = {
     "rich": "rich",
     "requests": "requests",
-    "nmap": "python-nmap",
     "scapy": "scapy",
     "weasyprint": "weasyprint",
 }
