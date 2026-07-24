@@ -1,0 +1,185 @@
+================================================================================
+ AEGIS SCANNER — COMMAND REFERENCE
+ Cyber404 Academy 2026
+================================================================================
+Run everything from the repo root (aegis-scanner/). All relative paths
+(output/, database/aegis.db, .env) resolve from there.
+
+LEGAL: only run this against targets you own or have explicit written authorization
+to test -- this now includes sqlmap (SQL injection probing), hydra (credential
+brute-forcing), and wpscan/enum4linux, which are more intrusive than the original
+recon/scan/audit toolset and can trip IDS/WAF alerts or lock out accounts.
+
+
+--------------------------------------------------------------------------------
+ 1. INSTALL / SETUP
+--------------------------------------------------------------------------------
+
+  git clone https://github.com/syedj-hacks/aegis-scanner.git
+  cd aegis-scanner
+  chmod +x install.sh
+  ./install.sh
+  source venv/bin/activate
+
+  # install.sh does, in order:
+  #   1. apt install bind9-dnsutils nmap nikto gobuster subfinder amass theharvester dirb
+  #                   whatweb nuclei zaproxy sslyze wpscan sqlmap hydra enum4linux
+  #   2. apt install python3-venv python3-pip libpango-1.0-0 libpangocairo-1.0-0
+  #                   libcairo2 libgdk-pixbuf-2.0-0   (WeasyPrint's native PDF libs)
+  #   3. python3 -m venv venv
+  #   4. pip install -r requirements.txt
+  #   5. python3 setup.py   (checks deps, creates output/ + database/, copies
+  #                           config.example.py -> config.py automatically, offers an
+  #                           optional personal AEGIS_NVD_API_KEY prompt written to .env
+  #                           -- a shared default key already ships in config.example.py,
+  #                           so this step can be skipped safely)
+
+  # Re-run setup only (skip apt/venv, e.g. after editing .env by hand):
+  python3 setup.py
+
+  # Manual config template copy (setup.py now does this automatically on first run --
+  # only needed if you deleted modules/utils/config.py and want to recreate it by hand;
+  # it's gitignored on purpose):
+  cp modules/utils/config.example.py modules/utils/config.py
+
+  # ZAP note: the apt zaproxy package installs the full ZAP app. If zap-baseline.py
+  # isn't on PATH after install, it ships inside the ZAP install dir -- add it to PATH
+  # or symlink it manually.
+
+
+--------------------------------------------------------------------------------
+ 2. RUNNING A SCAN (main entry point)
+--------------------------------------------------------------------------------
+
+  python3 aegis.py [target] [--profile PROFILE] [-v | --verbose] [--version] [-h | --help]
+
+  # target        hostname or IP address (validated before anything runs); now OPTIONAL --
+  #               omit it entirely and you'll be interactively prompted for one, then for
+  #               a profile from a numbered menu (defaults to quickscan on empty input)
+  # --profile     quickscan (default) | stealthscan | webaudit | deepscan | compliance
+  #               omitting this with a target given still silently defaults to quickscan
+  #               (unchanged behavior); the profile menu only appears in interactive mode
+  # -v/--verbose  prints the resolved tool list + nmap_args for the chosen profile
+  # --version     prints "Aegis Scanner 1.0.0" and exits
+  # -h/--help     full usage + profile table
+
+Examples:
+
+  python3 aegis.py 192.168.56.101 --profile deepscan
+  python3 aegis.py scanme.nmap.org --profile quickscan
+  python3 aegis.py example.com --profile webaudit -v
+  python3 aegis.py 10.0.0.5 --profile stealthscan
+  python3 aegis.py example.com --profile compliance
+  python3 aegis.py                                      # interactive: prompts for target + profile
+
+
+--------------------------------------------------------------------------------
+ 3. PER-PROFILE DIRECT INVOCATION (bypasses the CLI, useful for debugging one
+    profile in isolation — each profile module is independently runnable)
+--------------------------------------------------------------------------------
+
+  python3 -m modules.profiles.quickscan   <target>
+  python3 -m modules.profiles.stealth     <target>
+  python3 -m modules.profiles.webaudit    <target>
+  python3 -m modules.profiles.deepscan    <target>
+  python3 -m modules.profiles.compliance  <target>
+
+
+--------------------------------------------------------------------------------
+ 4. INDIVIDUAL MODULE TESTING (import + call from a Python shell / script;
+    every module function returns a dict and never raises)
+--------------------------------------------------------------------------------
+
+  # Recon
+  python3 -c "from modules.recon.dns import resolve_dns; print(resolve_dns('example.com'))"
+  python3 -c "from modules.recon.subdomain import enumerate_subdomains; print(enumerate_subdomains('example.com'))"
+  python3 -c "from modules.recon.osint import harvest_osint; print(harvest_osint('example.com'))"
+
+  # Scanning
+  python3 -c "from modules.scanning.port_scanner import scan_ports; print(scan_ports('scanme.nmap.org', profile='quickscan'))"
+  python3 -c "from modules.scanning.service_detect import detect_services; print(detect_services('scanme.nmap.org', [22, 80]))"
+  python3 -c "from modules.scanning.banner import grab_banners; print(grab_banners('scanme.nmap.org', [22, 80]))"
+  python3 -c "from modules.scanning.enum4linux_wrap import run_enum4linux; print(run_enum4linux('scanme.nmap.org'))"
+  python3 -c "from modules.scanning.hydra_wrap import run_hydra; print(run_hydra('scanme.nmap.org', 'ssh', port=22))"
+
+  # Web
+  python3 -c "from modules.web.header_check import check_headers; print(check_headers('example.com', port=80))"
+  python3 -c "from modules.web.nikto_wrap import run_nikto; print(run_nikto('example.com', port=80))"
+  python3 -c "from modules.web.gobuster_wrap import run_gobuster; print(run_gobuster('example.com', port=80))"
+  python3 -c "from modules.web.dirb_wrap import run_dirb; print(run_dirb('example.com', port=80))"
+  python3 -c "from modules.web.whatweb_wrap import run_whatweb; print(run_whatweb('example.com', port=80))"
+  python3 -c "from modules.web.nuclei_wrap import run_nuclei; print(run_nuclei('example.com', port=80, severity=['critical','high']))"
+  python3 -c "from modules.web.sslyze_wrap import run_sslyze; print(run_sslyze('example.com', port=443))"
+  python3 -c "from modules.web.wpscan_wrap import run_wpscan; print(run_wpscan('example.com', port=80))"
+  python3 -c "from modules.web.sqlmap_wrap import run_sqlmap; print(run_sqlmap('example.com', 'http://example.com/page.php?id=1'))"
+  python3 -c "from modules.web.zap_wrap import run_zap_baseline; print(run_zap_baseline('example.com', port=80))"
+
+  # Enrichment
+  python3 -c "from modules.enrichment.cve_lookup import lookup_cves; print(lookup_cves('nginx', '1.18.0'))"
+  python3 -c "from modules.enrichment.severity import score_finding; print(score_finding({'cve_id':'CVE-2021-1234','cvss':9.1}))"
+  python3 -c "from modules.enrichment.remediation import get_remediation; print(get_remediation({'cve_id':'CVE-2021-1234'}))"
+
+  # Reporting
+  python3 -c "from modules.reporting.summary import build_summary; print(build_summary(1))"
+  python3 -c "from modules.reporting.report_txt import generate_txt_report; print(generate_txt_report(1))"
+  python3 -c "from modules.reporting.report_pdf import generate_pdf_report; print(generate_pdf_report(1))"
+
+
+--------------------------------------------------------------------------------
+ 5. DATABASE (SQLite at database/aegis.db)
+--------------------------------------------------------------------------------
+
+  # Open a shell on the scan database directly
+  sqlite3 database/aegis.db
+
+  # Useful queries once inside sqlite3:
+  .tables
+  .schema scans
+  .schema findings
+  SELECT * FROM scans ORDER BY timestamp DESC LIMIT 10;
+  SELECT * FROM findings WHERE scan_id = 1;
+  SELECT id, target, profile, timestamp FROM scans WHERE target = 'example.com';
+
+  # From Python instead of the sqlite3 CLI:
+  python3 -c "from database.db import get_scan_history; print(get_scan_history())"
+  python3 -c "from database.db import get_scan_history; print(get_scan_history('example.com'))"
+  python3 -c "from database.db import get_findings_for_scan; print(get_findings_for_scan(1))"
+  python3 -c "from database.db import get_latest_scan; print(get_latest_scan('example.com'))"
+  python3 -c "from database.db import init_db; init_db()"   # re-create tables if missing
+
+
+--------------------------------------------------------------------------------
+ 6. LOGS & OUTPUT
+--------------------------------------------------------------------------------
+
+  # Every target gets its own output directory:
+  #   output/<target>/scan_errors.log   — per-target tool/scan error log
+  #   output/<target>/report.txt        — plain-text report (all profiles)
+  #   output/<target>/report.pdf        — PDF report (deepscan only)
+
+  tail -f output/<target>/scan_errors.log      # watch a scan's errors live
+  cat   output/<target>/report.txt             # read the last text report
+  xdg-open output/<target>/report.pdf          # open the PDF report (Linux)
+
+
+--------------------------------------------------------------------------------
+ 7. ENVIRONMENT / CONFIG
+--------------------------------------------------------------------------------
+
+  # .env at repo root (gitignored) — only real secret is the NVD API key:
+  echo "AEGIS_NVD_API_KEY=<your-key-here>" >> .env
+
+  # Get a free NVD key (raises CVE lookup rate limit 5 req/30s -> 50 req/30s):
+  #   https://nvd.nist.gov/developers/request-an-api-key
+
+  # A real shell export always overrides .env:
+  export AEGIS_NVD_API_KEY=<your-key-here>
+  python3 aegis.py example.com --profile deepscan
+
+
+--------------------------------------------------------------------------------
+ 8. DEACTIVATE / RE-ENTER THE VENV
+--------------------------------------------------------------------------------
+
+  deactivate                 # leave the venv
+  source venv/bin/activate   # re-enter it in a new shell session
