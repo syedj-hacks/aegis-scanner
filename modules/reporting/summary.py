@@ -109,14 +109,17 @@ def _enrich(finding: dict) -> dict:
 
     Returns a shallow copy — the row dict db.py handed over is never
     mutated. Severity is normalised (not regraded); description and
-    remediation are derived. See the module docstring for why those two
-    choices differ.
+    remediation prefer the stored columns (populated at insert time since
+    the description/remediation/finding_type migration) and fall back to
+    the derived text below only for rows written before that migration,
+    where those columns are NULL. See the module docstring for why
+    severity is trusted rather than regraded.
     """
     enriched = dict(finding)
     enriched["severity"] = normalise_severity(finding.get("severity"))
     enriched["severity_source"] = "cvss" if finding.get("cvss") is not None else "heuristic"
-    enriched["description"] = _describe(finding)
-    enriched["remediation"] = remediation_text(enriched)
+    enriched["description"] = finding.get("description") or _describe(finding)
+    enriched["remediation"] = finding.get("remediation") or remediation_text(enriched)
     return enriched
 
 

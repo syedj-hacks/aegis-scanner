@@ -21,8 +21,24 @@ VENV_DIR="$REPO_ROOT/venv"
 #   gobuster                      modules/web/gobuster_wrap.py
 #   subfinder, amass              modules/recon/subdomain.py
 #   theharvester                  modules/recon/osint.py
-#   dirb                          provides /usr/share/wordlists/dirb/common.txt (gobuster_wrap.py default wordlist)
-SCAN_TOOLS=(bind9-dnsutils nmap nikto gobuster subfinder amass theharvester dirb)
+#   dirb                          modules/web/dirb_wrap.py (also provides
+#                                 /usr/share/wordlists/dirb/common.txt, gobuster_wrap.py's
+#                                 default wordlist)
+#   whatweb                       modules/web/whatweb_wrap.py
+#   nuclei                        modules/web/nuclei_wrap.py
+#   zaproxy                       modules/web/zap_wrap.py — apt's zaproxy package ships the
+#                                 ZAP daemon/GUI; if zap-baseline.py isn't on PATH after
+#                                 install, grab it from the ZAP install itself
+#                                 (see https://www.zaproxy.org/docs/docker/baseline-scan/)
+#   sslyze                        modules/web/sslyze_wrap.py
+#   wpscan                        modules/web/wpscan_wrap.py
+#   sqlmap                        modules/web/sqlmap_wrap.py
+#   hydra                         modules/scanning/hydra_wrap.py
+#   enum4linux                    modules/scanning/enum4linux_wrap.py
+SCAN_TOOLS=(
+    bind9-dnsutils nmap nikto gobuster subfinder amass theharvester dirb
+    whatweb nuclei zaproxy sslyze wpscan sqlmap hydra enum4linux
+)
 
 # Python environment + WeasyPrint's native Pango/Cairo/GDK-Pixbuf bindings
 # (report_pdf.py imports weasyprint lazily specifically because these can

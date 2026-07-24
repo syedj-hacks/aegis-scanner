@@ -16,6 +16,8 @@ import re
 import sys
 import time
 
+from rich.prompt import Prompt
+
 from modules.utils.config import PROFILES, get_profile
 from modules.utils.display import (
     print_banner, print_panel, print_info, print_success,
@@ -88,12 +90,16 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=_build_epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("target", help="target hostname or IP address to scan")
+    parser.add_argument(
+        "target", nargs="?", default=None,
+        help="target hostname or IP address to scan (omit to be prompted)",
+    )
     parser.add_argument(
         "--profile",
         choices=sorted(PROFILES.keys()),
-        default="quickscan",
-        help="scan profile to run (default: quickscan)",
+        default=None,
+        help="scan profile to run (default: quickscan; omit to be prompted "
+             "when target is also omitted)",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -120,11 +126,76 @@ def _normalize_result(result):
     return scan_id, [p for p in paths if p]
 
 
+def _prompt_target() -> str:
+    """
+    Interactively prompt for a target, re-prompting on invalid input instead
+    of exiting. Only called when no target was supplied on the command line.
+    """
+    while True:
+        try:
+            candidate = Prompt.ask("[bold]Enter target (hostname/IP)[/bold]").strip()
+        except (EOFError, KeyboardInterrupt):
+            print_warning("No target provided — exiting.")
+            sys.exit(130)
+
+        if is_valid_target(candidate):
+            return candidate
+
+        print_error(
+            f"'{candidate}' is not a valid hostname or IP address — "
+            "check for typos (e.g. double dots, invalid characters)."
+        )
+
+
+def _prompt_profile() -> str:
+    """
+    Show a numbered menu of every profile in config.PROFILES and prompt for
+    a selection (by number or name), defaulting to quickscan. Only called
+    when no --profile was supplied on the command line.
+    """
+    names = sorted(PROFILES.keys())
+    default_name = "quickscan" if "quickscan" in names else names[0]
+
+    menu_lines = [
+        f"  [bold]{i}[/bold]. {name:<12} {PROFILE_DESCRIPTIONS.get(name, '')}"
+        for i, name in enumerate(names, start=1)
+    ]
+    print_panel("\n".join(menu_lines), title="Select a Scan Profile", style="cyan")
+
+    while True:
+        try:
+            choice = Prompt.ask(
+                "[bold]Profile[/bold] (number or name)", default=default_name
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print_warning(f"No selection made — defaulting to '{default_name}'.")
+            return default_name
+
+        if choice in PROFILES:
+            return choice
+        if choice.isdigit():
+            index = int(choice) - 1
+            if 0 <= index < len(names):
+                return names[index]
+
+        print_error(f"'{choice}' is not a valid profile — enter a number 1-{len(names)} or a profile name.")
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
     print_banner(f"AEGIS SCANNER v{__version__}")
+
+    # Interactive mode is gated on the target being absent from argv — a
+    # bare `python3 aegis.py` invocation. `python3 aegis.py <target>` (no
+    # --profile) must keep defaulting to quickscan silently, exactly as
+    # before, so the profile menu is never shown unless the target was also
+    # missing (full backward compatibility for every other invocation shape).
+    interactive = args.target is None
+
+    if interactive:
+        args.target = _prompt_target()
 
     if not is_valid_target(args.target):
         print_error(
@@ -132,6 +203,9 @@ def main() -> int:
             "check for typos (e.g. double dots, invalid characters)."
         )
         return 1
+
+    if args.profile is None:
+        args.profile = _prompt_profile() if interactive else "quickscan"
 
     print_panel(
         f"[bold]Target:[/bold]  {args.target}\n"

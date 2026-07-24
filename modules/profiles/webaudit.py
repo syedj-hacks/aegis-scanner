@@ -4,16 +4,17 @@ Webaudit profile orchestrator for Aegis Scanner (Phase 8 - profiles layer).
 
 Web-focused profile: DNS resolution, a port scan restricted to web ports
 (PROFILES['webaudit']['nmap_args'] already scopes nmap to 80,443,8080,8443),
-the full web module (header audit, nikto, gobuster) against whatever of
-those ports came back open, CVE lookup + severity + remediation on the web
-findings only, and a text report.
+the full web module (header audit, nikto, gobuster, dirb, whatweb, sslyze,
+banner grabbing) against whatever of those ports came back open, CVE lookup
++ severity + remediation on the web findings, and a text report.
 
 Wrapper availability
 ---------------------
-PROFILES['webaudit']['tools'] also lists whatweb and zaproxy, which have no
-wrapper module anywhere in this codebase (only nslookup, nmap, nikto and
-gobuster do). Rather than invent a stub call, this profile logs a clear
-warning for each configured tool it cannot actually run.
+PROFILES['webaudit']['tools'] also lists zaproxy, which has a wrapper
+(modules/web/zap_wrap.py) but is deliberately not run in this profile — it
+is wired into deepscan only, per the deepscan/webaudit/compliance tool
+split (a full ZAP baseline scan is heavier than webaudit's fast-audit
+scope). It is still logged as skipped here rather than silently omitted.
 """
 
 from modules.utils.config import get_profile
@@ -23,9 +24,13 @@ from modules.utils.display import (
 from modules.utils.logger import log_scan_start, log_scan_end, log_tool_failure
 from modules.recon.dns import resolve_dns
 from modules.scanning.port_scanner import scan_ports
+from modules.scanning.banner import grab_banners
 from modules.web.header_check import check_headers
 from modules.web.nikto_wrap import run_nikto
 from modules.web.gobuster_wrap import run_gobuster
+from modules.web.dirb_wrap import run_dirb
+from modules.web.whatweb_wrap import run_whatweb
+from modules.web.sslyze_wrap import run_sslyze
 from modules.enrichment.cve_lookup import lookup_cves
 from modules.enrichment.severity import score_finding
 from modules.enrichment.remediation import get_remediation
@@ -34,7 +39,7 @@ from modules.reporting.report_txt import generate_txt_report
 
 PROFILE_NAME = "webaudit"
 
-_AVAILABLE_TOOLS = {"nslookup", "nmap", "nikto", "gobuster"}
+_AVAILABLE_TOOLS = {"nslookup", "nmap", "nikto", "gobuster", "dirb", "whatweb", "sslyze", "banner_grab"}
 
 _HTTPS_PORTS = (443, 8443)
 
@@ -79,18 +84,23 @@ def _findings_from_cves(cves: list, port, service_name: str) -> list:
 def _findings_from_headers(header_result: dict) -> list:
     port = header_result.get("port")
     findings = [
-        {"type": "missing_security_header", "port": port, "header": name}
+        {
+            "type": "missing_security_header", "port": port, "header": name,
+            "description": f"Missing security header: {name}",
+        }
         for name in header_result.get("missing_headers") or []
     ]
     if header_result.get("server_banner"):
         findings.append({
             "type": "fingerprint_header", "port": port,
             "header": "Server", "value": header_result["server_banner"],
+            "description": f"Server header discloses: {header_result['server_banner']}",
         })
     if header_result.get("powered_by"):
         findings.append({
             "type": "fingerprint_header", "port": port,
             "header": "X-Powered-By", "value": header_result["powered_by"],
+            "description": f"X-Powered-By header discloses: {header_result['powered_by']}",
         })
     return findings
 
@@ -107,13 +117,68 @@ def _findings_from_nikto(nikto_result: dict) -> list:
 def _findings_from_gobuster(gobuster_result: dict) -> list:
     port = gobuster_result.get("port")
     findings = [
-        {"type": "discovered_path", "port": port,
-         "path": entry["path"], "status_code": entry["status_code"]}
+        {
+            "type": "discovered_path", "port": port,
+            "path": entry["path"], "status_code": entry["status_code"],
+            "description": f"Discovered path {entry['path']} (HTTP {entry['status_code']})",
+        }
         for entry in gobuster_result.get("discovered_paths") or []
     ]
     if gobuster_result.get("wordpress_fingerprinted"):
-        findings.append({"type": "wordpress_fingerprinted", "port": port})
+        findings.append({
+            "type": "wordpress_fingerprinted", "port": port,
+            "description": "WordPress installation fingerprinted via /wp-* marker path(s)",
+        })
     return findings
+
+
+def _findings_from_dirb(dirb_result: dict) -> list:
+    port = dirb_result.get("port")
+    return [
+        {
+            "type": "discovered_path", "port": port,
+            "path": entry["path"], "status_code": entry["status_code"],
+            "description": f"Discovered path {entry['path']} (HTTP {entry['status_code']}, via dirb)",
+        }
+        for entry in dirb_result.get("discovered_paths") or []
+    ]
+
+
+def _findings_from_whatweb(whatweb_result: dict) -> list:
+    port = whatweb_result.get("port")
+    return [
+        {
+            "type": "technology_fingerprint", "port": port,
+            "name": tech["name"], "value": tech["value"],
+            "description": f"Technology fingerprinted: {tech['name']}"
+                            + (f" ({tech['value']})" if tech["value"] else ""),
+        }
+        for tech in whatweb_result.get("technologies") or []
+    ]
+
+
+def _findings_from_sslyze(sslyze_result: dict) -> list:
+    port = sslyze_result.get("port")
+    findings = []
+    for f in sslyze_result.get("findings") or []:
+        severity = "HIGH" if "legacy protocol" in f["issue"].lower() else "MEDIUM"
+        findings.append({
+            "type": "sslyze_finding", "port": port,
+            "issue": f["issue"], "severity": severity,
+            "description": f"{f['issue']}: {f['detail']}",
+        })
+    return findings
+
+
+def _findings_from_banners(banner_result: dict) -> list:
+    return [
+        {
+            "type": "banner", "port": b["port"], "banner_text": b["banner_text"],
+            "description": f"Service banner on port {b['port']}: {b['banner_text']}",
+        }
+        for b in banner_result.get("banners") or []
+        if b.get("banner_text")
+    ]
 
 
 def run_webaudit(target: str):
@@ -149,8 +214,15 @@ def run_webaudit(target: str):
         advance("Web port scan")
 
     header_results, nikto_results, gobuster_results = [], [], []
+    dirb_results, whatweb_results, sslyze_results = [], [], []
+    banner_result = {"banners": []}
+
     if open_ports:
-        with scan_progress_bar(len(open_ports) * 3, f"Web module: {target}") as advance:
+        ports = [p["port"] for p in open_ports]
+        banner_result = grab_banners(target, ports)
+        tool_results.append(banner_result)
+
+        with scan_progress_bar(len(open_ports) * 5, f"Web module: {target}") as advance:
             for port_entry in open_ports:
                 port = port_entry["port"]
                 use_https = _is_https_port(port_entry)
@@ -169,8 +241,25 @@ def run_webaudit(target: str):
                 tool_results.append(gobuster_result)
                 gobuster_results.append(gobuster_result)
                 advance(f"Gobuster :{port}")
+
+                dirb_result = run_dirb(target, port=port, use_https=use_https)
+                tool_results.append(dirb_result)
+                dirb_results.append(dirb_result)
+                advance(f"Dirb :{port}")
+
+                whatweb_result = run_whatweb(target, port=port, use_https=use_https)
+                tool_results.append(whatweb_result)
+                whatweb_results.append(whatweb_result)
+                advance(f"WhatWeb :{port}")
+
+                if use_https:
+                    sslyze_result = run_sslyze(target, port=port)
+                    tool_results.append(sslyze_result)
+                    sslyze_results.append(sslyze_result)
     else:
         print_info(f"[{PROFILE_NAME}] no web port open on {target} — web module skipped")
+
+    findings.extend(_score_and_remediate(_findings_from_banners(banner_result)))
 
     for header_result in header_results:
         findings.extend(_score_and_remediate(_findings_from_headers(header_result)))
@@ -186,6 +275,15 @@ def run_webaudit(target: str):
 
     for gobuster_result in gobuster_results:
         findings.extend(_score_and_remediate(_findings_from_gobuster(gobuster_result)))
+
+    for dirb_result in dirb_results:
+        findings.extend(_score_and_remediate(_findings_from_dirb(dirb_result)))
+
+    for whatweb_result in whatweb_results:
+        findings.extend(_score_and_remediate(_findings_from_whatweb(whatweb_result)))
+
+    for sslyze_result in sslyze_results:
+        findings.extend(_score_and_remediate(_findings_from_sslyze(sslyze_result)))
 
     insert_findings_bulk(scan_id, findings)
 

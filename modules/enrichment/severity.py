@@ -215,6 +215,17 @@ _PATH_KEYWORDS = [
 ]
 _DEFAULT_PATH_SEVERITY = "LOW"
 
+# nmap --script results (compliance profile's ssl-enum-ciphers/http-headers,
+# deepscan's -sC default scripts). Graded by keyword since script output is
+# free text; ssl-enum-ciphers naming legacy protocols/export-grade ciphers
+# is the clearest actionable signal available without a dedicated parser
+# for every script's output format.
+_NMAP_SCRIPT_KEYWORDS = [
+    ("HIGH", ("sslv2", "sslv3", "export", "null cipher", "anon")),
+    ("MEDIUM", ("tlsv1.0", "tls1.0", "tlsv1.1", "tls1.1", "rc4", "3des", "weak", "cbc")),
+]
+_DEFAULT_NMAP_SCRIPT_SEVERITY = "LOW"
+
 # A WordPress install is not itself a flaw, but it is a large plugin
 # attack surface and triggers wpscan (config.CONDITIONAL_TOOLS).
 _WORDPRESS_SEVERITY = "MEDIUM"
@@ -303,6 +314,8 @@ def _finding_type(finding: dict) -> str:
 
     if _has_cve(finding):
         return "cve"
+    if finding.get("script_id") is not None:
+        return "nmap_script"          # {port, script_id, output}
     if finding.get("header") or finding.get("missing_header"):
         return "missing_security_header"
     if finding.get("description") is not None and "reference" in finding:
@@ -338,6 +351,10 @@ def _heuristic_severity(finding: dict, kind: str) -> str:
     if kind == "wordpress_fingerprinted":
         return _WORDPRESS_SEVERITY
 
+    if kind == "nmap_script":
+        output = str(finding.get("output") or "")
+        return _match_keywords(output, _NMAP_SCRIPT_KEYWORDS) or _DEFAULT_NMAP_SCRIPT_SEVERITY
+
     if kind == "discovered_path":
         # Note: a 200 on a directory is NOT graded as directory indexing —
         # gobuster only reports that the path exists, not that an index was
@@ -346,7 +363,7 @@ def _heuristic_severity(finding: dict, kind: str) -> str:
         return _match_keywords(str(finding.get("path") or ""),
                                _PATH_KEYWORDS) or _DEFAULT_PATH_SEVERITY
 
-    if kind in ("banner", "fingerprint_header"):
+    if kind in ("banner", "fingerprint_header", "technology_fingerprint"):
         return _BANNER_SEVERITY
 
     if kind in ("open_port", "service_version"):

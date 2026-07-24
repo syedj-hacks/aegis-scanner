@@ -1,5 +1,4 @@
 rich
-python-nmap
 requests
 scapy
 weasyprint

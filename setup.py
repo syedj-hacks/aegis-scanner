@@ -17,10 +17,13 @@ layer exists (install-time, not the application), same as install.sh.
 
 import getpass
 import os
+import shutil
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(REPO_ROOT, ".env")
+CONFIG_PATH = os.path.join(REPO_ROOT, "modules", "utils", "config.py")
+CONFIG_EXAMPLE_PATH = os.path.join(REPO_ROOT, "modules", "utils", "config.example.py")
 
 # import name -> requirements.txt entry, so a failure names the pip package.
 # Note: requirements.txt also lists python-nmap, but no module in this
@@ -61,6 +64,19 @@ def _importable(module_name: str) -> bool:
         return False
 
 
+def ensure_local_config():
+    """
+    modules/utils/config.py is gitignored (it can carry a pasted API key),
+    so a fresh clone has no local config until it's copied from the
+    tracked config.example.py template. Never overwrites an existing one.
+    """
+    if os.path.isfile(CONFIG_PATH):
+        print("[+] modules/utils/config.py already present")
+        return
+    shutil.copyfile(CONFIG_EXAMPLE_PATH, CONFIG_PATH)
+    print("[+] Created modules/utils/config.py from config.example.py")
+
+
 def ensure_directories():
     for path in (os.path.join(REPO_ROOT, "output"), os.path.join(REPO_ROOT, "database")):
         os.makedirs(path, exist_ok=True)
@@ -88,26 +104,26 @@ def _write_env(values: dict):
 
 def ensure_env_key():
     """
-    Ensure .env carries AEGIS_NVD_API_KEY. Only ever reports whether a key
-    is present, never its value — matches config.py's own handling.
+    NVD_API_KEY already has a project-wide default baked into
+    config.example.py (copied to config.py by ensure_local_config()), so
+    no key is required to get CVE lookups working out of the box. This
+    only offers a personal override, and never blocks setup either way.
     """
     existing = _read_env()
 
     if existing.get("AEGIS_NVD_API_KEY") or os.environ.get("AEGIS_NVD_API_KEY"):
-        print("[+] AEGIS_NVD_API_KEY is configured")
+        print("[+] Personal AEGIS_NVD_API_KEY override is configured")
         return
 
-    print("[!] AEGIS_NVD_API_KEY is not set.")
-    print("    Get a free key at https://nvd.nist.gov/developers/request-an-api-key")
-    print("    Without one, CVE lookups fall back to NVD's slower anonymous rate limit (5 req/30s).")
+    print("[+] Using the project's shared NVD API key (baked into config.py)")
 
     if not sys.stdin.isatty():
-        print("    Non-interactive shell — add AEGIS_NVD_API_KEY=<key> to .env manually when ready.")
-        _write_env(existing)
         return
 
     try:
-        key = getpass.getpass("    Paste your NVD API key now (input hidden, or Enter to skip): ").strip()
+        key = getpass.getpass(
+            "    Optional: paste a personal NVD API key to use instead (input hidden, or Enter to skip): "
+        ).strip()
     except (EOFError, KeyboardInterrupt):
         key = ""
         print()
@@ -115,16 +131,14 @@ def ensure_env_key():
     if key:
         existing["AEGIS_NVD_API_KEY"] = key
         print("[+] AEGIS_NVD_API_KEY saved to .env")
-    else:
-        print("[!] Skipped — add AEGIS_NVD_API_KEY to .env later")
-
-    _write_env(existing)
+        _write_env(existing)
 
 
 def main():
     print("=== Aegis Scanner setup ===")
     ok = check_python_version()
     ok = check_dependencies() and ok
+    ensure_local_config()
     ensure_directories()
     ensure_env_key()
 

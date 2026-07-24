@@ -45,6 +45,18 @@ def init_db():
         )
     """)
 
+    # Migration: the findings table predates description/remediation/
+    # finding_type — add them as nullable columns so existing rows (this
+    # database file is tracked in git and ships with scan history already
+    # in it) stay valid with those fields simply NULL. ALTER TABLE ADD
+    # COLUMN is safe to re-run every process start: skipped once the column
+    # already exists.
+    cur.execute("PRAGMA table_info(findings)")
+    existing_columns = {row[1] for row in cur.fetchall()}
+    for column in ("description", "remediation", "finding_type"):
+        if column not in existing_columns:
+            cur.execute(f"ALTER TABLE findings ADD COLUMN {column} TEXT")
+
     conn.commit()
     conn.close()
 
@@ -65,14 +77,25 @@ def insert_scan(target: str, profile: str) -> int:
 
 def insert_finding(scan_id: int, finding: dict):
     """
-    finding: {port, service, version, cve_id, cvss, severity}
+    finding: {port, service, version, cve_id, cvss, severity, description,
+              remediation, type/finding_type}
+
+    description/remediation/finding_type are nullable — callers that still
+    hand over the old CVE-shaped dict (no description/remediation/type key)
+    insert cleanly with those columns left NULL, same as any pre-migration
+    row.
     """
+    finding_type = finding.get("type") or finding.get("finding_type")
+    if not finding_type and finding.get("cve_id"):
+        finding_type = "cve"
+
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """INSERT INTO findings
-           (scan_id, port, service, version, cve_id, cvss, severity)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+           (scan_id, port, service, version, cve_id, cvss, severity,
+            description, remediation, finding_type)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             scan_id,
             finding.get("port"),
@@ -81,6 +104,9 @@ def insert_finding(scan_id: int, finding: dict):
             finding.get("cve_id"),
             finding.get("cvss"),
             finding.get("severity"),
+            finding.get("description"),
+            finding.get("remediation"),
+            finding_type,
         ),
     )
     conn.commit()

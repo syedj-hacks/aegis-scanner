@@ -83,6 +83,61 @@ def _parse_nmap_xml(xml_text: str) -> list:
     return open_ports
 
 
+def _parse_nmap_scripts(xml_text: str) -> list:
+    """
+    Parse nmap XML (-oX) output for <script>/<hostscript> results — the
+    data --script runs (e.g. compliance's ssl-enum-ciphers, http-headers)
+    produce but scan_ports() previously discarded.
+
+    Returns a list of:
+        {port: int | None, protocol: str | None, script_id: str, output: str}
+
+    port/protocol are None for host-level scripts (<hostscript>, e.g.
+    scripts that don't target a specific port); per-port scripts carry the
+    port they ran against. Malformed/empty XML yields [] rather than
+    raising, same contract as _parse_nmap_xml.
+    """
+    scripts = []
+
+    if not xml_text or not xml_text.strip():
+        return scripts
+
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return scripts
+
+    for host in root.findall("host"):
+        hostscript_node = host.find("hostscript")
+        if hostscript_node is not None:
+            for script_el in hostscript_node.findall("script"):
+                scripts.append({
+                    "port": None,
+                    "protocol": None,
+                    "script_id": script_el.get("id", "unknown"),
+                    "output": (script_el.get("output") or "").strip(),
+                })
+
+        ports_node = host.find("ports")
+        if ports_node is None:
+            continue
+        for port_el in ports_node.findall("port"):
+            try:
+                port_num = int(port_el.get("portid", "0"))
+            except (TypeError, ValueError):
+                port_num = 0
+
+            for script_el in port_el.findall("script"):
+                scripts.append({
+                    "port": port_num,
+                    "protocol": port_el.get("protocol", "tcp"),
+                    "script_id": script_el.get("id", "unknown"),
+                    "output": (script_el.get("output") or "").strip(),
+                })
+
+    return scripts
+
+
 def scan_ports(target: str, profile: str = None) -> dict:
     """
     Scan `target` for open ports using nmap.
@@ -98,6 +153,10 @@ def scan_ports(target: str, profile: str = None) -> dict:
     dict:
         target        : str
         open_ports    : list[dict]  {port, protocol, service, state}
+        scripts       : list[dict]  {port, protocol, script_id, output} from
+                                    any --script results in the XML (e.g.
+                                    compliance's ssl-enum-ciphers/
+                                    http-headers); [] when no --script ran
         profile_used  : str | None  profile name actually applied, or None
         raw_output    : str         raw nmap XML stdout (for logging/debug)
         error         : str | None  human-readable failure reason, if any
@@ -107,6 +166,7 @@ def scan_ports(target: str, profile: str = None) -> dict:
     result = {
         "target": target,
         "open_ports": [],
+        "scripts": [],
         "profile_used": None,
         "raw_output": "",
         "error": None,
@@ -143,6 +203,9 @@ def scan_ports(target: str, profile: str = None) -> dict:
     open_ports = _parse_nmap_xml(result["raw_output"])
     result["open_ports"] = open_ports
 
+    scripts = _parse_nmap_scripts(result["raw_output"])
+    result["scripts"] = scripts
+
     if open_ports:
         log_tool_success(target, "nmap", tool_result.get("duration"))
         for p in open_ports:
@@ -159,6 +222,16 @@ def scan_ports(target: str, profile: str = None) -> dict:
         # nmap ran fine but nothing was open (host down, all filtered, etc.)
         log_tool_success(target, "nmap", tool_result.get("duration"))
         print_warning(f"[Ports] {target}: nmap completed but found no open ports")
+
+    if scripts:
+        for s in scripts:
+            log_finding(target, {
+                "type": "nmap_script",
+                "port": s["port"],
+                "script_id": s["script_id"],
+                "output": s["output"],
+            })
+        print_success(f"[Ports] {target}: {len(scripts)} nmap script result(s) captured")
 
     return result
 

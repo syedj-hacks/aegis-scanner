@@ -198,6 +198,24 @@ _WORDPRESS_REMEDIATION = (
     "ones; run wpscan against this install to enumerate vulnerable components."
 )
 
+# nmap --script results, keyed by script id.
+_NMAP_SCRIPT_REMEDIATION = {
+    "ssl-enum-ciphers": (
+        "Disable legacy TLS protocol versions and weak cipher suites "
+        "(SSLv2/SSLv3/TLS1.0/1.1, RC4/3DES/export/NULL/anonymous ciphers); "
+        "keep only TLS1.2+ with strong AEAD cipher suites."
+    ),
+    "http-headers": (
+        "Review the HTTP headers this script reported and align them with "
+        "the security-header baseline (Strict-Transport-Security, "
+        "Content-Security-Policy, X-Frame-Options, etc.)."
+    ),
+}
+_DEFAULT_NMAP_SCRIPT_REMEDIATION = (
+    "Review this nmap script's output and address any misconfiguration or "
+    "outdated software version it revealed."
+)
+
 _UNKNOWN_REMEDIATION = (
     "Review this finding manually — no automated remediation guidance is "
     "available for it."
@@ -297,6 +315,8 @@ def _finding_kind(finding: dict) -> str:
 
     if finding.get("cve_id") or finding.get("cves"):
         return "cve"
+    if finding.get("script_id") is not None:
+        return "nmap_script"
     if finding.get("header") or finding.get("missing_header"):
         return "missing_security_header"
     if finding.get("description") is not None and "reference" in finding:
@@ -338,12 +358,70 @@ def remediation_text(finding: dict) -> str:
     if kind == "wordpress_fingerprinted":
         return _WORDPRESS_REMEDIATION
 
+    if kind == "nmap_script":
+        script_id = str(finding.get("script_id") or "").strip().lower()
+        return _NMAP_SCRIPT_REMEDIATION.get(script_id, _DEFAULT_NMAP_SCRIPT_REMEDIATION)
+
     if kind == "discovered_path":
         return _match_table(str(finding.get("path") or ""),
                             _PATH_REMEDIATION) or _DEFAULT_PATH_REMEDIATION
 
-    if kind in ("banner", "fingerprint_header"):
+    if kind in ("banner", "fingerprint_header", "technology_fingerprint"):
         return _BANNER_REMEDIATION
+
+    if kind == "nuclei_finding":
+        reference = finding.get("reference") or ""
+        suffix = f" Reference: {reference}" if reference else ""
+        return (
+            f"Apply the fix for the matched nuclei template "
+            f"({finding.get('template_id') or 'see finding'}) — "
+            f"typically a version upgrade or configuration change.{suffix}"
+        )
+
+    if kind == "zap_finding":
+        return (
+            f"Review the ZAP baseline alert '{finding.get('name') or 'reported issue'}' "
+            "against OWASP guidance for that alert class and remediate the "
+            "underlying misconfiguration."
+        )
+
+    if kind == "sslyze_finding":
+        issue = str(finding.get("issue") or "")
+        if "legacy protocol" in issue.lower():
+            return _NMAP_SCRIPT_REMEDIATION["ssl-enum-ciphers"]
+        return (
+            "Remove the weak/export-grade cipher suite(s) sslyze reported from "
+            "the server's TLS configuration, keeping only strong AEAD ciphers."
+        )
+
+    if kind == "wpscan_finding":
+        reference = finding.get("reference") or ""
+        suffix = f" See: {reference}" if reference else ""
+        return (
+            f"Update {finding.get('component') or 'the affected WordPress component'} "
+            f"to a patched release.{suffix}"
+        )
+
+    if kind == "sqlmap_finding":
+        return (
+            f"Parameterise the '{finding.get('parameter') or 'affected'}' query "
+            "(prepared statements / an ORM) to eliminate this confirmed SQL "
+            "injection; deploy a WAF rule as an interim mitigation."
+        )
+
+    if kind == "weak_credentials":
+        return (
+            "Change this credential immediately, enforce a strong password "
+            "policy, and prefer key-based/MFA authentication over passwords "
+            "for this service."
+        )
+
+    if kind in ("smb_share", "smb_user"):
+        return (
+            "Restrict anonymous/null-session SMB access; require "
+            "authentication for share/user enumeration and remove any "
+            "unnecessary share exposure."
+        )
 
     if kind in ("open_port", "service_version"):
         try:
