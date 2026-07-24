@@ -1,0 +1,328 @@
+"""
+modules/web/gobuster_wrap.py
+Directory / content brute-force wrapper for Aegis Scanner (Member C - web).
+
+Runs `gobuster dir` against a target's web service through
+error_handler.run_tool() and parses the discovered paths and their HTTP
+status codes into a structured list.
+
+WordPress signalling
+--------------------
+config.CONDITIONAL_TOOLS maps "wpscan" -> "wordpress_fingerprinted": a
+detection flag that gates whether the orchestrator should later run wpscan.
+Nothing in the codebase reads or writes that flag yet (modules/profiles/*
+and aegis.py are still empty stubs), so rather than invent a global
+flag store this module simply returns `wordpress_fingerprinted` as a
+boolean under exactly that key. Whoever writes modules/profiles/webaudit.py
+reads it straight off this function's return dict and matches it against
+CONDITIONAL_TOOLS without any extra plumbing.
+"""
+
+import os
+import re
+
+from modules.utils.error_handler import run_tool
+from modules.utils.logger import (
+    log_tool_start, log_tool_success, log_tool_failure, log_finding,
+)
+from modules.utils.display import (
+    print_info, print_success, print_warning, print_error,
+)
+
+# Wordlists tried in order when the caller doesn't supply one. First one
+# that actually exists on this box wins — paths differ between Kali
+# releases and a hardcoded missing path would fail every scan.
+_DEFAULT_WORDLISTS = [
+    "/usr/share/wordlists/dirb/common.txt",
+    "/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt",
+    "/usr/share/seclists/Discovery/Web-Content/common.txt",
+]
+
+# -q  : suppress banner/noise so only result lines reach stdout
+# --np: no progress meter (it would otherwise pollute captured output)
+# -t  : threads
+# (-k, to skip TLS validation on self-signed test certs, is appended only
+#  when use_https is set)
+_GOBUSTER_BASE_ARGS = ["-q", "--np", "-t", "30"]
+
+# Matches gobuster's result lines, e.g.
+#   admin                (Status: 301) [Size: 0] [--> /admin/]
+#   /index.html          (Status: 200) [Size: 55]
+_RESULT_LINE = re.compile(r"^(?P<path>\S+)\s+\(Status:\s*(?P<status>\d+)\)")
+
+# Single-page apps and sites with a soft 404 answer *every* URL with the
+# same page, so gobuster refuses to start and exits 1. Its own error text
+# carries the wildcard response's length, which is exactly what's needed to
+# filter that page out — so we detect this and retry once.
+_WILDCARD_ERROR = "status code that matches the provided options for non existing urls"
+_WILDCARD_LENGTH = re.compile(r"\(Length:\s*(?P<length>\d+)\)")
+
+# Paths whose presence is strong evidence of a WordPress install.
+_WORDPRESS_MARKERS = (
+    "/wp-admin",
+    "/wp-login.php",
+    "/wp-content",
+    "/wp-includes",
+    "/xmlrpc.php",
+)
+
+
+def _build_url(target: str, port: int, use_https: bool) -> str:
+    """Compose the base URL, respecting a full URL if one was passed in."""
+    if target.startswith(("http://", "https://")):
+        return target.rstrip("/")
+
+    scheme = "https" if use_https else "http"
+    default_port = 443 if use_https else 80
+    host = target if port == default_port else f"{target}:{port}"
+    return f"{scheme}://{host}"
+
+
+def _resolve_wordlist(wordlist: str = None) -> tuple:
+    """
+    Decide which wordlist to use.
+
+    Returns (path, error). On success error is ""; on failure path is None
+    and error explains what was missing, so the caller can degrade
+    gracefully instead of launching a doomed gobuster run.
+    """
+    if wordlist:
+        if os.path.isfile(wordlist):
+            return wordlist, ""
+        return None, f"wordlist not found: {wordlist}"
+
+    for candidate in _DEFAULT_WORDLISTS:
+        if os.path.isfile(candidate):
+            return candidate, ""
+
+    return None, (
+        "no wordlist available; tried " + ", ".join(_DEFAULT_WORDLISTS)
+    )
+
+
+def _wildcard_length(stderr: str) -> str:
+    """
+    If gobuster bailed out because the target answers every URL with the
+    same page, return that page's content length as a string (suitable for
+    --exclude-length). Returns "" for any other failure, so the caller only
+    retries on this specific, recoverable condition.
+    """
+    text = stderr or ""
+    if _WILDCARD_ERROR not in text.lower():
+        return ""
+    match = _WILDCARD_LENGTH.search(text)
+    return match.group("length") if match else ""
+
+
+def _normalise_path(path: str) -> str:
+    """
+    gobuster prints bare entries ("admin") in quiet mode and rooted ones
+    ("/admin") in others. Normalise to a leading slash so downstream
+    reporting and the WordPress markers compare consistently.
+    """
+    path = path.strip()
+    if not path.startswith("/"):
+        path = "/" + path
+    return path
+
+
+def _parse_gobuster_output(stdout: str) -> list:
+    """
+    Parse gobuster's result lines into a list of:
+        {path: str, status_code: int}
+
+    Non-matching lines (blank lines, stray progress output) are skipped.
+    Duplicates are collapsed. Malformed/empty input yields [].
+    """
+    discovered = []
+    seen = set()
+
+    for raw_line in (stdout or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        match = _RESULT_LINE.match(line)
+        if not match:
+            continue
+
+        path = _normalise_path(match.group("path"))
+        try:
+            status_code = int(match.group("status"))
+        except (TypeError, ValueError):
+            continue
+
+        if path in seen:
+            continue
+        seen.add(path)
+
+        discovered.append({"path": path, "status_code": status_code})
+
+    discovered.sort(key=lambda d: d["path"])
+    return discovered
+
+
+def _detect_wordpress(discovered: list) -> list:
+    """
+    Return the WordPress marker paths present in the discovered set.
+    Matching is prefix-based and case-insensitive so /wp-admin/ and
+    /WP-Admin both count.
+    """
+    hits = []
+    for entry in discovered:
+        path = entry.get("path", "").lower().rstrip("/")
+        for marker in _WORDPRESS_MARKERS:
+            if path == marker or path.startswith(marker + "/"):
+                hits.append(entry["path"])
+                break
+    return hits
+
+
+def run_gobuster(target: str, port: int = 80, use_https: bool = False,
+                 wordlist: str = None) -> dict:
+    """
+    Brute-force directories/files on `target`'s web service with gobuster.
+
+    Parameters
+    ----------
+    target    : str   host / IP (a full http(s):// URL is also accepted)
+    port      : int   web service port (default 80)
+    use_https : bool  scan over TLS (adds gobuster's -k so self-signed
+                      certs on test targets don't abort the run)
+    wordlist  : str   path to a wordlist; defaults to the first entry of
+                      _DEFAULT_WORDLISTS that exists on this system
+
+    Returns
+    -------
+    dict:
+        target                 : str
+        port                   : int
+        discovered_paths       : list[dict]  {path, status_code}
+                                             path always leading-slashed
+        wordpress_fingerprinted: bool        True when a /wp-* marker was
+                                             found — this is the flag
+                                             config.CONDITIONAL_TOOLS maps
+                                             to wpscan
+        raw_output             : str         gobuster's stdout
+        error                  : str | None  human-readable failure reason
+
+    Never raises. A missing gobuster binary, a missing wordlist, or an
+    unreachable target all come back as error set + discovered_paths empty
+    + wordpress_fingerprinted False.
+
+    Targets that answer every URL with the same page (SPAs, soft 404s) make
+    gobuster refuse to run; that one case is retried automatically with the
+    wildcard page's length excluded, so such targets still return results.
+    """
+    log_tool_start(target, "gobuster")
+
+    result = {
+        "target": target,
+        "port": port,
+        "discovered_paths": [],
+        "wordpress_fingerprinted": False,
+        "raw_output": "",
+        "error": None,
+    }
+
+    resolved_wordlist, wordlist_error = _resolve_wordlist(wordlist)
+    if wordlist_error:
+        result["error"] = wordlist_error
+        log_tool_failure(target, "gobuster", wordlist_error)
+        print_error(f"[Gobuster] {target}:{port} — {wordlist_error}")
+        return result
+
+    url = _build_url(target, port, use_https)
+    command = ["gobuster", "dir", "-u", url, "-w", resolved_wordlist] + _GOBUSTER_BASE_ARGS
+    if use_https:
+        command.append("-k")
+
+    print_info(f"[Gobuster] Enumerating {url} with {resolved_wordlist}")
+
+    # run_tool() applies config.get_timeout('gobuster') itself — no timeout
+    # argument is passed or accepted here.
+    tool_result = run_tool(target, "gobuster", command)
+    result["raw_output"] = tool_result.get("stdout", "") or ""
+
+    # A wildcard-response refusal isn't a real failure — retry once with the
+    # offending page length excluded, otherwise SPA targets always yield
+    # zero paths.
+    if not tool_result.get("success"):
+        retry_length = _wildcard_length(tool_result.get("stderr", ""))
+        if retry_length:
+            print_warning(
+                f"[Gobuster] {url} answers every URL with a {retry_length}-byte page; "
+                "retrying with that length excluded"
+            )
+            tool_result = run_tool(
+                target, "gobuster",
+                command + ["--exclude-length", retry_length],
+            )
+            result["raw_output"] = tool_result.get("stdout", "") or ""
+
+    if not tool_result.get("success"):
+        # gobuster writes the real reason (connection refused, bad
+        # wordlist) to stderr and exits non-zero, so prefer stderr text
+        # over run_tool's generic "non-zero exit code" wording.
+        stderr = (tool_result.get("stderr") or "").strip()
+        err = stderr or tool_result.get("error") or "gobuster failed"
+        result["error"] = err
+        log_tool_failure(target, "gobuster", err)
+        print_error(f"[Gobuster] gobuster failed for {url} — {err}")
+        return result
+
+    discovered = _parse_gobuster_output(result["raw_output"])
+    result["discovered_paths"] = discovered
+
+    wordpress_hits = _detect_wordpress(discovered)
+    result["wordpress_fingerprinted"] = bool(wordpress_hits)
+
+    log_tool_success(target, "gobuster", tool_result.get("duration"))
+
+    if discovered:
+        for entry in discovered:
+            log_finding(target, {
+                "type": "discovered_path",
+                "port": port,
+                "path": entry["path"],
+                "status_code": entry["status_code"],
+            })
+            print_success(f"[Gobuster] {entry['path']} ({entry['status_code']})")
+        print_info(f"[Gobuster] {url} — {len(discovered)} path(s) discovered")
+    else:
+        print_warning(f"[Gobuster] {url} — scan completed, no paths discovered")
+
+    if result["wordpress_fingerprinted"]:
+        log_finding(target, {
+            "type": "wordpress_fingerprinted",
+            "port": port,
+            "evidence": wordpress_hits,
+        })
+        print_success(
+            f"[Gobuster] WordPress fingerprinted via {', '.join(wordpress_hits)} "
+            "— wpscan is now applicable (CONDITIONAL_TOOLS)"
+        )
+
+    return result
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print_error(
+            "Usage: python -m modules.web.gobuster_wrap <target> [port] [https] [wordlist]"
+        )
+        sys.exit(1)
+
+    tgt = sys.argv[1]
+    prt = int(sys.argv[2]) if len(sys.argv) > 2 else 80
+    https = len(sys.argv) > 3 and sys.argv[3].lower() in ("https", "true", "1", "yes")
+    wl = sys.argv[4] if len(sys.argv) > 4 else None
+
+    print_info(f"Running gobuster against {tgt}:{prt} (https={https})...")
+    out = run_gobuster(tgt, port=prt, use_https=https, wordlist=wl)
+    for item in out["discovered_paths"]:
+        print_info(f"  {item['status_code']}  {item['path']}")
+    print_info(f"WordPress fingerprinted: {out['wordpress_fingerprinted']}")
+    print_info(f"Error: {out['error'] or 'none'}")
