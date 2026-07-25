@@ -10,9 +10,7 @@ structured list of {name, value} technology hits.
 import re
 
 from modules.utils.error_handler import run_tool
-from modules.utils.logger import (
-    log_tool_start, log_tool_success, log_tool_failure, log_finding,
-)
+from modules.utils.logger import log_finding
 from modules.utils.display import (
     print_info, print_success, print_warning, print_error,
 )
@@ -111,29 +109,30 @@ def run_whatweb(target: str, port: int = 80, use_https: bool = False) -> dict:
     Never raises. A missing whatweb binary or unreachable target come back
     as error set + technologies empty.
     """
-    log_tool_start(target, "whatweb")
-
     result = {
+        "tool": "whatweb",
         "target": target,
         "port": port,
         "technologies": [],
         "cms_detected": None,
         "raw_output": "",
         "error": None,
+        "skipped": False,
     }
 
     url = _build_url(target, port, use_https)
     command = ["whatweb"] + _WHATWEB_BASE_ARGS + [url]
     print_info(f"[WhatWeb] Fingerprinting {url}")
 
+    # run_tool() already logs this call's start/success/failure under the
+    # "whatweb" tool name — no need to log it again here.
     tool_result = run_tool(target, "whatweb", command)
     result["raw_output"] = tool_result.get("stdout", "") or ""
+    result["skipped"] = tool_result.get("skipped", False)
 
     if not tool_result.get("success"):
-        err = tool_result.get("error") or tool_result.get("stderr") or "whatweb failed"
-        result["error"] = err
-        log_tool_failure(target, "whatweb", err)
-        print_error(f"[WhatWeb] whatweb failed for {url} — {err}")
+        result["error"] = tool_result.get("error") or tool_result.get("stderr") or "whatweb failed"
+        print_error(f"[WhatWeb] whatweb failed for {url} — {result['error']}")
         return result
 
     technologies = _parse_whatweb_output(result["raw_output"])
@@ -143,8 +142,6 @@ def run_whatweb(target: str, port: int = 80, use_https: bool = False) -> dict:
         if tech["name"] in _CMS_PLUGINS:
             result["cms_detected"] = tech["name"]
             break
-
-    log_tool_success(target, "whatweb", tool_result.get("duration"))
 
     if technologies:
         for tech in technologies:

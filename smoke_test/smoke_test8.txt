@@ -1,0 +1,860 @@
+================================================================================
+AEGIS SCANNER — SMOKE TEST REPORT #8
+Historical backfill (decided, not assumed), web-wrapper field population,
+repeat-coverage runs, and the webaudit scope disclosure
+================================================================================
+
+1. RUN METADATA
+--------------------------------------------------------------------------------
+Date (start)            : 2026-07-25 19:15 PKT
+Date (end)              : 2026-07-25 22:05 PKT
+Targets                 : pentest-ground.com   (public, intentionally vulnerable)
+                          scanme.nmap.org      (nmap's own designated scan host)
+                          172.28.0.20          (local DVWA Docker fixture, used
+                                                for tool-output capture so the
+                                                public targets' rate limits were
+                                                not spent on format inspection)
+Profiles run            : all five
+Invocation form         : python3 aegis.py <target> --profile <profile>
+                          --non-interactive
+Scans produced          : 130-139
+
+This pass took the OPEN items from smoke_test7 §9. Most were optional
+improvements rather than active bugs, so the first thing this file records is
+which of them were decided by the user rather than by the implementer.
+
+Headline results, in the order they matter:
+  - The historical backfill was scoped, presented, and DECIDED before
+    anything was written. cve_id and cvss were corrected; port deliberately
+    was NOT. Section 2.
+  - The other web wrappers were discarding considerably more real tool
+    output than smoke_test7 §9.3 predicted — not just the scheme. ZAP alone
+    was keeping 4 fields out of ~20 and throwing away its own remediation
+    advice. Section 3.
+  - THREE defects were found by this work, one of them a regression this
+    pass itself introduced and then caught. Section 4. The regression is
+    written up in full because the whole-database sweep passed straight
+    through it, which says something about what that sweep does and does
+    not prove.
+
+
+2. PHASE 1 — THE HISTORICAL BACKFILL, SCOPED AND DECIDED
+================================================================================
+
+2.1 Scope was reported before anything was written
+--------------------------------------------------------------------------------
+smoke_test7 §9.1 left historical rows unrewritten as a deliberate choice. The
+brief for this pass required the scope to be measured and the decision put to
+the user rather than assumed either way. Measured scope, over 70 nuclei rows
+in 129 scans:
+
+    cve_id   20 rows / 4 scans (68, 71, 111, 117), all pentest-ground.com
+             — the four Redis Lua CVE templates
+    cvss     11 rows — exposed-redis 7.2 (6), configuration-listing 5.3 (3),
+             CVE-2023-48795 5.9 (2)
+    port     33 rows / 6 scans (68, 71, 82, 86, 111, 117) storing 80/443
+             where the templates pivot to 6379
+             + 4 further rows (scans 85, 115, scanme.nmap.org) storing 80
+             where the SSH templates hardcode Port 22
+    case     2 rows storing 'cve-2023-48795' lowercase, so one CVE sorted
+             and grouped as two distinct values
+
+    24 further NULL cve_id rows are CORRECTLY NULL — redis-default-logins,
+    exposed-redis, dvwa-default-login, configuration-listing and
+    ssh-weak-algo-supported are not CVE-shaped template ids. A backfill that
+    "filled in the blanks" would have invented CVEs for all 24.
+
+2.2 The distinction that drove the decision
+--------------------------------------------------------------------------------
+The two corrections are not the same kind of operation, and saying so was the
+most useful part of this phase:
+
+    cve_id is RECOVERED. output/<target>/scan_errors.log recorded the
+    template_id verbatim at scan time —
+    output/pentest-ground.com/scan_errors.log:226 is:
+        Finding recorded: {'type': 'nuclei_finding', 'port': 80,
+        'template_id': 'CVE-2025-46819', ...}
+    The value was observed during that run and written down. Restoring it to
+    the row is recovering an observation.
+
+    port would be INFERRED. Port 6379 does not appear in ANY log before
+    2026-07-25 15:59:38 — which is scan 126, AFTER the smoke_test7 fix. For
+    the six older scans the matched port was never recorded anywhere. Writing
+    6379 in would not restore an observation; it would derive a value from
+    the template's pivot behaviour and put it into a historical record that
+    nothing from that run attests to. The SSH rows are weaker still: there is
+    no post-fix run against scanme.nmap.org to corroborate Port 22 at all.
+
+2.3 The decision (made by the user, 2026-07-25)
+--------------------------------------------------------------------------------
+Presented as four options with the above stated. Chosen:
+    cve_id + cvss backfilled; port left exactly as recorded on all 37 rows;
+    lowercase cve_id normalised to uppercase.
+Recorded here because it was a judgement call about evidence, not a technical
+default, and the file should say who made it.
+
+2.4 How the migration establishes what a row's template was
+--------------------------------------------------------------------------------
+tools/backfill_nuclei_identity.py. Standalone and explicitly invoked —
+nothing in the scanner calls it, it is not wired into startup or any profile,
+and it is dry-run unless --apply is passed.
+
+A row is only updated when TWO INDEPENDENT derivations of its template id
+agree:
+
+  (1) positional — the scan's nuclei log events, taken within that scan's own
+      time window, paired in order with that scan's nuclei rows. Accepted
+      only when the counts match AND every paired severity matches.
+  (2) textual — the row's description prose mapped to a template name (via
+      the '<name> — <prose>' form post-fix rows store), and thence to a
+      template id via the logs.
+
+Both mappings were verified unambiguous against the real data before use:
+10 distinct template names, 0 mapping to more than one template id; 6
+distinct prose bodies, 0 mapping to more than one name.
+
+Where they disagree, or either is unavailable, the row is SKIPPED and named
+in the dump. Two rows were skipped on that basis (5106, 5107 — scan 89,
+172.28.0.20): that target's nuclei events are not in the log, and no post-fix
+run of those templates exists to derive them textually. Row 5107 is a
+configuration-listing finding whose twins in scans 90 and 112 DID receive
+cvss 5.3; it keeps NULL. That inconsistency is the honest outcome of
+declining to guess, and is preferred to a tidier database.
+
+Two scans failed positional pairing and fell back to textual evidence alone:
+    scan 71  — scan 72 (compliance) was registered 59 MICROSECONDS later
+               against the same target, so the time window closes instantly.
+               The guard correctly refused to pair rather than reaching into
+               a neighbouring scan's events.
+    scan 89  — no nuclei events in the log for that target/window at all.
+
+2.5 What was actually written
+--------------------------------------------------------------------------------
+    30 rows updated, verified row-by-row after commit:
+        20  cve_id NULL -> CVE-2025-46817/-46818/-46819/-49844
+         8  cvss NULL -> 7.2 (exposed-redis x6), 5.3 (configuration-listing x2)
+         2  cve-2023-48795 -> CVE-2023-48795, plus cvss 5.9 on the same rows
+    port unchanged on every one of the 30 — asserted in code (the UPDATE
+    statement does not name the column) and re-read and verified afterwards.
+
+    Post-state:
+        lowercase cve_id rows remaining          0
+        NULL cve_id on CVE-shaped templates      0
+        Redis rows still storing port 80/443    33   <- by decision
+
+2.6 Auditable and reversible — both demonstrated, not asserted
+--------------------------------------------------------------------------------
+    - the before/after dump is written BEFORE any row is modified, so the
+      record survives even if the update fails partway:
+      smoke_test/backfill_nuclei_identity_20260725_192305.txt
+    - the database is copied to database/aegis.db.pre-backfill.<stamp> first
+    - --revert <dumpfile> restores the recorded values
+
+    The revert was EXERCISED, not just implemented:
+        apply   -> 5408 cve_id CVE-2025-46817, 4981 CVE-2023-48795 + cvss 5.9
+        revert  -> 5408 NULL,  4981 back to lowercase 'cve-2023-48795'
+        re-apply-> corrections restored, port untouched throughout
+      A reversal path that has never been run is a claim, not a safety net.
+
+    Third recovery path: database/aegis.db is tracked in git, so the
+    pre-backfill state is also in the commit history.
+
+2.7 Caveat recorded in the dump itself
+--------------------------------------------------------------------------------
+cvss values are read from the nuclei templates as they exist on disk TODAY,
+not from the output of the run being corrected. exposed-redis 7.2 is
+corroborated by post-fix scans of the same host; configuration-listing 5.3
+and CVE-2023-48795 5.9 are not — there is no post-fix run of those templates
+to compare against, and an upstream template edit since the scan would not be
+detectable here. This is weaker evidence than the cve_id recovery and is
+labelled as such in the dump's CAVEATS block rather than only here.
+
+
+3. PHASE 2 — WHAT THE OTHER WEB WRAPPERS WERE DISCARDING
+================================================================================
+
+smoke_test7 §9.3 recorded this gap as "gobuster/nikto/zap know their scheme
+and could populate it". The audit found the scheme was the smallest part of
+it.
+
+3.1 Method: real tool output, captured and inspected
+--------------------------------------------------------------------------------
+No field was added on the strength of a tool's documentation. Each tool was
+run and its raw output inspected, against the local DVWA fixture so the
+public targets' rate limits were not spent on format inspection. The captures
+are committed as test fixtures so the assertions are reproducible:
+
+    tests/fixtures/gobuster_raw.txt      gobuster vs http://127.0.0.1:8082
+    tests/fixtures/nikto_raw.txt         nikto 2.6.0 vs 127.0.0.1:8082
+    tests/fixtures/zap_alerts_raw.json   ZAP, 25 real alerts
+    tests/fixtures/nuclei_raw.jsonl      carried over from smoke_test7
+
+3.2 gobuster — Size and redirect target were never parsed
+--------------------------------------------------------------------------------
+Real output:
+    docs         (Status: 301) [Size: 312] [--> http://127.0.0.1:8082/docs/]
+    index.php    (Status: 302) [Size: 0]   [--> login.php]
+    favicon.ico  (Status: 200) [Size: 1406]
+
+_RESULT_LINE stopped at the status code, so [Size:] and [--> ...] were
+matched by nothing and discarded. Both are real, tool-reported detail: the
+size distinguishes a 0-byte stub from a real page, and the redirect target
+says where a 301 actually goes. Both are now parsed, with both groups
+optional so a build that omits either still parses rather than silently
+yielding zero paths.
+
+3.3 dirb — SIZE was already captured, then dropped on the floor
+--------------------------------------------------------------------------------
+_FOUND_LINE has always had a (?P<size>\d+) group. The dict built two lines
+later was {path, status_code}. The value was parsed and then discarded at the
+point of use — the shortest possible distance between having data and losing
+it. Now kept. Directory hits, which dirb reports without a SIZE, keep None
+rather than a fabricated 0.
+
+3.4 nikto — test id, affected URI, citation and server banner
+--------------------------------------------------------------------------------
+Real output:
+    + Server: Apache/2.4.25 (Debian)
+    + [013587] /: Suggested security header missing: referrer-policy. See: ...
+    + [750500] /config/: Directory indexing found.
+    + [600050] Apache/2.4.25 appears to be outdated (current is at least ...)
+
+  - the test id ([95], [013587] — the width varies) is nikto's own identifier
+  - the URI prefix is the path the finding concerns
+  - "See: <url>" was ALREADY parsed into `reference` and then dropped at
+    insert, because there was no column for it (see 3.6)
+  - "Server:" was filtered out as metadata, but it is nikto's own observation
+    of the server banner and the only place the product/version appears
+
+The fourth line is why the path is matched with a leading "/" only:
+"Apache/2.4.25 appears to be outdated" has no URI, and a looser pattern would
+have recorded "Apache/2.4.25" as one. Verified by test.
+
+"Server: No banner retrieved" is treated as no banner rather than as a
+product called "No banner retrieved".
+
+3.5 ZAP — keeping 4 fields out of ~20, including its own remediation
+--------------------------------------------------------------------------------
+The largest gap by far. Field census over a real 25-alert run:
+
+    100% populated : alert, description, solution, reference, url, cweid,
+                     confidence, method, risk, pluginId, alertRef
+     68% populated : evidence   (17/25)
+     52% populated : param      (13/25)
+      0% populated : attack, inputVector
+
+The wrapper kept rule_id, name, status and severity. It discarded ZAP's own
+description, its per-alert remediation advice, the URL it matched at, the
+evidence string and the parameter — five fields for which the findings table
+has had columns for some time.
+
+Now carried. Fields ZAP left empty stay empty: `attack` is 0/25 because a
+passive baseline scan sends no attack payloads, and param/evidence are
+genuinely absent on some rules. Those render "not determined by zaproxy"
+rather than a fabricated value.
+
+    cweid -1 is ZAP's own "not applicable" sentinel — Session Management
+    Response Identified carries it. Rendering that as "CWE--1" would invent a
+    weakness class that does not exist, so <= 0 is dropped.
+
+    ZAP reports one alert per matching URL; 25 alerts are 9 distinct rules.
+    The collapse keeps the first URL as exemplar and records how many URLs
+    matched, so "(matched at 4 URLs)" appears rather than the breadth being
+    silently lost.
+
+3.6 One new column: reference
+--------------------------------------------------------------------------------
+nikto, ZAP and wpscan all parsed a citation URL and all three lost it at
+insert for want of a column. Added via db.py's existing, documented
+ALTER TABLE migration pattern — safe to re-run, existing rows simply carry
+NULL. A citation is neither evidence of a finding nor remediation for it, so
+it gets its own column rather than being folded into either.
+
+3.7 Scheme, handled properly rather than as a scheme field
+--------------------------------------------------------------------------------
+The brief named http-vs-https. Rather than a bare `scheme` column, the
+wrappers populate `endpoint` with the full URL — which carries the scheme,
+the port AND the path, in a column that already existed. gobuster composes it
+from the base URL it was launched against; dirb reports absolute URLs itself;
+nikto gets base_url + the URI it flagged (findings with no URI get the base
+URL, which is still true of them); ZAP reports `url` directly.
+
+3.8 nuclei's matched-at — found while verifying the above
+--------------------------------------------------------------------------------
+Not in the brief. With Endpoint rendering for the first time, nuclei findings
+read "Endpoint: not determined by nuclei" — while nuclei_wrap had been
+parsing `matched-at` since smoke_test7's matched-port fix and the mappers
+were dropping it. Verified against the real JSONL fixture: every one of the
+six Redis matches carries 'pentest-ground.com:6379'. Now mapped to endpoint
+in both profiles that map nuclei findings.
+
+Reported honestly: this was a one-line fix to close a gap that the pass's own
+new column had made visible. It is scope creep of the smallest kind, and it
+is recorded rather than folded in quietly.
+
+3.9 Live verification — scan 130, deepscan / 172.28.0.20
+--------------------------------------------------------------------------------
+    519.3s, 19 tools, 0 failed, 0 skipped
+
+    finding_type              n   endpoint  reference  remediation  evid  param  product
+    nikto_finding            16     16        10           16        0     0      16
+    discovered_path          16     16         0           16        0     0       0
+    zap_finding               9      9         9            9        6     6       0
+    nuclei_finding            2      0         2            2        0     0       0
+
+  - nikto reference 10/16, not 16/16, because only 10 of those findings
+    carried a "See:" citation. A wrapper that reported 16/16 would be lying.
+  - zap evidence/param 6/9 for the same reason.
+  - nuclei endpoint 0/2 is a TIMING artefact, not a defect: this scan's
+    process started at 19:35 and imported the mapper before the 3.8 fix
+    landed at 19:41. `reference` populated because the old mapper already
+    passed it and only the column was new. Re-verified live in the Phase 5
+    runs — see section 6.
+
+3.10 Rendered in both TXT and PDF, through one code path
+--------------------------------------------------------------------------------
+Endpoint and Reference were added to the text detail card and the PDF finding
+card, both through summary.field_display(), so the two files cannot disagree
+about a finding's endpoint. Real rendered output, scan 130:
+
+    [10] MEDIUM — [750500] /config/: Directory indexing found.
+      Port          : 80
+      Endpoint      : http://172.28.0.20:80/config/
+      Reference     : not determined by nikto
+
+    [54] LOW — Cookie No HttpOnly Flag — A cookie has been set without t...
+      Endpoint      : http://172.28.0.20
+      Reference     : https://owasp.org/www-community/HttpOnly
+
+  and the nikto finding with no URI of its own:
+      Endpoint      : http://172.28.0.20:80
+
+3.11 field_display mappings extended
+--------------------------------------------------------------------------------
+endpoint and reference gained _NOT_APPLICABLE entries so host- and port-level
+findings say "N/A (host-level finding)" / "N/A (port observation)" rather
+than reporting a gap that is not one. wpscan_finding was missing from
+FINDING_TYPE_TOOL entirely and was added. Verified across all 19 real
+finding_types: no bare dash, no blank cell, for either field.
+
+
+4. THREE DEFECTS FOUND BY THIS WORK
+================================================================================
+
+4.1 A tool's own remediation was being overwritten with generic text
+--------------------------------------------------------------------------------
+enrichment/remediation.py:482 read:
+
+    enriched["remediation"] = remediation_text(enriched)
+
+— unconditionally. So once the ZAP wrapper started supplying ZAP's per-alert
+`solution`, enrichment immediately replaced it. Rendered result:
+
+    ZAP's own text : "Ensure that the HttpOnly flag is set for all cookies."
+    what was shown : "Review the ZAP baseline alert 'Cookie No HttpOnly Flag'
+                      against OWASP guidance for that alert class and
+                      remediate the underlying misconfiguration."
+
+The second sentence tells the reader to go and look it up; the first is the
+answer. A tool-supplied remediation now wins over the generic text; an empty
+or whitespace-only one still falls back exactly as before. Only findings
+whose wrapper genuinely populates the field are affected — a grep confirmed
+the ZAP mapper is the only one that does.
+
+4.2 A REGRESSION THIS PASS INTRODUCED, AND HOW IT WAS CAUGHT
+--------------------------------------------------------------------------------
+This is the most important entry in this file.
+
+Both enrichment/severity.py::_finding_type and
+enrichment/remediation.py::_finding_kind sniff a finding's kind from its
+shape when no type is declared. Both contained:
+
+    if finding.get("description") is not None and "reference" in finding:
+        return "nikto_finding"
+
+— keyed on the KEY BEING PRESENT. Rows read back from SQLite carry every
+column in the table. Adding the `reference` column (3.6) therefore made that
+condition true for EVERY stored row, and every described finding with no
+declared type started classifying as a nikto finding.
+
+Observed live, scan 131 (stealthscan / pentest-ground.com), on an OPEN PORT
+finding:
+
+    Description   : Http is exposed on port 80.
+    Remediation   : Review this nikto finding against the application's
+                    intended configuration and ...
+
+nikto does not run in stealthscan. The report was naming a tool that never
+executed, for a finding it never produced.
+
+Root-caused rather than patched at the symptom. Two things were wrong:
+
+  (a) both classifiers read only `type`, never `finding_type` — which is the
+      column name db.py actually persists under. Every stored row was being
+      put through shape-sniffing despite already declaring what it was. Both
+      now honour `finding_type`, so a stored row is read, not guessed at.
+  (b) the nikto heuristic now requires a TRUTHY reference, not a present key.
+
+    Fixed, verified on the same scan:
+        Remediation   : Redirect all HTTP traffic to HTTPS and serve the site
+                        over TLS so credentials and sessions are not sent in
+                        the clear.
+
+Stated plainly, because it bears on how much the other evidence in this file
+proves: THE WHOLE-DATABASE SWEEP PASSED STRAIGHT THROUGH THIS BUG. That sweep
+checks for ambiguous cells, duplicate top-finding lines and crashes across
+every scan. A confidently-worded, entirely wrong remediation sentence is none
+of those things. It was found by reading one rendered report, and by nothing
+else. 187 findings across five profiles carry a NULL finding_type and were in
+scope of the defect.
+
+
+4.3 A CVE duplicate-insert path in deepscan — found, documented, NOT fixed
+--------------------------------------------------------------------------------
+The dedup guard smoke_test7 built fired on two of this pass's deepscans, on
+two different hosts:
+
+    scan 130 (172.28.0.20)      duplicate collapsed: CVE-2016-8743
+                                (type=cve, port=80, severity=HIGH)
+    scan 138 (scanme.nmap.org)  duplicate collapsed: CVE-2021-44224
+                                (type=cve, port=80, severity=HIGH)
+
+Cause, from the run's own console output (scan 138):
+
+    [*] [CVE] Querying NVD for 'Apache httpd 2.4.7'          <- service detect
+    [*] [CVE]   CVE-2021-44224 — CVSS 8.2 (HIGH)
+    [*] [CVE] Querying NVD for 'apache http server 2.4.7'    <- header fingerprint
+    [*] [CVE]   CVE-2021-44224 — CVSS 8.2 (HIGH)
+
+deepscan enriches CVEs down two independent paths — nmap's detected service
+product, and the Server header's product — and on a host where both name the
+same software, both queries return the same CVE and BOTH are inserted. Same
+class as smoke_test7 §3.4's nuclei duplicate, different producer.
+
+Reports are CORRECT: the render-time guard collapses it and says so out loud,
+which is exactly the job it was built for. The database row is still
+duplicated, which is why db and rendered counts differ by one on those two
+scans (§6.4).
+
+Deliberately NOT fixed in this pass. The fix belongs at collection time in
+deepscan's CVE enrichment, and by the time it was diagnosed both live
+deepscans had already run; changing enrichment behaviour without a live
+deepscan to re-verify it would mean shipping an unverified collection-time
+change on the strength of a unit test alone, which is the opposite of how
+every other fix in this pass was handled. Reproduced on two independent
+hosts, so it is not target-specific and will keep occurring until fixed.
+Carried into §9.10 as an open item rather than closed quietly.
+
+5. PHASE 4 — WEBAUDIT SCOPE DISCLOSURE
+================================================================================
+
+smoke_test7 §9.8 noted that webaudit on pentest-ground.com reported 6 MEDIUM
+/ 24 LOW while a quickscan of the same host found 2 CRITICAL, and that
+nothing in the webaudit report explained why. Not a bug — that is the
+profile's designed scope — but a report silent about its own scope reads as a
+statement about the host rather than about the scan.
+
+5.1 The claim was checked before it was written
+--------------------------------------------------------------------------------
+The obvious wording — "webaudit does not run nuclei" — is FALSE. webaudit
+runs nuclei in `-dast -tags xss` mode for reflected XSS. What it does not run
+is the severity template pass over the host's other exposed services. The
+note says exactly that:
+
+    Scope: this profile audits the web application layer. It runs nuclei only
+    in DAST mode for reflected XSS, not the severity template pass that
+    quickscan and deepscan run against the host's other exposed services — so
+    CVE-class findings on non-web ports are outside what this report covers.
+    A quickscan or deepscan of the same host may surface findings this report
+    does not.
+
+5.2 One source, three surfaces
+--------------------------------------------------------------------------------
+summary.profile_scope_note() is the single definition; the text report, the
+PDF cover and the end-of-run CLI banner all read it, so the three cannot
+drift into describing the same profile's scope differently. Placed directly
+under the header, not at the end: a reader who stops after the severity
+summary is exactly the reader who needs it.
+
+5.3 Verified
+--------------------------------------------------------------------------------
+    - renders on scan 122, the exact 6 MEDIUM / 24 LOW report that motivated it
+    - absent from quickscan/deepscan/stealthscan/compliance reports
+    - present in the PDF cover HTML for webaudit, absent for deepscan
+    - case-insensitive, and safe for an unknown or None profile
+    - live webaudit runs in section 6 confirm it end to end
+
+
+6. PHASE 3 — REPEAT-COVERAGE RUNS
+================================================================================
+smoke_test7 §9.4/9.5 left repeat coverage uneven and two profile/target
+pairs unexercised under the current codebase. Nine runs, sequential, never
+stacked, with a 120s gap between them to respect the target-side rate
+limiting smoke_test5 documented.
+
+6.1 Second pass on the pairs that had only one post-fix run
+--------------------------------------------------------------------------------
+Every one reproduced its smoke_test7 counterpart EXACTLY — same finding
+count, same severity breakdown, zero tool failures:
+
+    profile / target                 this pass      smoke_test7      match
+    stealthscan / pentest-ground     131:  2 LOW    120:  2 LOW       yes
+    compliance  / pentest-ground     132:  5 LOW    121:  5 LOW       yes
+    webaudit    / pentest-ground     133: 30 (6 MED, 24 LOW)
+                                                    122: 30 (6/24)    yes
+    stealthscan / scanme.nmap.org    134:  2 LOW    123:  2 LOW       yes
+    compliance  / scanme.nmap.org    135:  2 LOW    124:  2 LOW       yes
+    quickscan   / scanme.nmap.org    136:  2 LOW    125:  2 LOW       yes
+
+  Reproducibility across two independent passes, hours apart, on live remote
+  targets is a stronger result than either pass alone. It also means the
+  reporting changes in this pass did not alter what any of those profiles
+  finds.
+
+6.2 webaudit and deepscan against scanme.nmap.org — the never-re-run pair
+--------------------------------------------------------------------------------
+smoke_test7 §9.5 relied on smoke_test5's pre-Phase-7 verification for these.
+Both now run under the current codebase:
+
+    137  webaudit  scanme.nmap.org   31 findings (1 HIGH, 5 MED, 25 LOW)
+                                     7 tools, 0 failed
+    138  deepscan  scanme.nmap.org   47 rows / 46 rendered, 1835.9s
+                                     14 tools, 0 failed
+
+  Nothing in the reporting changes since smoke_test5 altered their behaviour
+  there. 138's one collapsed row is the CVE duplicate of 4.3, not a
+  regression.
+
+6.3 The cross-port nuclei dedup — ATTEMPTED, NOT RE-TRIGGERED
+--------------------------------------------------------------------------------
+smoke_test7 §9.9 left this proven by unit test and by a clean end state, but
+never re-observed live. A deepscan was run against pentest-ground.com
+specifically to exercise it — a host with 80, 81 and 443 open, where the
+Redis templates pivot to 6379 from whichever web port matches.
+
+    139  deepscan  pentest-ground.com  76 rows / 76 rendered
+                                       19 tools, 0 failed, 2 CRIT 4 HIGH
+                                       18 MED 52 LOW
+
+    cross-port skips logged   : 0
+    render-time collapses     : 0
+
+  It did not re-trigger, and the tool's own output says exactly why:
+
+      [*] [Nuclei] Scanning http://pentest-ground.com  (severity=...)
+      [+] [Nuclei]  ... 6 findings, all Redis, all matched
+      [*] [Nuclei] Scanning https://pentest-ground.com (severity=...)
+      [!] [Nuclei] https://pentest-ground.com — scan completed, no matches
+
+  nuclei matched the Redis set from the :80 probe and returned NOTHING from
+  the :443 probe. With only one probe matching, there is no second copy to
+  collapse — the condition the dedup exists for did not arise.
+
+  Stated plainly, as the brief asked: THE LIVE CROSS-PORT COLLISION COULD NOT
+  BE RE-TRIGGERED against the current test targets. It has now failed to
+  recur across three consecutive deepscans of the host it was originally
+  observed on (128, 139, and by construction 138 on a different host). It
+  happened once, on scan 127. Whether nuclei matches a pivoting template from
+  more than one probe appears to be target-side and timing-dependent, and
+  this pass has no way to force it.
+
+  What IS therefore proven about the cross-port dedup: the unit test
+  (t_phase2/t_phase3, same-template-from-:80-and-:443 -> 2 findings not 4)
+  and the fact that scan 139's database row count and rendered count agree
+  exactly at 76 with no collapse needed. What is NOT proven: the live skip
+  path firing again. Recorded as still-open rather than quietly dropped.
+
+6.4 All nine runs
+--------------------------------------------------------------------------------
+    Zero tool failures and zero user skips across all nine, and across the
+    Phase 2 verification deepscan (130) — ten runs, 0 failures total.
+    All ten PDFs valid (%PDF- header, 17KB-100KB). All ten TXT reports
+    mechanically checked for ambiguous cells: 0.
+
+
+7. PHASE 5 — WHAT THE PREVIOUS COMMIT ACTUALLY BUNDLED
+================================================================================
+
+smoke_test7 recorded that its commit also landed previously-uncommitted
+smoke_test5/6 work. Confirmed against the real diff of a3e04a9, which touched
+63 files (+9951 / -1209). Split by origin:
+
+7.1 Genuinely smoke_test7's own work
+--------------------------------------------------------------------------------
+    NEW : modules/profiles/_common.py, modules/reporting/retention.py,
+          modules/reporting/completion.py, smoke_test/smoke_test7.txt
+    MOD : modules/web/nuclei_wrap.py, modules/reporting/summary.py,
+          report_txt.py, report_pdf.py, aegis.py,
+          modules/utils/config.example.py, modules/utils/error_handler.py,
+          modules/web/header_check.py, modules/scanning/banner.py,
+          all five modules/profiles/*.py
+
+    Spot-verified rather than assumed: banner.py's diff carries the
+    §7.4 skip-flag work, with a comment explicitly contrasting it against
+    header_check.
+
+7.2 Carried over from smoke_test5/6, already in the tree
+--------------------------------------------------------------------------------
+    NEW : modules/web/xss_wrap.py (+305)
+          test-targets/ entire directory — docker-compose.yml, README.md,
+            dvwa-extra/{info,xss}.php, ssh-extra/, direct_*_confirm.py
+          smoke_test/smoke_test1..6.txt and
+            aegis_scanner_status_and_capabilities.txt
+          — i.e. smoke tests 1-6 were ALL previously uncommitted, not only 5/6
+    MOD : modules/scanning/port_scanner.py (+355), service_detect.py (+85),
+          modules/web/sqlmap_wrap.py (+196), zap_wrap.py (+273),
+          dirb_wrap.py, gobuster_wrap.py, nikto_wrap.py, sslyze_wrap.py,
+          whatweb_wrap.py, wpscan_wrap.py, hydra_wrap.py, enum4linux_wrap.py,
+          modules/utils/display.py, logger.py,
+          modules/enrichment/{cve_lookup,remediation,severity}.py,
+          modules/recon/{dns,osint,subdomain}.py,
+          database/db.py, database/aegis.db, install.sh, requirements.txt,
+          README.md, important documentations/*
+
+    Spot-verified: zap_wrap.py's diff contains the KeyboardInterrupt
+    skip-flag fix whose comment states it was missed by the earlier
+    15-wrapper pass — i.e. smoke_test5 §5.5 work, not this pass's.
+
+7.3 Attribution limit, stated
+--------------------------------------------------------------------------------
+This split is by file and by diff content, not line-by-line. Several files
+(the four uniform +8/-11 wrapper diffs) carry the earlier skip-flag
+propagation pass; where a single file mixes both origins the whole file is
+listed under the pass that owns the majority of its diff. Exact per-line
+attribution is not recoverable, because the pre-commit working tree state no
+longer exists. Said plainly rather than presented as more precise than it is.
+
+7.4 What is genuinely new in THIS pass
+--------------------------------------------------------------------------------
+    NEW : tools/backfill_nuclei_identity.py
+          tests/ (t_phase2/3/4/8.py, t_pty.py, fixtures/) — see 8.2
+          smoke_test/smoke_test8.txt
+          smoke_test/backfill_nuclei_identity_20260725_192305.txt
+    MOD : database/db.py (reference column), database/aegis.db (backfill),
+          modules/web/{gobuster,dirb,nikto,zap}_wrap.py,
+          modules/profiles/{_common,deepscan,webaudit,quickscan}.py,
+          modules/reporting/{summary,report_txt,report_pdf,completion}.py,
+          modules/enrichment/{remediation,severity}.py,
+          .gitignore
+
+
+8. VERIFICATION
+================================================================================
+
+8.1 Unit tests — 317 assertions, 0 failures
+--------------------------------------------------------------------------------
+    tests/t_phase2.py   36 PASS   (smoke_test7) CVE/CVSS recovery, the 60-char
+                                  collision, dedup safety, real scan 117 rows
+    tests/t_phase3.py   47 PASS   (smoke_test7) matched-port from real JSONL,
+                                  N/A vs not-determined for every finding type
+    tests/t_phase4.py   40 PASS   (smoke_test7) retention filenames, budgets,
+                                  prompt choices, hostile input
+    tests/t_phase8.py  169 PASS   NEW — this pass, sections A-J below
+    tests/t_pty.py      11 PASS   (smoke_test7) real-pty retention prompt
+
+    t_phase8.py, by section:
+      A  gobuster size/redirect/url from REAL captured output, incl. size 0
+         vs size-absent, and a no-[Size:] line still parsing
+      B  dirb SIZE kept, directory hits keep None rather than a fake 0
+      C  nikto test id (both widths), URI extraction, the "Apache/2.4.25
+         appears to be outdated" line correctly yielding NO path, reference
+         extraction, server banner split, "No banner retrieved" handling
+      D  ZAP against the real 25-alert capture: 25 -> 9 rules, every carried
+         field, cweid -1 dropped, attack empty on all, url_count
+      E  the mappers put the new detail on the finding dict
+      F  field_display honesty for endpoint/reference across all 19 real
+         finding types
+      G  reference survives the database round-trip; absent -> NULL not ''
+      H  the webaudit scope note (Phase 4)
+      I  a tool's own remediation is not overwritten (4.1)
+      J  adding the reference column must not reclassify findings (4.2)
+
+    Every fixture in A-D is real captured tool output. No synthetic tool
+    output is used anywhere in this file's evidence.
+
+8.2 The test suite was one /tmp cleanup from being lost
+--------------------------------------------------------------------------------
+smoke_test7 reported "123 unit assertions, 0 failures". Those tests existed
+only in a previous session's scratchpad directory under /tmp — they were
+never in the repository, so the claim was not independently checkable and the
+suite would have vanished with the next reboot. They are now in tests/, with
+their hardcoded /tmp fixture paths repointed to tests/fixtures/ and to
+tempfile.gettempdir(). All five files were re-run from the new location
+before and after every change in this pass.
+
+8.3 Whole-database render sweep
+--------------------------------------------------------------------------------
+    scans rendered      137/137
+    crashes             0
+    ambiguous cells     0
+    duplicate top lines 0
+
+    Both the TXT renderer and all three PDF HTML builders were exercised for
+    every scan. See 4.2 for what this sweep does NOT prove.
+
+8.4 Real scans this pass
+--------------------------------------------------------------------------------
+ scan  target              profile      db   rpt  severity                        tools fail skip
+ -----------------------------------------------------------------------------------------------
+  130  172.28.0.20         deepscan      58   57  1 CRIT, 2 HIGH, 10 MED, 44 LOW    19    0    0   <- Phase 2 verification
+  131  pentest-ground.com  stealthscan    2    2  2 LOW                              2    0    0
+  132  pentest-ground.com  compliance     5    5  5 LOW                              3    0    0
+  133  pentest-ground.com  webaudit      30   30  6 MED, 24 LOW                     13    0    0
+  134  scanme.nmap.org     stealthscan    2    2  2 LOW                              2    0    0
+  135  scanme.nmap.org     compliance     2    2  2 LOW                              1    0    0
+  136  scanme.nmap.org     quickscan      2    2  2 LOW                              5    0    0
+  137  scanme.nmap.org     webaudit      31   31  1 HIGH, 5 MED, 25 LOW              7    0    0
+  138  scanme.nmap.org     deepscan      47   46  1 HIGH, 10 MED, 35 LOW            14    0    0
+  139  pentest-ground.com  deepscan      76   76  2 CRIT, 4 HIGH, 18 MED, 52 LOW    19    0    0
+ -----------------------------------------------------------------------------------------------
+
+ db vs rendered: 130 and 138 DIFFER by one row each. Both are the CVE
+ duplicate-insert path described in 4.3, correctly collapsed and loudly
+ logged. Every other scan agrees exactly.
+
+ Field population across all ten runs (real rows, not projections):
+
+    finding_type              n   endpoint  reference  remediation  evidence  param  product
+    nikto_finding            56      56        44          56          0        0      56
+    discovered_path          52      52         0          52          0        0       0
+    zap_finding              48      48        41          48         35       23       0
+    nuclei_finding           10       8        10          10          0        0       0
+    missing_security_header  42       0         0          42          0        0       0
+    cve                       9       0         0           9          0        0       9
+
+  - nuclei endpoint 8/10, not 10/10: the two unpopulated rows are scan 130's,
+    which ran before the 3.8 fix landed. Scans 138 and 139 are 2/2 and 6/6.
+    Verified directly:
+        scan 130  2 nuclei rows, 0 with endpoint   (pre-fix process)
+        scan 138  2 nuclei rows, 2 with endpoint
+        scan 139  6 nuclei rows, 6 with endpoint — every one
+                  'pentest-ground.com:6379', nuclei's own matched-at
+  - zap reference 41/48 and evidence 35/48 because ZAP genuinely reports
+    neither on every rule. discovered_path reference 0/52 because gobuster
+    and dirb publish no citations and never will — that renders
+    "N/A (path discovery)", not as a gap.
+
+
+9. HONEST LIMITATIONS
+================================================================================
+
+ 1. Historical port values are STILL not corrected — 33 Redis rows storing
+    80/443 and 4 SSH rows storing 80. This is now a recorded decision (2.3)
+    rather than an open item, but the consequence is unchanged and worth
+    stating in the same breath: a reader of scan 117's report sees a
+    CRITICAL Redis CVE attributed to port 80. That is what was recorded at
+    the time. The reports for scans run since smoke_test7 show 6379.
+
+ 2. cvss backfilled for configuration-listing (5.3) and CVE-2023-48795 (5.9)
+    comes from today's on-disk template, with no post-fix run to corroborate
+    it. See 2.7.
+
+ 3. Two rows (5106, 5107) were not backfilled at all because neither
+    derivation could establish their template. Row 5107's twins in other
+    scans did get cvss 5.3, so the database is now slightly inconsistent
+    between those scans. Declining to guess was preferred.
+
+ 4. nikto's test id and gobuster's Size/redirect are captured at the wrapper
+    level and reach the report through the description text, not through
+    dedicated columns — there are none, and adding four more columns for
+    them was not judged worth the schema churn. `reference` was added
+    because three separate wrappers needed it.
+
+ 5. ZAP findings still carry no CVE or CVSS, and render "not determined by
+    zaproxy". ZAP genuinely publishes neither for passive baseline alerts; it
+    publishes cweid, which has no column. Not invented.
+
+ 6. The ZAP per-rule collapse keeps ONE exemplar URL in `endpoint` and
+    records the count in the description. The other matching URLs are not
+    stored. A rule matching 4 URLs shows one of them plus "(matched at 4
+    URLs)".
+
+ 7. 187 stored findings across five profiles carry a NULL finding_type.
+    They render honestly ("not determined", no tool named) but less
+    informatively than a typed row would ("N/A (port observation)"). The 4.2
+    fix means they are no longer MIS-classified, but they are still
+    untyped at the source. Not addressed in this pass; it is a
+    collection-time gap in the profiles that emit them.
+
+ 8. The whole-database sweep (8.3) proves rendering does not crash and does
+    not produce ambiguous or duplicate cells. It does not prove the rendered
+    text is CORRECT — 4.2 is the worked example.
+
+ 9. The live cross-port nuclei collision was NOT re-triggered (6.3). Two
+    further deepscans of pentest-ground.com — the host it was seen on —
+    have now failed to reproduce it (scans 128 and 139), because nuclei
+    matched the Redis templates from the :80 probe only and returned no
+    matches from :443. Proven by unit test and by a clean end state; the
+    live skip path remains unobserved since scan 127.
+
+10. A CVE duplicate-insert path (4.3) is documented and NOT fixed in this
+    pass. Reports are correct because the render-time guard collapses it
+    loudly, but the database carries a duplicate row on affected deepscans.
+    Deliberately deferred rather than fixed late in a pass whose live
+    deepscans had already run — a collection-time change to CVE enrichment
+    needs its own live re-verification, which there was no remaining scan
+    budget for. Reproduced on two independent hosts, so it is not
+    target-specific.
+
+11. Two report lines still exceed the 78-column width (both top-findings
+    lines, e.g. "Missing security header: Strict-Transport-Security" at 79
+    chars). Pre-existing, from smoke_test7's identifier work, not introduced
+    or altered here; the new Endpoint/Reference cells are width-bounded by
+    _fit(). Recorded because a reader may notice it and wonder if this pass
+    caused it.
+
+12. The scan-130 report was written before three later fixes in this pass
+    (nuclei endpoint, ZAP remediation preservation, the field-width fix), so
+    its stored .txt/.pdf reflect the code at 19:44, not the final code. It
+    was left as written rather than regenerated: it is the record of that
+    run. Scans 138 and 139 exercise the final code end to end.
+
+
+10. FINAL VERDICT
+================================================================================
+Every phase in the brief was completed, and the two that could not be
+completed as scoped say so rather than being quietly reported as done.
+
+Phase 1 — the backfill was measured, presented with the evidence distinction
+that mattered (cve_id is recovered from scan-time logs; port would be
+inferred from template behaviour), and DECIDED by the user before anything
+was written. 30 rows corrected, port untouched by decision, 2 rows skipped
+because the evidence did not support them, and the reversal path exercised
+rather than assumed.
+
+Phase 2 — the gap was considerably larger than "the wrappers know their
+scheme". gobuster's Size and redirect were never parsed; dirb captured SIZE
+in a regex group and dropped it two lines later; nikto's test id, URI,
+citation and server banner were all discarded; ZAP was keeping 4 fields of
+~20 and throwing away its own remediation advice, matched URL, evidence and
+parameter. All now populated from the tools' own output, with fields the
+tools genuinely do not report left undetermined rather than guessed.
+
+Phase 3 — six second-pass runs reproduced their smoke_test7 counterparts
+exactly; the two never-re-run scanme.nmap.org profiles now run under the
+current codebase; and the cross-port dedup re-trigger was attempted and
+FAILED to reproduce, with nuclei's own output showing why. Ten runs, zero
+tool failures.
+
+Phase 4 — the scope note says what webaudit actually does (nuclei in DAST
+mode for XSS) rather than the convenient falsehood that it does not run
+nuclei at all, from one shared source read by the text report, the PDF and
+the CLI banner.
+
+Phase 5 — the previous commit's contents are split by origin, with the
+attribution method and its limit both stated.
+
+Three defects were found by doing the work rather than by the brief:
+  - a tool's own remediation being overwritten with generic advice (4.1)
+  - a REGRESSION this pass introduced, where adding a column silently
+    reclassified every stored untyped finding as a nikto finding and
+    produced a confident, wrong remediation naming a tool that never ran
+    (4.2)
+  - a CVE duplicate-insert path in deepscan, reproduced on two hosts (4.3)
+
+The second of those is the one worth remembering. It was not caught by 317
+unit assertions, and not caught by a sweep that renders all 137 scans and
+checks every cell for ambiguity. It was caught by reading one rendered
+report and noticing that a stealthscan finding had been told to review a
+nikto result. The evidence in this file is real and mechanical, and 4.2 is
+the standing reminder of what mechanical evidence does not cover.

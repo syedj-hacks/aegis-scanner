@@ -1,0 +1,577 @@
+================================================================================
+AEGIS SCANNER — SMOKE TEST REPORT #9
+The CVE duplicate-insert path, fixed where it is produced;
+and finding attribution turned from an assumption into a checked property
+================================================================================
+
+1. RUN METADATA
+--------------------------------------------------------------------------------
+Date (start)            : 2026-07-25 22:20 PKT
+Date (end)              : 2026-07-25 23:50 PKT
+Targets                 : 172.28.0.20   (local DVWA Docker fixture — the host
+                                         that reproduced the CVE duplicate on
+                                         2026-07-25, scan 130)
+                          172.28.0.10   (local WordPress Docker fixture —
+                                         scanned because §3.2 needed a live
+                                         wordpress_fingerprinted finding, and
+                                         this is the fixture that raises one)
+Profiles run            : deepscan (x3), quickscan, stealthscan, compliance,
+                          webaudit
+Invocation form         : python3 aegis.py <target> --profile <profile>
+                          --non-interactive
+Scans produced          : 140-146
+
+This pass had two objectives, both carried forward from smoke_test8 as OPEN:
+
+  - §4.3 / §9.10: deepscan inserts a genuine duplicate CVE row every time a
+    host's nmap product and its Server header name the same software. The
+    render-time guard collapses it in reports; the database keeps both rows.
+  - §4.2: the finding-attribution regression that a whole-database sweep and
+    317 assertions both passed straight through, because nothing anywhere
+    checked whether a finding was credited to a tool that actually ran.
+
+Both are now closed, and both were closed with live evidence rather than unit
+tests alone. The order below is the order the work was done in: the duplicate
+was REPRODUCED live before a line was changed (§2.1), and re-run against the
+same host afterwards (§2.6).
+
+Two further attribution defects were found by the audit §3 asked for. Neither
+was in the brief. Both were real, both are fixed, and one of them was
+mis-crediting a finding in every report that has ever contained it.
+
+
+2. PHASE 1 — THE CVE DUPLICATE-INSERT PATH, FIXED AT COLLECTION TIME
+================================================================================
+
+2.1 Reproduced live before anything was changed
+--------------------------------------------------------------------------------
+smoke_test8 saw this on two independent hosts (scan 130, 172.28.0.20; scan
+138, scanme.nmap.org). Before a line was changed, it was reproduced a third
+time — on 172.28.0.20, the host from scan 130, chosen because it is local and
+takes eight minutes rather than half an hour:
+
+    scan 140   deepscan 172.28.0.20   2026-07-25 22:32   484.6s
+
+The run's own console output, unedited:
+
+    [*] [CVE] Querying NVD for 'Apache httpd 2.4.25'          <- service detect
+    [+] [CVE] 1 CVE(s) matched 'Apache httpd 2.4.25'
+    [*] [CVE]   CVE-2016-8743 — CVSS 7.5 (HIGH)
+    [*] [CVE] Querying NVD for 'apache http server 2.4.25'    <- header banner
+    [+] [CVE] 3 CVE(s) matched 'apache http server 2.4.25'
+    [*] [CVE]   CVE-2017-7659 — CVSS 7.5 (HIGH)
+    [*] [CVE]   CVE-2016-8743 — CVSS 7.5 (HIGH)
+    [*] [CVE]   CVE-2016-4975 — CVSS 6.1 (MEDIUM)
+
+and the rows it wrote:
+
+    sqlite> select id,port,service,product,cve_id,severity from findings
+            where scan_id=140 and cve_id is not null order by cve_id;
+
+    5910  80  Apache        Apache        CVE-2016-4975  MEDIUM
+    5896  80  Apache httpd  Apache httpd  CVE-2016-8743  HIGH     <- path 1
+    5909  80  Apache        Apache        CVE-2016-8743  HIGH     <- path 2
+    5908  80  Apache        Apache        CVE-2017-7659  HIGH
+
+    sqlite> select cve_id,port,count(*) from findings where scan_id=140
+            and cve_id is not null group by cve_id,port having count(*)>1;
+    CVE-2016-8743|80|2
+
+    [!] [Summary] duplicate collapsed: CVE-2016-8743 (type=cve, port=80,
+        severity=HIGH) — 1 extra copy(ies) dropped, 1 kept
+
+2.2 The two call sites
+--------------------------------------------------------------------------------
+Both are in modules/profiles/deepscan.py and both are correct in isolation:
+
+  _enrich_services()  (scanning phase, line ~200)
+      for each service nmap -sV identified, lookup_cves(product, version)
+      -> _findings_from_cves(cves, svc.port, svc.service)
+      -> insert_findings_bulk() before the web phase starts
+
+  the web loop      (web phase, line ~790)
+      for each web port, check_headers() -> lookup_cves_from_banner(banner)
+      -> _findings_from_cves(cves, port, banner)
+      -> insert_findings_bulk() per port
+
+Neither knows the other exists. On a host where nmap's product and the
+Server header describe the same software, the same CVE arrives twice with
+the same port, and both inserts land. The two rows are not byte-identical —
+path 1 stores product "Apache httpd", path 2 stores "Apache" — which is why
+they read as two findings in the database and why the next section matters.
+
+2.3 The brief's preferred fix was tested against the evidence, and rejected
+--------------------------------------------------------------------------------
+The brief's option (a) was a shared "already looked up" cache keyed on
+product+version, with the second call site skipping the redundant NVD call or
+reusing the first result. Scan 140 rules both halves of that out:
+
+  - The keys do not match. nmap reports "Apache httpd"; the Server header
+    parses to "Apache" (cve_lookup._parse_banner + _disambiguate_product then
+    send "apache http server"). Same software, two different product strings,
+    so a product-keyed cache never fires on the very case it was meant for.
+
+  - The second lookup is NOT redundant. It returned three CVEs, of which only
+    ONE was the duplicate. CVE-2017-7659 and CVE-2016-4975 came back from the
+    header query alone. Skipping the second call, or reusing the first
+    result for it, would have silently cost two real HIGH/MEDIUM findings —
+    trading a duplicate row for missing vulnerabilities, which is the worse
+    defect by a wide margin.
+
+That leaves the brief's own alternative — the CVE id, which is known by the
+time a finding exists — and it is also the shape smoke_test7 §3.4 set the
+precedent for.
+
+2.4 The fix
+--------------------------------------------------------------------------------
+modules/profiles/deepscan.py:
+
+    _findings_from_cves(cves, port, service_name, seen=None)
+
+`seen` is a scan-wide set of (cve_id, port) pairs, created once in
+run_deepscan() and passed to BOTH call sites. A CVE whose (id, port) pair is
+already in the set is not turned into a finding, and says so on the console:
+
+    [*] deepscan CVE-2016-8743 was already recorded on port 80 by an earlier
+        lookup — not recorded twice
+
+Deliberately the same shape as _findings_from_nuclei()'s
+(template_id, matched_port) guard from smoke_test7 §3.4 — the same problem
+(one scan, two paths, one finding) solved the same way, rather than a second
+mechanism doing the same job differently. The insert layer (database/db.py)
+is untouched; no schema change was needed and none was made.
+
+A CVE that carries no id cannot be keyed and is never dropped by the guard
+(t_phase9 §A).
+
+2.5 Safety: the same CVE in a different context still counts twice
+--------------------------------------------------------------------------------
+The key includes the port precisely so that the fix cannot suppress two
+genuinely different findings, which is the failure mode this class of change
+risks. Verified (t_phase9 §C):
+
+    same CVE, port 80 and port 8080         -> BOTH recorded
+    three different CVEs, one port          -> all three recorded
+    same CVE, same port, two lookups        -> one recorded
+    two portless copies of one CVE          -> one recorded, and this is the
+                                               documented limit of the key:
+                                               (cve, None) cannot distinguish
+                                               two services with no port
+
+The last line is stated rather than hidden. deepscan always has a port for a
+CVE finding (both paths are per-service or per-port), so it does not arise in
+practice, but the key would collapse it if it did.
+
+2.6 Verified live, same host, same conditions
+--------------------------------------------------------------------------------
+    scan 141   deepscan 172.28.0.20   2026-07-25 22:46   486.9s
+
+Both NVD queries ran exactly as before — the guard does not suppress the
+lookup, only the second row:
+
+    [*] [CVE] Querying NVD for 'Apache httpd 2.4.25'
+    [*] [CVE]   CVE-2016-8743 — CVSS 7.5 (HIGH)
+    [*] [CVE] Querying NVD for 'apache http server 2.4.25'
+    [*] [CVE]   CVE-2017-7659 — CVSS 7.5 (HIGH)
+    [*] [CVE]   CVE-2016-8743 — CVSS 7.5 (HIGH)
+    [*] [CVE]   CVE-2016-4975 — CVSS 6.1 (MEDIUM)
+    [*] deepscan CVE-2016-8743 was already recorded on port 80 by an earlier
+        lookup — not recorded twice
+
+Before and after, from the database itself:
+
+    scan_id  cve_id         port  rows
+    -------  -------------  ----  ----
+    140      CVE-2016-4975    80    1
+    140      CVE-2016-8743    80    2      <- the duplicate
+    140      CVE-2017-7659    80    1
+    141      CVE-2016-4975    80    1
+    141      CVE-2016-8743    80    1      <- fixed
+    141      CVE-2017-7659    80    1
+
+    total findings   scan 140: 49     scan 141: 48
+
+All three CVEs are still present. The only row that disappeared is the
+duplicate. The database and the rendered report now agree on the count for
+this scan (48 and 48); on scan 140 they differed by one (49 and 48).
+
+Confirmed a second time by scan 146 — the same profile against the same host
+under the system interpreter with the full toolset (19 tools, 0 failures,
+ZAP included): one row per CVE, and no render-time collapse logged.
+
+2.7 The render-time guard still fires, and now fires less
+--------------------------------------------------------------------------------
+summary.deduplicate_findings() is untouched. It was not built for this
+producer and must stay for any other:
+
+    scan 140 (pre-fix)  : "duplicate collapsed: CVE-2016-8743 ..." x1
+    scan 141 (post-fix) : no collapse logged at all
+
+Its behaviour is re-asserted directly in t_phase9 §D — an identical pair
+still collapses, and the same CVE on two ports still does not.
+
+
+3. PHASE 2 — THE ATTRIBUTION PATTERN, AUDITED CODEBASE-WIDE
+================================================================================
+
+3.1 What was audited, and what was found
+--------------------------------------------------------------------------------
+The §4.2 defect was a classifier deciding "is this a nikto finding?" from a
+KEY BEING PRESENT on a dict, on a row read back from SQLite where every
+column is present by definition. The audit looked for every other place a
+finding's type/tool is decided by anything other than the persisted
+finding_type.
+
+Searched: every `"x" in dict` / `.keys()` membership test in modules/,
+database/ and aegis.py; every function taking a finding/row; and every
+static finding_type -> tool mapping the reports render from.
+
+    key-presence classification, other instances : NONE
+        The only two were severity._finding_type and
+        remediation._finding_kind, both fixed in smoke_test8. The remaining
+        `"in"` hits in the codebase are substring tests on text
+        ("legacy protocol" in issue) and PROFILES.keys() in the CLI.
+
+    static mis-attribution                       : TWO (3.2, 3.3)
+    untyped rows at the source                   : THREE producers (3.4)
+
+3.2 wordpress_fingerprinted was credited to a tool that never produced it
+--------------------------------------------------------------------------------
+summary.FINDING_TYPE_TOOL mapped:
+
+    "wordpress_fingerprinted": "wpscan"
+
+That finding is raised by GOBUSTER. gobuster_wrap sets
+`wordpress_fingerprinted` when its path sweep hits a /wp-* marker; deepscan
+and webaudit both map that flag to the finding. wpscan is what the flag
+TRIGGERS afterwards (CONDITIONAL_TOOLS), not what found it — and webaudit
+never runs wpscan at all.
+
+Consequence, on both rows that existed before this pass (row 4711, scan 32,
+webaudit/daraz.pk; row 5052, scan 88, deepscan/172.28.0.10): every
+unpopulated cell on that finding rendered "not determined by wpscan", naming
+a tool that had not run. The same defect as §4.2 with a different mechanism:
+there the wrong type was inferred, here the right type named the wrong tool.
+
+The webaudit case is the flagrant one — wpscan is not wired into that profile
+at all, so the credit could never have been right. In deepscan wpscan may
+genuinely run afterwards, triggered by this very finding, which is what made
+the mapping look plausible for as long as it did.
+
+    Fixed: "wordpress_fingerprinted": "gobuster".
+
+The finding's remediation text — which advises running wpscan against the
+install — is correct and unchanged. Advice to run a tool and credit for
+having run it are different claims.
+
+3.3 sslyze findings had no attribution at all
+--------------------------------------------------------------------------------
+compliance and webaudit both emit `sslyze_finding`, and it was absent from
+FINDING_TYPE_TOOL and from every _NOT_APPLICABLE table. An sslyze finding
+therefore rendered "not determined" with no tool named, and its CVE/CVSS
+cells read as gaps rather than as fields a TLS-configuration finding never
+has. No stored row has this type yet (compliance's sslyze pass has produced
+no issues on the targets scanned so far), so nothing rendered wrongly — this
+is a gap closed before it could, found by the same audit.
+
+    Added: FINDING_TYPE_TOOL["sslyze_finding"] = "sslyze", plus
+    cve_id/cvss/version/endpoint/reference N/A entries.
+
+3.4 The root enabler: three profiles were still inserting untyped rows
+--------------------------------------------------------------------------------
+194 stored findings carry a NULL finding_type today; smoke_test8 §9.7 counted
+187 at the time it was written, the difference being rows its own later scans
+added. A row with no declared type MUST be classified
+by shape when a report reads it — which is the machinery §4.2's bug lived
+in. Fixing the classifiers made the guesswork correct; it did not stop the
+guessing.
+
+Three insert sites were producing those rows:
+
+    stealth.py:82      insert_findings_bulk(scan_id, open_ports)
+    compliance.py:138  findings.extend(open_ports)
+    quickscan.py:161   findings = service_result.get("services")
+
+All three now stamp the type at the source — "open_port" for the two nmap
+port lists, "service_version" for quickscan's nmap -sV services. Rows written
+from here on declare what they are and are never shape-sniffed. Verified live
+in §6.2: every finding row written by scans 140-146 carries a finding_type,
+and the NULL count across the whole database is still 194 — it stopped
+growing rather than being rewritten.
+
+The rendering improves as a side effect, which is the point restated: scan
+143's stealthscan row now reads
+
+    Service : http (version N/A (port observation))
+    CVE     : N/A (port observation)
+    CVSS    : N/A (no CVE to score)
+
+where the same row on scan 134 read "not determined" — the report can now
+tell "this field cannot apply here" from "nobody filled this in" because the
+row says what it is.
+
+Historical NULL rows are NOT rewritten. They render honestly today (§4.4
+shows the attribution check passes on all of them), and rewriting stored scan
+history needs the same confirm-first process smoke_test8 §2 used for the
+cve_id/cvss backfill.
+
+3.5 The two known classifiers, re-checked under the current schema
+--------------------------------------------------------------------------------
+Phase 1 added no columns, so the schema they were fixed against is the schema
+they run against. Both were re-verified anyway, mechanically:
+
+  - both read finding_type first: a row that declares "open_port" while
+    carrying a truthy `reference` classifies as open_port (t_phase9 §F)
+  - both agree with each other on every shape tested and on every row in the
+    database — asserted, not assumed, because their docstrings claim to be
+    one contract (t_phase9 §E, and the classifier_disagree check in the sweep)
+
+
+4. PHASE 3 — ATTRIBUTION CORRECTNESS AS A TEST CLASS
+================================================================================
+
+4.1 modules/reporting/attribution.py
+--------------------------------------------------------------------------------
+A new module, three checks, run over every row of every scan:
+
+  1. TOOL PLAUSIBILITY   classify the row exactly as a report does, map that
+                         kind to the tool(s) that can PRODUCE it
+                         (FINDING_TYPE_PRODUCERS), and require at least one
+                         of them to be a tool the scan's profile runs
+                         (PROFILE_PRODUCERS).
+
+  2. CLASSIFIER AGREEMENT  severity.py and remediation.py must classify the
+                         row identically. Documented as one contract since
+                         smoke_test8; checked here.
+
+  3. FIELD SIGNATURE     a column summary.py declares inapplicable for a
+                         finding type must be NULL on rows of that type, and
+                         a type's identity column (a `cve` with no cve_id)
+                         must be populated. This is the check aimed at the
+                         NEXT shared column: `reference` was added for
+                         nikto/ZAP/wpscan and instantly became true of every
+                         row; check 3 notices when a new column lands on a
+                         finding type that has no business carrying it.
+
+One detail decided the module's correctness. The check classifies
+summary._enrich()'s output, not the raw row — _enrich() fills a NULL
+description with the derived sentence, and the §4.2 branch could only fire
+once a description existed. Checking raw rows would have missed the exact
+bug this exists for; that is asserted in t_phase9 §F rather than left as a
+comment.
+
+4.2 What a clean sweep does NOT prove
+--------------------------------------------------------------------------------
+The database stores scans and findings. It does NOT store which tools ran for
+a given scan — tool_results lives in memory for the duration of a run and
+reaches the reports, not the schema. So check 1 cross-references the set of
+tools the scan's PROFILE runs, which is the strongest honest answer available
+to "could this tool have produced this row".
+
+    It catches      : a finding credited to a tool the profile never invokes
+                      — the whole class §4.2 belongs to, and the class §3.2
+                      belonged to.
+    It cannot catch : a tool that is wired into the profile but was skipped,
+                      failed, or never reached on that particular run.
+
+Persisting a per-scan tools-run record would close that gap and is the
+obvious next step; it is a schema change and was not made on the way past.
+
+4.3 Wired into the sweep, not left as a separate step
+--------------------------------------------------------------------------------
+The whole-database render sweep smoke_test5-8 ran lived in a scratch
+directory (/tmp/...), like the test suite before smoke_test8 §8.2 rescued it.
+It is now tests/db_sweep.py, in the repository, with the attribution check as
+a fourth column of its output:
+
+    python tests/db_sweep.py            # every scan
+    python tests/db_sweep.py 141 142    # named scans
+
+    scans rendered      : 144/144
+    crashes             : 0
+    ambiguous cells     : 0
+    dup top-find scans  : 0
+    attribution issues  : 0
+      of which historical: 2 (known, not counted — see KNOWN_HISTORICAL)
+
+Exit status is non-zero if anything fails, so it is usable as a gate. The
+attribution check is not a separate command anyone has to remember, which was
+the point: the §4.2 bug survived because the question was nobody's job.
+
+4.4 The current database: two historical rows, reported not corrected
+--------------------------------------------------------------------------------
+Run across all 144 scans and 6,118 findings, the check reports exactly two
+mismatches, both in the project's first two days:
+
+    row 1  scan 1, 2026-07-23 21:50, example.com, profile "quickscan"
+           CVE-2021-41773 / CVSS 9.8 / "Apache 2.4.49"
+    row 4  scan 3, 2026-07-24 03:33, scanme.nmap.org, profile "quickscan"
+           CVE-2021-44224 / CVSS 8.2
+
+quickscan performs no NVD lookup in the current code, so both rows are
+credited to a producer their profile does not run. What the evidence shows:
+
+  - the quickscan orchestrator's first commit is c071b97, 2026-07-24 04:15.
+    Row 1 was written the day BEFORE it existed; row 4 about 40 minutes
+    before it landed.
+  - neither row has a description, a finding_type or a product, and
+    example.com does not serve Apache 2.4.49.
+
+Both are consistent with early db.py-layer testing recorded against a scans
+row labelled "quickscan", not with a scan that ran. They are NOT rewritten —
+the same standing rule smoke_test8 §2 applied to the backfill. They are
+listed by row id in tests/db_sweep.py:KNOWN_HISTORICAL, printed on every run
+with a "[known historical]" marker, and excluded only from the exit status so
+that a new, real mismatch cannot hide in a permanently-red gate.
+
+
+5. PHASE 4 — THE TEST SUITE IS WHERE IT SHOULD BE
+================================================================================
+    tests/ is tracked                : yes — git ls-files lists all five
+                                       previous files plus tests/fixtures/
+    tests/ is gitignored             : no — `git check-ignore` returns
+                                       nothing for tests/t_phase9.py and
+                                       tests/db_sweep.py (.gitignore's
+                                       "!tests/fixtures/*.json" line keeps
+                                       the JSON fixture out of the *.json
+                                       ignore)
+    /tmp references in tests/        : none. tempfile.mkdtemp() is used for
+                                       throwaway databases, which is correct.
+    new tests written to             : tests/t_phase9.py, tests/db_sweep.py
+                                       — in the repository, first time,
+                                       not a scratch directory
+
+One wart, unfixed and stated: tests/t_phase3.py and tests/t_phase8.py still
+hardcode /home/jafar/aegis-scanner in sys.path and in one sqlite3.connect().
+They run, they are tracked, and they are not in /tmp; the new files use a
+path derived from __file__ instead.
+
+
+6. PHASE 5 — FULL VERIFICATION
+================================================================================
+
+6.1 Test suite
+--------------------------------------------------------------------------------
+    tests/t_phase2.py      36 assertions   0 failures
+    tests/t_phase3.py      47              0
+    tests/t_phase4.py      40              0
+    tests/t_phase8.py     183              0
+    tests/t_pty.py         11              0
+    tests/t_phase9.py      58              0   <- new this pass
+    -----------------------------------------
+    TOTAL                 375              0
+
+t_phase9's CVE fixtures are the real NVD results from scan 140 — the run that
+reproduced the duplicate. No invented tool output.
+
+6.2 Live scans this pass
+--------------------------------------------------------------------------------
+(db = stored rows, rpt = rows the report renders, untyped = rows with a NULL
+finding_type, severity counted from the stored column — "ungraded" is a row
+whose severity is NULL in the database, which the reports normalise on read)
+
+ scan target       profile      secs   db  rpt  untyped  severity            tools f s
+ -----------------------------------------------------------------------------------
+  140 172.28.0.20  deepscan    484.6   49   48        0  1C 3H  8M 37L        19 1 0
+  141 172.28.0.20  deepscan    486.9   48   48        0  1C 2H  8M 37L        19 1 0
+  142 172.28.0.20  quickscan    81.5    2    2        0  1C, 1 ungraded        5 0 0
+  143 172.28.0.20  stealthscan   9.7    1    1        0  1 ungraded            2 0 0
+  144 172.28.0.20  compliance    1.4    2    2        0  1L, 1 ungraded        1 0 0
+  145 172.28.0.10  webaudit    742.7   71   71        0  2C 5H  7M 57L        13 0 0
+  146 172.28.0.20  deepscan    510.1   57   57        0  1C 2H 10M 44L        19 0 0
+ -----------------------------------------------------------------------------------
+
+    140  PRE-FIX reproduction. db 49 vs rendered 48 — the duplicate row,
+         collapsed at render time. This is the last scan in this database
+         that will show that gap.
+    141  POST-FIX, same host, same conditions. db and rendered agree. One
+         HIGH fewer than 140: the duplicate copy of CVE-2016-8743.
+    142-144  the three profiles whose insert sites were changed in §3.4.
+         `untyped 0` is the point of those rows: every finding they wrote
+         declares its own finding_type. Compare scan 134 (stealthscan,
+         smoke_test8) whose two rows are both NULL.
+    145  webaudit against the WordPress fixture — the run that exercises
+         §3.2 end to end. Its report renders the wordpress_fingerprinted
+         finding as "not determined by gobuster"; before this pass the same
+         finding in the same profile said "not determined by wpscan", a tool
+         webaudit does not run.
+    146  POST-FIX deepscan re-run under the SYSTEM python3, the interpreter
+         previous passes used. Scans 140-145 ran inside venv/, which does not
+         have python-owasp-zap-v2.4 installed (requirements.txt lists it;
+         the system interpreter has it) — that is the "tools failed: 1" on
+         140 and 141, and it is why those two produced no zap_finding rows.
+         Both sides of the before/after comparison ran under the same
+         interpreter, so it does not affect §2.6, but the run was repeated
+         with the full toolset rather than left as a caveat: 19 tools, 0
+         failures, 9 ZAP findings, and one row per CVE.
+
+    Neither 141 nor 146 logged a render-time duplicate collapse at all.
+
+6.3 Whole-database sweep
+--------------------------------------------------------------------------------
+See §4.3 — 144/144 scans rendered, 0 crashes, 0 ambiguous cells, 0 duplicate
+top-finding lines, 0 live attribution issues, exit status 0.
+
+
+7. WHAT CHANGED
+================================================================================
+    modules/profiles/deepscan.py     scan-wide (cve_id, port) set shared by
+                                     both CVE-enrichment paths (§2.4)
+    modules/reporting/summary.py     wordpress_fingerprinted -> gobuster;
+                                     sslyze_finding tool + N/A entries (§3.2,
+                                     §3.3)
+    modules/profiles/stealth.py      open_port type stamped at insert
+    modules/profiles/compliance.py   open_port type stamped at insert
+    modules/profiles/quickscan.py    service_version type stamped at insert
+    modules/enrichment/severity.py   public finding_kind() entry point
+    modules/enrichment/remediation.py  public finding_kind() entry point
+    modules/reporting/attribution.py NEW — the attribution check class
+    tests/db_sweep.py                NEW — the whole-database sweep, now in
+                                     the repo, with attribution wired in
+    tests/t_phase9.py                NEW — 58 assertions
+
+
+8. HONEST LIMITATIONS
+================================================================================
+ 1. The attribution check verifies a finding against the tools its PROFILE
+    runs, not against the tools that actually ran on that scan — there is no
+    per-scan tools-run record in the schema to check against (§4.2). A
+    finding credited to a wired-but-skipped tool would pass.
+
+ 2. Two historical rows (1 and 4) remain attribution mismatches and are
+    excluded from the sweep's exit status by an explicit, printed allowlist.
+    They are wrong in the database and are left that way deliberately (§4.4).
+
+ 3. 194 stored rows still carry a NULL finding_type and are still classified
+    by shape when rendered. The three producers are fixed (§3.4) so the
+    number stops growing, but the existing rows are unchanged and the
+    shape-sniffing fallback still exists for them. It cannot be removed while
+    they do.
+
+ 4. The (cve_id, port) dedup key collapses two CVE findings that share an id
+    and have NO port (§2.5). deepscan always records a port for these, so it
+    is unreachable today, not impossible in principle.
+
+ 5. webaudit has only one CVE-enrichment path (per web port), so it did not
+    need and did not get the shared set. If a second path is ever added
+    there, the same guard has to be added with it — the attribution sweep
+    will not catch a duplicate, only a mis-credit.
+
+ 6. §3.3's sslyze fix is verified by unit test and by rendering, not by a
+    live sslyze finding: no target scanned so far has produced one.
+
+ 7. The repository's venv/ is missing python-owasp-zap-v2.4, which
+    requirements.txt lists and the system interpreter has. Scans 140-145 ran
+    inside that venv; the two deepscans among them (140, 141) therefore ran
+    no ZAP and report "tools failed: 1" (§6.2 — the other three profiles do
+    not run ZAP, so they are unaffected). Found by this pass, left as-is
+    because installing into someone's virtualenv was not part of the brief,
+    and worked around by re-running the verification deepscan under the
+    system interpreter (scan 146, 0 failures). Anyone running
+    `venv/bin/python aegis.py ... --profile deepscan` today gets one tool
+    down.
+
+ 8. This pass's live scans all ran against the two local Docker fixtures.
+    The duplicate was reproduced on public hosts before (scans 130, 138) and
+    the mechanism is target-independent, but no public target was re-scanned
+    after the fix.

@@ -18,9 +18,9 @@ exception (same approach as modules/scanning/banner.py).
 import requests
 import urllib3
 
-from modules.utils.error_handler import safe_call
+from modules.utils.error_handler import safe_call, is_user_skip
 from modules.utils.logger import (
-    log_tool_start, log_tool_success, log_tool_failure, log_finding,
+    log_tool_start, log_tool_success, log_tool_failure, log_tool_skip, log_finding,
 )
 from modules.utils.display import (
     print_info, print_success, print_warning, print_error,
@@ -135,6 +135,7 @@ def check_headers(target: str, port: int = 80, use_https: bool = False) -> dict:
     log_tool_start(target, "header_check")
 
     result = {
+        "tool": "header_check",
         "target": target,
         "port": port,
         "missing_headers": [],
@@ -142,6 +143,11 @@ def check_headers(target: str, port: int = 80, use_https: bool = False) -> dict:
         "server_banner": None,
         "powered_by": None,
         "error": None,
+        # Required by every profile's failure count: a result carrying an
+        # error but not marked skipped is reported as a FAILED tool. This
+        # module drives requests via safe_call() rather than run_tool(), so
+        # it has to set the flag itself — see the assignment below.
+        "skipped": False,
     }
 
     url = _build_url(target, port, use_https)
@@ -157,6 +163,16 @@ def check_headers(target: str, port: int = 80, use_https: bool = False) -> dict:
     if not outcome.get("success"):
         err = outcome.get("error") or "request failed"
         result["error"] = err
+
+        if is_user_skip(err):
+            # A deliberate Ctrl+C, not a failure. Without this the profiles
+            # counted — and, since the failure-reporting change, printed —
+            # the user's own skip as a tool failure.
+            result["skipped"] = True
+            log_tool_skip(target, "header_check")
+            print_warning(f"[Headers] {url} skipped by user")
+            return result
+
         # safe_call already logged via log_tool_failure; this line records
         # the target/port context the generic wrapper doesn't know about.
         log_tool_failure(target, "header_check", f"{url} — {err}")

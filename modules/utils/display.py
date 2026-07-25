@@ -75,10 +75,27 @@ def print_severity_badge(severity: str) -> str:
     return f"[{color}]{sev}[/{color}]"
 
 
+_DESCRIPTION_MAX = 70
+
+
+def _truncate(text: str, limit: int = _DESCRIPTION_MAX) -> str:
+    text = str(text or "").strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
 def print_table(findings: list, title: str = "Vulnerability Findings"):
     """
     findings: list of dicts, each with keys:
-    port, service, version, cve_id, cvss, severity, remediation (optional)
+    port, service, version, cve_id, cvss, severity, description (optional),
+    remediation (optional)
+
+    Port/Service/Version/CVE/CVSS are blank ("-") for the non-CVE finding
+    types (a gobuster path, a missing header, a nikto line, ...) that make
+    up most findings outside deepscan's service-enrichment pass — without a
+    Description column those rows render as almost nothing but a severity
+    badge. Description is included whenever the caller supplied one (every
+    finding read back through reporting/summary.py has one — see
+    summary._describe()) precisely so those rows are still legible here.
     """
     table = Table(title=title, show_lines=True, header_style="bold magenta")
     table.add_column("Port", justify="center")
@@ -87,6 +104,7 @@ def print_table(findings: list, title: str = "Vulnerability Findings"):
     table.add_column("CVE")
     table.add_column("CVSS", justify="center")
     table.add_column("Severity", justify="center")
+    table.add_column("Description")
 
     # Sort worst-first so Critical/High surface at the top
     def sort_key(f):
@@ -101,6 +119,7 @@ def print_table(findings: list, title: str = "Vulnerability Findings"):
             f.get("cve_id", "-"),
             str(f.get("cvss", "-")),
             print_severity_badge(f.get("severity", "INFO")),
+            _truncate(f.get("description", "-")),
         )
     console.print(table)
 
@@ -171,18 +190,30 @@ def scan_progress_bar(total_steps: int, description: str = "Scanning"):
         yield advance
 
 
-def print_summary(target: str, stats: dict):
+def print_summary(target: str, stats: dict, show_tool_counts: bool = True):
     """
-    Final end-of-scan summary panel.
-    stats: {critical: int, high: int, medium: int, low: int, tools_run: int, tools_failed: int}
+    End-of-scan summary panel.
+    stats: {critical, high, medium, low, tools_run, tools_failed, tools_skipped}
+
+    show_tool_counts=False drops the "Tools run/failed/skipped" line —
+    used by report_txt.py's mid-run preview panel, which renders before the
+    profile orchestrator's real tool-stats dict exists yet (summary_stats()
+    only has DB-derived severity counts at that point). Showing a
+    permanently-zero tool-count line there was more misleading than useful;
+    the final SCAN SUMMARY panel that follows immediately after already
+    shows the real counts.
     """
     body = (
         f"[bold]Target:[/bold] {target}\n\n"
         f"{print_severity_badge('CRITICAL')}: {stats.get('critical', 0)}   "
         f"{print_severity_badge('HIGH')}: {stats.get('high', 0)}   "
         f"{print_severity_badge('MEDIUM')}: {stats.get('medium', 0)}   "
-        f"{print_severity_badge('LOW')}: {stats.get('low', 0)}\n\n"
-        f"[dim]Tools run: {stats.get('tools_run', 0)} | "
-        f"Tools failed: {stats.get('tools_failed', 0)}[/dim]"
+        f"{print_severity_badge('LOW')}: {stats.get('low', 0)}"
     )
+    if show_tool_counts:
+        body += (
+            f"\n\n[dim]Tools run: {stats.get('tools_run', 0)} | "
+            f"Tools failed: {stats.get('tools_failed', 0)} | "
+            f"Tools skipped by user: {stats.get('tools_skipped', 0)}[/dim]"
+        )
     console.print(Panel(body, title="SCAN SUMMARY", border_style="bold cyan"))

@@ -107,6 +107,54 @@ TOOL_TIMEOUTS = {
 def get_timeout(tool_name: str) -> int:
     return TOOL_TIMEOUTS.get(tool_name.lower(), TOOL_TIMEOUTS["default"])
 
+# ---- nmap dynamic timeout scaling ----
+# A single TOOL_TIMEOUTS['nmap'] budget cannot fit both a top-100-port -F
+# scan and a full 65535-port '-p-' sweep. port_scanner.py inspects the
+# profile's own nmap_args and picks the matching budget below instead of
+# always using TOOL_TIMEOUTS['nmap'].
+#   full_fast : deepscan's bare '-p-' discovery pass (runs at -T4)
+#   anything else falls back to TOOL_TIMEOUTS['nmap']
+#
+# Sized as (chunks x per-chunk budget): port_scanner.py splits '-p-' into
+# 32 chunks of ~2048 ports (_FULL_RANGE_CHUNKS), so 19200 gives each chunk
+# 600s. Calibrated from a live measurement of ~9.4 ports/sec against a
+# heavily filtered host, not guessed — raise it if your targets are
+# slower, but do not lower it below (chunks x measured per-chunk time) or
+# chunks start timing out before completing even once.
+NMAP_TIMEOUTS = {
+    "full_fast": 19200,  # 32 x 600s — full port range at -T3 or faster
+}
+
+# ---- Per-profile wall-clock budgets ----
+# Ceiling on a profile's own per-port work loop, checked between ports so
+# a target with many open web ports cannot run indefinitely. Separate from
+# (and much smaller than) NMAP_TIMEOUTS['full_fast'], which budgets a
+# single full-port sweep: a thorough port sweep and a per-port web audit
+# have very different realistic completion times.
+PROFILE_TIME_BUDGET_SECONDS = {
+    "webaudit": 1800,   # 30 min
+    "deepscan": 3600,   # 60 min — web-module loop only
+}
+
+# ---- Skip-current-tool keybind ----
+# While a tool is running, pressing SKIP_KEY terminates just that
+# subprocess and advances to the next tool (see error_handler.py's
+# keyboard listener). Tools in COMPULSORY_TOOLS feed data that other
+# modules depend on downstream and cannot be skipped — the keypress is
+# acknowledged but ignored, with a message naming what depends on it.
+COMPULSORY_TOOLS = {
+    "nmap": "every downstream module (service detection, web audit, CVE "
+            "lookup, conditional tools) depends on its open-port list",
+    "nmap-sv": "CVE lookup and severity scoring depend on the "
+               "product/version it reports",
+    "nslookup": "subdomain enumeration and OSINT rely on the resolved "
+                "address",
+    "dns_resolve": "subdomain enumeration and OSINT rely on the resolved "
+                   "address",
+}
+
+SKIP_KEY = "s"
+
 # ---- Scan profile settings ----
 PROFILES = {
     "quickscan": {
@@ -116,7 +164,16 @@ PROFILES = {
     },
     "stealthscan": {
         "tools": ["nslookup", "nmap"],
-        "nmap_args": ["-T1", "-p-", "--randomize-hosts", "-Pn"],
+        # REDESIGNED: a full 65535-port '-p-' sweep at any quiet timing
+        # template is an architectural dead end — live-measured at ~0.29
+        # ports/sec at -T2 against a real filtered target (60+ hours
+        # extrapolated). No amount of chunk/timeout tuning fixes that, so
+        # this scans a curated port list at -T2 ("Polite") instead:
+        # measured at 22.5-96.0s against two real targets.
+        "nmap_args": [
+            "-T2", "-Pn", "--randomize-hosts",
+            "-p", "21,22,23,25,53,80,110,139,143,443,445,993,995,1723,3306,3389,5432,5900,8080,8443",
+        ],
         "nuclei_severity": ["critical", "high", "medium"],
     },
     "webaudit": {
@@ -126,11 +183,16 @@ PROFILES = {
     },
     "deepscan": {
         "tools": "ALL",                       # full top-20 toolset
-        "nmap_args": ["-T4", "-p-", "-sV", "-sC"],
+        # Bare discovery sweep — NO -sV/-sC. Combining either with a
+        # 65535-port sweep is nmap's slowest possible shape and, even
+        # chunked, routinely blew every chunk's budget and returned zero
+        # ports (confirmed live). service_detect.py runs -sV -sC as a
+        # second pass against only the ports this one found.
+        "nmap_args": ["-T4", "-p-"],
     },
     "compliance": {
         "tools": ["nmap", "sslyze", "whatweb"],
-        "nmap_args": ["-T4", "--script", "ssl-enum-ciphers,http-headers"],
+        "nmap_args": ["-T4", "-p", "80,443,8443", "--script", "ssl-enum-ciphers,http-headers"],
     },
 }
 
@@ -151,4 +213,13 @@ CONDITIONAL_TOOLS = {
     "hydra": "login_service_found",
     "wpscan": "wordpress_fingerprinted",
     "enum4linux": "smb_service_found",
+}
+
+# ---- Known-good targets (regression guard) ----
+# Hosts whose open ports are an established fact. port_scanner.py flags
+# loudly if a scan of one of these returns ZERO open ports, since that can
+# only be a scanner or network fault, never a real result. Keys must be
+# lowercase; values are the ports known to be open.
+KNOWN_GOOD_TARGETS = {
+    "scanme.nmap.org": [22, 80],
 }

@@ -5,9 +5,14 @@ Deepscan profile orchestrator for Aegis Scanner (Phase 8 - profiles layer).
 The full profile: everything quickscan does (DNS, profile-driven nmap port
 scan, service detection) plus subdomain enumeration, OSINT, banner grabbing,
 the full web module (header audit, nikto, gobuster, dirb, whatweb, nuclei,
-ZAP baseline) on any discovered web port, CVE lookup + severity +
-remediation on every finding, a real CONDITIONAL_TOOLS dispatch (wpscan,
-sqlmap, hydra, enum4linux), and both a text and a PDF report.
+ZAP baseline) on any discovered web port, a dedicated cross-site-scripting
+pass (nuclei `-dast -tags xss` via modules/web/xss_wrap.py, fuzzed against
+parameterised URLs built from the discovered script endpoints), CVE lookup +
+severity + remediation on every finding, a real CONDITIONAL_TOOLS dispatch
+(wpscan, sqlmap, hydra, enum4linux — sqlmap now also reads back safe DB
+metadata for a confirmed injection), and both a text and a PDF report. The
+confirmed SQLi/XSS findings carry the exact payload, parameter/endpoint and
+a response snippet, rendered in the report's Injection & Scripting section.
 
 Wrapper availability
 ---------------------
@@ -38,11 +43,19 @@ All four now have both a real detection producer and a real wrapper to
 dispatch to.
 """
 
-from modules.utils.config import get_profile, CONDITIONAL_TOOLS
+import time
+
+from modules.utils.config import get_profile, CONDITIONAL_TOOLS, PROFILE_TIME_BUDGET_SECONDS
 from modules.utils.display import (
     scan_progress_bar, print_phase, print_warning, print_success, print_error, print_info,
 )
-from modules.utils.logger import log_scan_start, log_scan_end, log_tool_failure
+from modules.utils.logger import log_scan_start, log_scan_end, log_tool_failure, get_logger
+from modules.profiles._common import (
+    warn_unavailable_tools, GLOBAL_AVAILABLE_TOOLS,
+    count_and_report_tool_failures, persist_tool_run, web_param_candidates,
+    finalise_reports,
+    nuclei_description, nuclei_port, nuclei_service, named_description,
+)
 from modules.recon.dns import resolve_dns
 from modules.recon.subdomain import enumerate_subdomains
 from modules.recon.osint import harvest_osint
@@ -60,21 +73,19 @@ from modules.web.nuclei_wrap import run_nuclei
 from modules.web.zap_wrap import run_zap_baseline
 from modules.web.wpscan_wrap import run_wpscan
 from modules.web.sqlmap_wrap import run_sqlmap
-from modules.enrichment.cve_lookup import lookup_cves
+from modules.web.xss_wrap import run_xss
+from modules.enrichment.cve_lookup import lookup_cves, lookup_cves_from_banner
 from modules.enrichment.severity import score_finding
 from modules.enrichment.remediation import get_remediation
 from database.db import insert_scan, insert_findings_bulk
-from modules.reporting.report_txt import generate_txt_report
-from modules.reporting.report_pdf import generate_pdf_report
 
 PROFILE_NAME = "deepscan"
 
-# Tool names with a real wrapper module in this codebase today.
-_AVAILABLE_TOOLS = {
-    "nslookup", "nmap", "nikto", "gobuster", "subfinder", "amass", "theharvester",
-    "dirb", "whatweb", "nuclei", "zaproxy", "banner_grab",
-    "wpscan", "sqlmap", "hydra", "enum4linux",
-}
+# Tool names this profile wires in — kept as an alias of the shared,
+# codebase-wide GLOBAL_AVAILABLE_TOOLS (modules/profiles/_common.py) rather
+# than its own local copy, which used to drift out of sync with the other
+# profiles' sets (Known Issue #8's residual gap).
+_AVAILABLE_TOOLS = GLOBAL_AVAILABLE_TOOLS
 
 # Ports/service-name hints used to decide which open ports are worth
 # running the web module against.
@@ -108,19 +119,6 @@ _LOGIN_SERVICE_MAP = {
 _SMB_PORTS = (139, 445)
 
 
-def _warn_unavailable_tools(target: str, tools, profile_name: str) -> None:
-    if not tools or tools == "ALL":
-        return
-    for tool in tools:
-        if tool not in _AVAILABLE_TOOLS:
-            msg = (
-                f"'{tool}' is listed in PROFILES['{profile_name}'] but has no "
-                "wrapper module in this codebase yet — skipping"
-            )
-            log_tool_failure(target, tool, msg)
-            print_warning(f"[{profile_name}] {msg}")
-
-
 def _is_web_port(port_entry: dict) -> bool:
     port = port_entry.get("port")
     service = str(port_entry.get("service") or "").lower()
@@ -143,9 +141,54 @@ def _score_and_remediate(findings: list) -> list:
     return out
 
 
-def _findings_from_cves(cves: list, port, service_name: str) -> list:
+def _findings_from_cves(cves: list, port, service_name: str, seen: set = None) -> list:
+    """
+    Map an NVD lookup's CVEs to findings, skipping any already recorded.
+
+    `seen` is a set of (cve_id, port) pairs accumulated across the WHOLE
+    scan, and it is what stops this profile inserting the same CVE twice.
+    deepscan enriches CVEs down two independent paths — nmap's detected
+    service product (_enrich_services, scanning phase) and the Server
+    header's product (the web loop) — and on a host where both name the
+    same software, both lookups return the same CVE. Observed live on three
+    separate hosts (scans 130, 138, 140):
+
+        [CVE] Querying NVD for 'Apache httpd 2.4.25'       <- service detect
+        [CVE]   CVE-2016-8743 — CVSS 7.5 (HIGH)
+        [CVE] Querying NVD for 'apache http server 2.4.25' <- header banner
+        [CVE]   CVE-2017-7659 — CVSS 7.5 (HIGH)
+        [CVE]   CVE-2016-8743 — CVSS 7.5 (HIGH)            <- same finding
+        [CVE]   CVE-2016-4975 — CVSS 6.1 (MEDIUM)
+
+    Two things scan 140's run settles, and which decided the shape of this
+    guard:
+
+      - the second lookup is NOT redundant. It returned two CVEs the first
+        one missed, so skipping the call (or reusing the first result for
+        the second path) would have cost two real findings.
+      - a cache keyed on product+version would not have fired anyway: nmap
+        reports the product as "Apache httpd", the Server header parses to
+        "Apache". Same software, different keys.
+
+    Keying on the CVE id and the port is therefore the only key that
+    identifies the actual duplicate — and it keeps the SAME CVE on a
+    DIFFERENT port as two separate findings, which it must: one service
+    being vulnerable on 80 and another on 8080 is two facts, not one.
+    Same shape as _findings_from_nuclei()'s (template_id, matched_port)
+    guard, for the same reason.
+    """
     findings = []
     for cve in cves:
+        cve_id = cve.get("cve_id")
+        if seen is not None and cve_id:
+            key = (cve_id, port)
+            if key in seen:
+                print_info(
+                    f"[{PROFILE_NAME}] {cve_id} was already recorded on port "
+                    f"{port} by an earlier lookup — not recorded twice"
+                )
+                continue
+            seen.add(key)
         finding = dict(cve)
         finding["port"] = port
         finding["service"] = finding.get("product") or service_name
@@ -153,9 +196,13 @@ def _findings_from_cves(cves: list, port, service_name: str) -> list:
     return _score_and_remediate(findings)
 
 
-def _enrich_services(target: str, services: list) -> list:
+def _enrich_services(target: str, services: list, seen: set = None) -> list:
     """CVE-lookup each detected service; fall back to a heuristic grade
-    when there is no product to query or NVD matched nothing."""
+    when there is no product to query or NVD matched nothing.
+
+    `seen` is the scan-wide (cve_id, port) set described in
+    _findings_from_cves() — this is the first of the two paths that fill it.
+    """
     findings = []
     for svc in services:
         product = svc.get("product")
@@ -164,7 +211,8 @@ def _enrich_services(target: str, services: list) -> list:
             cve_result = lookup_cves(product, svc.get("version"), target=target)
             cves = cve_result.get("cves") or []
         if cves:
-            findings.extend(_findings_from_cves(cves, svc.get("port"), svc.get("service")))
+            findings.extend(_findings_from_cves(cves, svc.get("port"),
+                                                svc.get("service"), seen=seen))
         else:
             raw = dict(svc, type="service_version")
             label = " ".join(x for x in (svc.get("product"), svc.get("version")) if x)
@@ -202,12 +250,56 @@ def _findings_from_headers(header_result: dict) -> list:
 
 
 def _findings_from_nikto(nikto_result: dict) -> list:
+    """nikto's own per-finding detail, not just its description text.
+
+    endpoint  — the scheme-qualified URL of the URI nikto flagged. nikto is
+                given the scheme as an argument, so http-vs-https is known
+                here for certain rather than assumed downstream. Findings
+                nikto reported without a URI (e.g. "Apache/2.4.25 appears to
+                be outdated") get the base URL, which is still true of them.
+    reference — nikto's "See: <url>" citation. Parsed since the wrapper was
+                written and dropped at insert until findings gained a
+                reference column.
+    product/version — nikto's reported Server banner, split on "/". The
+                whole scan shares one banner because it is one server.
+    """
     port = nikto_result.get("port")
-    return [
-        {"type": "nikto_finding", "port": port,
-         "description": f["description"], "reference": f["reference"]}
-        for f in nikto_result.get("findings") or []
-    ]
+    base_url = (nikto_result.get("base_url") or "").rstrip("/")
+    product = nikto_result.get("product") or None
+    version = nikto_result.get("version") or None
+
+    findings = []
+    for f in nikto_result.get("findings") or []:
+        path = f.get("path") or ""
+        endpoint = f"{base_url}{path}" if base_url else (path or None)
+        findings.append({
+            "type": "nikto_finding", "port": port,
+            "description": f["description"],
+            "reference": f.get("reference") or None,
+            "endpoint": endpoint or None,
+            "product": product,
+            "version": version,
+        })
+    return findings
+
+
+def _path_description(entry: dict, source: str = None) -> str:
+    """"Discovered path /admin (HTTP 301, 312 bytes) -> /admin/".
+
+    Size and redirect target are gobuster's/dirb's own output. They are
+    appended only when the tool actually reported them: a 0-byte page and a
+    page whose size the tool never printed are different facts, and writing
+    "0 bytes" for the second would state something the scan did not observe.
+    """
+    bits = [f"HTTP {entry.get('status_code')}"]
+    if entry.get("size") is not None:
+        bits.append(f"{entry['size']} bytes")
+    if source:
+        bits.append(f"via {source}")
+    text = f"Discovered path {entry.get('path')} ({', '.join(bits)})"
+    if entry.get("redirect"):
+        text += f" -> {entry['redirect']}"
+    return text
 
 
 def _findings_from_gobuster(gobuster_result: dict) -> list:
@@ -216,7 +308,8 @@ def _findings_from_gobuster(gobuster_result: dict) -> list:
         {
             "type": "discovered_path", "port": port,
             "path": entry["path"], "status_code": entry["status_code"],
-            "description": f"Discovered path {entry['path']} (HTTP {entry['status_code']})",
+            "description": _path_description(entry),
+            "endpoint": entry.get("url"),
         }
         for entry in gobuster_result.get("discovered_paths") or []
     ]
@@ -234,7 +327,8 @@ def _findings_from_dirb(dirb_result: dict) -> list:
         {
             "type": "discovered_path", "port": port,
             "path": entry["path"], "status_code": entry["status_code"],
-            "description": f"Discovered path {entry['path']} (HTTP {entry['status_code']}, via dirb)",
+            "description": _path_description(entry, source="dirb"),
+            "endpoint": entry.get("url"),
         }
         for entry in dirb_result.get("discovered_paths") or []
     ]
@@ -264,29 +358,101 @@ def _findings_from_whatweb(whatweb_result: dict) -> list:
     ]
 
 
-def _findings_from_nuclei(nuclei_result: dict) -> list:
-    port = nuclei_result.get("port")
+def _findings_from_nuclei(nuclei_result: dict, seen: set = None) -> list:
+    """
+    Map one nuclei run's matches to findings, skipping any already recorded.
+
+    `seen` is a set of (template_id, port) pairs accumulated ACROSS this
+    profile's per-port web loop, and it is required rather than optional in
+    practice: this profile runs nuclei once per web port, and a template
+    that pivots to its own service matches identically from every one of
+    them. The Redis Lua templates connect to 6379 regardless of the URL, so
+    a host with 80 and 443 open produced the same Redis finding twice —
+    once per probe.
+
+    That only became a true duplicate once the matched port started being
+    recorded correctly: with the probed port, the two copies read as "port
+    80" and "port 443" and looked like different findings. Observed live on
+    scan 127, where "Redis - Default Logins" was inserted twice and the
+    report-render dedup pass had to collapse it. Filtering here means the
+    duplicate is never written in the first place, so the database row
+    count and the report's finding count agree.
+    """
+    probed_port = nuclei_result.get("port")
     findings = []
     for f in nuclei_result.get("findings") or []:
+        matched_port = nuclei_port(f, probed_port)
+        if seen is not None:
+            key = (f.get("template_id"), matched_port)
+            if key in seen:
+                print_info(
+                    f"[{PROFILE_NAME}] nuclei template {f.get('template_id')} "
+                    f"already matched on port {matched_port} from an earlier "
+                    f"probe — not recorded twice"
+                )
+                continue
+            seen.add(key)
         findings.append({
-            "type": "nuclei_finding", "port": port,
+            "type": "nuclei_finding",
+            "port": matched_port,
+            "service": nuclei_service(f),
             "template_id": f["template_id"], "severity": (f["severity"] or "medium").upper(),
-            "reference": f["reference"],
-            "description": f["description"] or f["name"],
+            "reference": f["reference"], "cve_id": f.get("cve_id"),
+            # nuclei's own matched-at — the host:port (or URL) it actually
+            # matched on, which for a pivoting template is not the URL it
+            # was launched against. Parsed by nuclei_wrap since the
+            # matched-port fix and dropped at insert until findings gained
+            # an endpoint column.
+            "endpoint": f.get("matched_at") or None,
+            # See _common.nuclei_description() / nuclei_port(); the two
+            # profiles' nuclei mappers are kept identical on purpose.
+            "cvss": f.get("cvss"),
+            "name": f.get("name") or "",
+            "description": nuclei_description(f),
         })
     return findings
 
 
 def _findings_from_zap(zap_result: dict) -> list:
+    """ZAP reports far more per alert than its name and risk.
+
+    Every field below is ZAP's own output, verified against a real 25-alert
+    run (smoke_test8 §3.1). The wrapper previously kept four of them and the
+    mapper synthesised a description ("ZAP WARN alert: X") while discarding
+    ZAP's actual prose, its remediation advice, the URL it matched at, the
+    evidence string, and the parameter involved — all of which have had
+    columns on the findings table for some time.
+
+    The description keeps the established "<name> — <prose>" form so the
+    rule name survives the round-trip (findings has no name column) and so
+    two rules that share boilerplate prose stay distinguishable when the
+    report truncates.
+
+    Fields ZAP left empty stay None. For a passive baseline scan `attack` is
+    empty on every alert by nature, and param/evidence are populated on only
+    some rules; None renders as "not determined by zaproxy" rather than as a
+    fabricated value.
+    """
     port = zap_result.get("port")
-    return [
-        {
+    findings = []
+    for f in zap_result.get("findings") or []:
+        description = named_description(f.get("name"), f.get("description"))
+        # ZAP collapses to one row per rule; say how many URLs matched so the
+        # collapse does not understate the finding's reach.
+        count = f.get("url_count") or 0
+        if count > 1:
+            description = f"{description} (matched at {count} URLs)"
+        findings.append({
             "type": "zap_finding", "port": port,
             "name": f["name"], "severity": f["severity"],
-            "description": f"ZAP {f['status']} alert: {f['name']}",
-        }
-        for f in zap_result.get("findings") or []
-    ]
+            "description": description,
+            "remediation": f.get("solution") or None,
+            "endpoint": f.get("url") or None,
+            "evidence": f.get("evidence") or None,
+            "parameter": f.get("param") or None,
+            "reference": f.get("reference") or None,
+        })
+    return findings
 
 
 def _findings_from_wpscan(wpscan_result: dict, port) -> list:
@@ -302,15 +468,72 @@ def _findings_from_wpscan(wpscan_result: dict, port) -> list:
 
 
 def _findings_from_sqlmap(sqlmap_result: dict, port) -> list:
-    return [
-        {
+    """
+    Build SQLi findings carrying the concrete injection evidence the
+    report's Injection & Scripting section renders: the exact payload, the
+    parameter/endpoint it was sent against, and the read-only metadata
+    sqlmap extracted (DB engine/version, current DB, database names) as the
+    proof-of-exploitation snippet.
+    """
+    metadata = sqlmap_result.get("metadata") or {}
+    url = sqlmap_result.get("url") or ""
+
+    meta_bits = []
+    if metadata.get("dbms"):
+        meta_bits.append(f"back-end DBMS: {metadata['dbms']}")
+    if metadata.get("banner"):
+        meta_bits.append(f"banner: {metadata['banner']}")
+    if metadata.get("current_db"):
+        meta_bits.append(f"current database: {metadata['current_db']}")
+    if metadata.get("databases"):
+        meta_bits.append(f"databases: {', '.join(metadata['databases'])}")
+    evidence = "; ".join(meta_bits)
+
+    findings = []
+    for f in sqlmap_result.get("findings") or []:
+        techniques = ", ".join(t["type"] for t in f.get("techniques") or []) or f.get("type") or "unknown technique"
+        description = (
+            f"Confirmed SQL injection in parameter '{f['parameter']}' ({f['method']}) "
+            f"at {url} via {techniques}."
+        )
+        if evidence:
+            description += f" Read-only enumeration extracted — {evidence}."
+        findings.append({
             "type": "sqlmap_finding", "port": port,
             "parameter": f["parameter"], "severity": "CRITICAL",
-            "description": f"Confirmed SQL injection ({f['type']}) in parameter "
-                            f"'{f['parameter']}': {f['title']}",
-        }
-        for f in sqlmap_result.get("findings") or []
-    ]
+            "payload": f.get("payload") or "",
+            "endpoint": url,
+            "evidence": evidence,
+            "description": description,
+        })
+    return findings
+
+
+def _findings_from_xss(xss_result: dict, port) -> list:
+    """
+    Build reflected-XSS findings carrying the payload nuclei injected, the
+    parameter/endpoint it was injected into, and the response snippet
+    showing the payload reflected back — the evidence the report's Injection
+    & Scripting section renders.
+    """
+    findings = []
+    for f in xss_result.get("findings") or []:
+        description = (
+            f"Reflected cross-site scripting in parameter '{f['parameter']}' "
+            f"({f['method']}) at {f['endpoint']} — the injected payload is "
+            f"reflected unescaped in the response body."
+        )
+        findings.append({
+            "type": "xss_finding", "port": port,
+            "parameter": f["parameter"],
+            "severity": (f["severity"] or "medium").upper(),
+            "payload": f["payload"],
+            "endpoint": f["endpoint"],
+            "evidence": f["evidence"],
+            "reference": f.get("reference"),
+            "description": description,
+        })
+    return findings
 
 
 def _findings_from_hydra(hydra_result: dict) -> list:
@@ -394,6 +617,15 @@ def _check_conditional_tools(target: str, flags: dict, context: dict) -> tuple:
 
     for tool, flag_name in CONDITIONAL_TOOLS.items():
         if not flags.get(flag_name):
+            # Not a failure or a skip — this run's target simply never
+            # produced the signal (e.g. no WordPress fingerprint, no SMB
+            # port) that would make this tool applicable. Logged explicitly
+            # so "why didn't wpscan/sqlmap/hydra/enum4linux run" always has
+            # an answer in scan_errors.log instead of the tool just being
+            # invisibly absent from the run.
+            msg = f"condition '{flag_name}' not met — skipping {tool}"
+            get_logger(target).info(f"[{PROFILE_NAME}] {msg}")
+            print_info(f"[{PROFILE_NAME}] {msg}")
             continue
         if tool not in _AVAILABLE_TOOLS:
             msg = (
@@ -437,7 +669,7 @@ def _check_conditional_tools(target: str, flags: dict, context: dict) -> tuple:
     return new_findings, new_tool_results
 
 
-def run_deepscan(target: str):
+def run_deepscan(target: str, non_interactive: bool = False):
     """
     Run the full deepscan profile against `target`.
 
@@ -449,7 +681,7 @@ def run_deepscan(target: str):
     print_phase(f"DEEPSCAN — {target}")
 
     profile_cfg = get_profile(PROFILE_NAME)
-    _warn_unavailable_tools(target, profile_cfg.get("tools"), PROFILE_NAME)
+    warn_unavailable_tools(target, profile_cfg.get("tools"), PROFILE_NAME, _AVAILABLE_TOOLS)
 
     scan_id = insert_scan(target, PROFILE_NAME)
 
@@ -457,6 +689,13 @@ def run_deepscan(target: str):
     findings = []
     gobuster_results = []
     dirb_results = []
+
+    # (cve_id, port) pairs already recorded, shared by BOTH of this
+    # profile's CVE-enrichment paths — the service-detect lookup below and
+    # the Server-header lookup in the web loop. See _findings_from_cves()
+    # for the live evidence that both paths hit the same CVE on a host whose
+    # nmap product and Server banner name the same software.
+    seen_cve_matches = set()
 
     # --- Recon -----------------------------------------------------
     print_phase("RECON")
@@ -479,109 +718,152 @@ def run_deepscan(target: str):
         port_result = scan_ports(target, profile=PROFILE_NAME)
         tool_results.append(port_result)
         open_ports = port_result.get("open_ports") or []
-        nmap_scripts = port_result.get("scripts") or []
         advance("Port scan")
 
         ports = [p["port"] for p in open_ports]
         services = []
+        # -sC (default script) results now come from this targeted pass,
+        # not the initial full-range scan above — see config.py's
+        # PROFILES['deepscan']['nmap_args'] comment for why.
+        nmap_scripts = []
         if ports:
             service_result = detect_services(target, ports)
             tool_results.append(service_result)
             services = service_result.get("services") or []
+            nmap_scripts = service_result.get("scripts") or []
         advance("Service detection")
 
+        # banner_grab is only useful on ports NOT already known to be
+        # HTTP(S) — those don't send an unsolicited banner (they wait for a
+        # request first), so probing them here always times out for no
+        # data: -sV/header_check already cover them via a real request.
+        non_web_ports = [p["port"] for p in open_ports if not _is_web_port(p)]
         banner_result = {"banners": []}
-        if ports:
-            banner_result = grab_banners(target, ports)
+        if non_web_ports:
+            banner_result = grab_banners(target, non_web_ports)
             tool_results.append(banner_result)
         advance("Banner grabbing")
+
+    # Recon + scanning-phase findings are persisted here, before the web
+    # module even starts — service/version + CVE enrichment, nmap --script
+    # results and banners are already final at this point, so an interrupt
+    # anywhere in the (often much longer) web phase below can't cost them.
+    findings.extend(_enrich_services(target, services, seen=seen_cve_matches))
+    findings.extend(_score_and_remediate(_findings_from_banners(banner_result)))
+    for script in nmap_scripts:
+        findings.extend(_score_and_remediate([dict(script, type="nmap_script", description=(
+            f"nmap script {script['script_id']}: {script['output'][:300]}"
+        ))]))
+    insert_findings_bulk(scan_id, findings)
 
     # --- Web -----------------------------------------------------------
     print_phase("WEB")
     web_ports = [p for p in open_ports if _is_web_port(p)]
-    header_results, nikto_results, whatweb_results = [], [], []
-    nuclei_results, zap_results = [], []
+    budget = PROFILE_TIME_BUDGET_SECONDS.get(PROFILE_NAME)
+    web_loop_start = time.time()
+
+    # (template_id, matched_port) pairs already recorded, shared across the
+    # per-port loop below. A nuclei template that pivots to its own service
+    # matches identically from every web port probed — see
+    # _findings_from_nuclei().
+    seen_nuclei_matches = set()
+
     if web_ports:
         with scan_progress_bar(len(web_ports) * 7, f"Web audit: {target}") as advance:
             for port_entry in web_ports:
+                if budget is not None and (time.time() - web_loop_start) > budget:
+                    remaining = [p["port"] for p in web_ports[web_ports.index(port_entry):]]
+                    msg = (
+                        f"time budget ({budget}s) exhausted — skipping remaining "
+                        f"web port(s) {remaining}, finishing with partial results"
+                    )
+                    log_tool_failure(target, PROFILE_NAME, msg)
+                    print_warning(f"[{PROFILE_NAME}] {msg}")
+                    break
+
                 port = port_entry["port"]
                 use_https = _is_https_port(port_entry)
+                port_findings = []
 
                 header_result = check_headers(target, port=port, use_https=use_https)
                 tool_results.append(header_result)
-                header_results.append(header_result)
+                port_findings.extend(_score_and_remediate(_findings_from_headers(header_result)))
+                server_banner = header_result.get("server_banner")
+                if server_banner:
+                    cve_result = lookup_cves_from_banner(server_banner, target=target)
+                    port_findings.extend(_findings_from_cves(
+                        cve_result.get("cves") or [], port, server_banner,
+                        seen=seen_cve_matches,
+                    ))
                 advance(f"Headers :{port}")
 
                 nikto_result = run_nikto(target, port=port, use_https=use_https)
                 tool_results.append(nikto_result)
-                nikto_results.append(nikto_result)
+                port_findings.extend(_score_and_remediate(_findings_from_nikto(nikto_result)))
                 advance(f"Nikto :{port}")
 
                 gobuster_result = run_gobuster(target, port=port, use_https=use_https)
                 tool_results.append(gobuster_result)
                 gobuster_results.append(gobuster_result)
+                port_findings.extend(_score_and_remediate(_findings_from_gobuster(gobuster_result)))
                 advance(f"Gobuster :{port}")
 
                 dirb_result = run_dirb(target, port=port, use_https=use_https)
                 tool_results.append(dirb_result)
                 dirb_results.append(dirb_result)
+                port_findings.extend(_score_and_remediate(_findings_from_dirb(dirb_result)))
                 advance(f"Dirb :{port}")
 
                 whatweb_result = run_whatweb(target, port=port, use_https=use_https)
                 tool_results.append(whatweb_result)
-                whatweb_results.append(whatweb_result)
+                port_findings.extend(_score_and_remediate(_findings_from_whatweb(whatweb_result)))
                 advance(f"WhatWeb :{port}")
 
                 severity_list = profile_cfg.get("nuclei_severity")
                 nuclei_result = run_nuclei(target, port=port, use_https=use_https, severity=severity_list)
                 tool_results.append(nuclei_result)
-                nuclei_results.append(nuclei_result)
+                port_findings.extend(_score_and_remediate(
+                    _findings_from_nuclei(nuclei_result, seen=seen_nuclei_matches)
+                ))
                 advance(f"Nuclei :{port}")
 
                 zap_result = run_zap_baseline(target, port=port, use_https=use_https)
                 tool_results.append(zap_result)
-                zap_results.append(zap_result)
+                port_findings.extend(_score_and_remediate(_findings_from_zap(zap_result)))
                 advance(f"ZAP :{port}")
+
+                # Persisted per-port, not batched across the whole web
+                # phase — a later port timing out or the budget cutting in
+                # never costs an earlier port's findings.
+                insert_findings_bulk(scan_id, port_findings)
+                findings.extend(port_findings)
     else:
         print_info(f"[{PROFILE_NAME}] no web port found among open ports — skipping web module")
 
-    # --- Enrichment ------------------------------------------------
-    print_phase("ENRICHMENT")
-    findings.extend(_enrich_services(target, services))
-    findings.extend(_score_and_remediate(_findings_from_banners(banner_result)))
-
-    for script in nmap_scripts:
-        findings.extend(_score_and_remediate([dict(script, type="nmap_script", description=(
-            f"nmap script {script['script_id']}: {script['output'][:300]}"
-        ))]))
-
-    for header_result in header_results:
-        raw = _findings_from_headers(header_result)
-        findings.extend(_score_and_remediate(raw))
-        server_banner = header_result.get("server_banner")
-        if server_banner:
-            cve_result = lookup_cves(server_banner, target=target)
-            findings.extend(_findings_from_cves(
-                cve_result.get("cves") or [], header_result.get("port"), server_banner,
-            ))
-
-    for nikto_result in nikto_results:
-        findings.extend(_score_and_remediate(_findings_from_nikto(nikto_result)))
-
-    for gobuster_result in gobuster_results:
-        findings.extend(_score_and_remediate(_findings_from_gobuster(gobuster_result)))
-
-    for dirb_result in dirb_results:
-        findings.extend(_score_and_remediate(_findings_from_dirb(dirb_result)))
-
-    for whatweb_result in whatweb_results:
-        findings.extend(_score_and_remediate(_findings_from_whatweb(whatweb_result)))
-
-    for nuclei_result in nuclei_results:
-        findings.extend(_score_and_remediate(_findings_from_nuclei(nuclei_result)))
-
-    for zap_result in zap_results:
-        findings.extend(_score_and_remediate(_findings_from_zap(zap_result)))
+    # --- XSS fuzzing (dedicated) ------------------------------------
+    # A first-class cross-site-scripting pass: nuclei in DAST mode scoped to
+    # the XSS template tag, fuzzed against parameterised URLs built from the
+    # script endpoints gobuster/dirb discovered (web_param_candidates()).
+    # This is what makes XSS a real, evidence-bearing finding class rather
+    # than something only nikto/nuclei catch incidentally.
+    xss_candidates = web_param_candidates(gobuster_results, dirb_results)
+    if xss_candidates:
+        print_phase("XSS")
+        xss_findings = []
+        with scan_progress_bar(len(xss_candidates), f"XSS fuzzing: {target}") as advance:
+            for candidate_url, candidate_port in xss_candidates:
+                xss_result = run_xss(target, candidate_url)
+                tool_results.append(xss_result)
+                xss_findings.extend(_findings_from_xss(xss_result, candidate_port))
+                advance(f"XSS {candidate_url}")
+        xss_scored = _score_and_remediate(xss_findings)
+        insert_findings_bulk(scan_id, xss_scored)
+        findings.extend(xss_scored)
+    else:
+        print_info(
+            f"[{PROFILE_NAME}] no parameterised script endpoint discovered "
+            "— XSS fuzzing skipped (nothing to fuzz)"
+        )
 
     # --- Conditional tools ------------------------------------------
     wordpress_port, wordpress_https = None, False
@@ -613,26 +895,38 @@ def run_deepscan(target: str):
     }
     conditional_findings, conditional_tool_results = _check_conditional_tools(target, flags, context)
     tool_results.extend(conditional_tool_results)
-    findings.extend(_score_and_remediate(conditional_findings))
+    conditional_scored = _score_and_remediate(conditional_findings)
 
-    insert_findings_bulk(scan_id, findings)
+    # Only this final phase's new findings get inserted here — the
+    # scanning-phase and per-port web findings above were already persisted
+    # incrementally as soon as they existed, not held until this point.
+    insert_findings_bulk(scan_id, conditional_scored)
+    findings.extend(conditional_scored)
 
     stats = {
         "tools_run": len(tool_results),
-        "tools_failed": sum(1 for r in tool_results if r.get("error")),
+        "tools_failed": count_and_report_tool_failures(target, tool_results),
+        "tools_skipped": sum(1 for r in tool_results if r.get("skipped")),
     }
+    # Persist the same tool_results the stats above summarise, so the
+    # attribution check can later ask "did this tool actually run on THIS
+    # scan" instead of only "does this profile wire it in".
+    persist_tool_run(scan_id, tool_results)
     log_scan_end(target, stats)
 
     # --- Reporting -------------------------------------------------
     print_phase("REPORTING")
-    txt_path = generate_txt_report(scan_id)
-    pdf_path = generate_pdf_report(scan_id)
+    # Writes both reports, prunes the capped history and prints the
+    # end-of-scan REPORT GENERATED banner — see _common.finalise_reports().
+    txt_path, pdf_path = finalise_reports(
+        target, PROFILE_NAME, scan_id, non_interactive=non_interactive
+    )
 
     print_success(
         f"[{PROFILE_NAME}] scan {scan_id} complete — {len(findings)} finding(s), "
         f"txt={txt_path}, pdf={pdf_path}"
     )
-    return scan_id, txt_path, pdf_path
+    return scan_id, txt_path, pdf_path, stats
 
 
 if __name__ == "__main__":
@@ -642,5 +936,5 @@ if __name__ == "__main__":
         print_error("Usage: python -m modules.profiles.deepscan <target>")
         sys.exit(1)
 
-    sid, txt, pdf = run_deepscan(sys.argv[1])
+    sid, txt, pdf, _stats = run_deepscan(sys.argv[1])
     print_success(f"Deepscan complete — scan_id={sid} txt={txt} pdf={pdf}")

@@ -1,0 +1,676 @@
+================================================================================
+AEGIS SCANNER — SMOKE TEST REPORT #1
+================================================================================
+
+1. RUN METADATA
+--------------------------------------------------------------------------------
+Date (start)      : 2026-07-24 23:14:30 PKT
+Date (end)         : 2026-07-25 00:31:48 PKT
+Total wall clock    : 1h 17m 18s (4638s — sum of all 15 run durations; runs were
+                      sequential, no overlap)
+Targets             : scanme.nmap.org, testphp.vulnweb.com, pentest-ground.com
+                      (bare hostname only for pentest-ground.com, per instructions)
+Profiles             : quickscan, stealthscan, webaudit, deepscan, compliance
+Total runs           : 15 (3 targets x 5 profiles)
+Per-run wall-clock cap: 900s (15 min), enforced externally via `timeout --kill-after=10 900`
+Invocation form       : python aegis.py <target> --profile <profile> -v
+Environment notes     : nuclei and zap-baseline.py are NOT installed on this box
+                      (see Issue H). testphp.vulnweb.com was unreachable on port
+                      80/443 from this network for the entire test (see Issue G).
+Runs killed by the 900s cap: 2 of 15 (pentest-ground.com webaudit, pentest-ground.com
+                      deepscan)
+Runs that crashed/errored out entirely: 0 of 15 — every run exited cleanly (0) or
+                      was killed by the external cap (124); aegis.py itself never
+                      raised an unhandled exception.
+
+
+2. PER-RUN SUMMARY TABLE
+--------------------------------------------------------------------------------
+target x profile                          duration  exit  findings  CRIT HIGH MED LOW  scan_id
+scanme.nmap.org      / quickscan             50s     0        2       0    0   0   0*  43
+scanme.nmap.org      / stealthscan          301s     0        0       0    0   0   0   44
+scanme.nmap.org      / webaudit             774s     0       30       2    4   6  18   45
+scanme.nmap.org      / deepscan             420s     0        0       0    0   0   0   46
+scanme.nmap.org      / compliance           222s     0        5       0    0   0   1*  47
+testphp.vulnweb.com  / quickscan              3s     0        0       0    0   0   0   48
+testphp.vulnweb.com  / stealthscan          300s     0        0       0    0   0   0   49
+testphp.vulnweb.com  / webaudit               3s     0        0       0    0   0   0   50
+testphp.vulnweb.com  / deepscan             367s     0        0       0    0   0   0   51
+testphp.vulnweb.com  / compliance             5s     0        0       0    0   0   0   52
+pentest-ground.com   / quickscan             36s     0        3       0    0   0   0*  53
+pentest-ground.com   / stealthscan          300s     0        0       0    0   0   0   54
+pentest-ground.com   / webaudit          900s(!)   124        0       0    0   0   0   55
+pentest-ground.com   / deepscan          900s(!)   124        0       0    0   0   0   56
+pentest-ground.com   / compliance            57s     0        5       0    0   0   1*  57
+
+  exit 124 = killed by this test's own 900s external wall-clock cap (aegis.py itself
+             never hung on its own — see Issue A in section 3).
+  *  quickscan/quickscan-shaped and compliance's raw open_ports rows carry NULL
+     severity in the DB (not scored by score_finding()) and are graded LOW only at
+     report-render time by summary.py's normalisation — shown here as 0 explicit LOW
+     rows to reflect what's actually stored; report.txt/PDF display them as LOW.
+
+Report/PDF artifacts (deepscan only generates a PDF):
+  scanme.nmap.org/report.pdf      14361 bytes  (generated — scan completed)
+  testphp.vulnweb.com/report.pdf  14534 bytes  (generated — scan completed)
+  pentest-ground.com/report.pdf   NOT GENERATED (run killed before reporting phase)
+
+
+3. ISSUES FOUND
+================================================================================
+
+--------------------------------------------------------------------------------
+Known Issue #5 — Severity/finding-count distribution inconsistent with profile
+depth (stealthscan showing fewer/zero findings than quickscan)
+--------------------------------------------------------------------------------
+Verdict: CONFIRMED — root cause fully identified, 100% reproduction rate (3/3
+targets).
+
+Symptom: stealthscan produced exactly 0 findings against every single target,
+including pentest-ground.com, which quickscan's much shallower -F scan found real
+open ports on 36 seconds earlier in the very same sweep:
+  scanme.nmap.org__stealthscan.meta:      duration_s=301  finding_count=0
+  testphp.vulnweb.com__stealthscan.meta:  duration_s=300  finding_count=0
+  pentest-ground.com__stealthscan.meta:   duration_s=300  finding_count=0
+scan_errors.log (all three targets), verbatim:
+  "Tool failed: nmap — timed out after 300s"
+
+Root cause: modules/utils/config.py defines PROFILES['stealthscan']['nmap_args']
+= ['-T1', '-p-', '--randomize-hosts', '-Pn'] — a full 65535-port sweep at nmap's
+slowest ("Sneaky") timing template — but TOOL_TIMEOUTS['nmap'] is hardcoded to
+300 seconds, the same budget quickscan's -F (~100-port) scan uses. -T1 alone
+makes a full-port sweep take far longer than 300s regardless of target
+responsiveness (confirmed: it hit exactly the 300s wall on all 3 targets, 2 of
+which are fast/clean responders). modules/utils/error_handler.py:run_tool()
+kills the process via subprocess.communicate(timeout=...) at 300s and sets
+success=False (lines 128-134); modules/scanning/port_scanner.py:scan_ports()
+then short-circuits on any tool_result failure (lines 196-201) and returns
+open_ports=[] wholesale — none of the ports nmap had already found before being
+killed are recovered, because the killed process's XML output is either
+incomplete/unparseable or simply never reaches _parse_nmap_xml().
+
+Why it's happening: a single hardcoded per-tool timeout (config.py
+TOOL_TIMEOUTS['nmap']=300) is applied uniformly regardless of how heavy the
+profile-specific nmap_args actually are, combined with an all-or-nothing result
+contract in scan_ports() that discards 100% of partial results on any failure.
+
+Recommended fix: (a) give nmap a timeout that scales with its actual args — e.g.
+a separate, much larger TOOL_TIMEOUTS entry for -p- profiles, or compute a
+timeout dynamically in port_scanner.py/scan_ports() based on whether '-p-' or a
+slow -T value is present in nmap_args; and (b) make scan_ports() attempt to
+parse whatever XML nmap had written before being killed (nmap can be pointed at
+a real output file and re-read after a SIGTERM, or SIGTERM instead of SIGKILL
+can be tried first to let nmap flush a valid partial <nmaprun> document) instead
+of discarding everything on timeout.
+
+Severity: BLOCKS USAGE — stealthscan's entire reason to exist (a full port
+sweep) is non-functional against any real target today.
+
+
+--------------------------------------------------------------------------------
+Known Issue #1 — No way to skip/interrupt a single hung tool; does a slow tool
+block the whole profile?
+--------------------------------------------------------------------------------
+Verdict: REFINED / PARTIALLY CONFIRMED.
+
+Symptom: No single tool can hang forever — every modules/*/*_wrap.py call goes
+through error_handler.run_tool(), which enforces config.TOOL_TIMEOUTS per tool
+via subprocess.communicate(timeout=...) and unconditionally kills the process on
+expiry (error_handler.py:128-134). That part of the concern is NOT reproduced:
+nikto, gobuster, dirb etc. all self-terminated on schedule in every run.
+However, there is no AGGREGATE wall-clock budget across the tools x ports a
+profile runs, and this sweep's own external 900s cap had to kill 2 of 15 runs
+because of it:
+  "=== END pentest-ground.com__webaudit ... duration=900s exit=124 timed_out=yes ==="
+  "=== END pentest-ground.com__deepscan ... duration=900s exit=124 timed_out=yes ==="
+webaudit against pentest-ground.com (3 open web-ish ports: 80, 81, 443) had
+finished ports 80 and 81 and was midway through nikto on port 443 when killed —
+i.e. each individual tool honoured its own timeout, but headers+nikto(600s)+
+gobuster(300s)+dirb(300s)+whatweb(60s)+sslyze(60s), repeated per port, has no
+ceiling and legitimately summed past 15 minutes.
+
+Root cause: modules/profiles/webaudit.py and deepscan.py's per-port for-loops
+(webaudit.py:217-250, deepscan.py:505-544) have no time budget of their own —
+each iteration just calls the next tool unconditionally regardless of how much
+wall-clock the port loop has already consumed.
+
+Why it's happening: TOOL_TIMEOUTS bounds a single subprocess call, not a
+profile run; nothing multiplies that bound by "number of ports this profile
+found" to produce a realistic profile-level expectation.
+
+Recommended fix: track elapsed time inside the per-port loop in webaudit.py /
+deepscan.py and stop starting new tools (log + skip remaining ports/tools)
+once a configurable profile-level budget is exhausted, so a target with many
+open web ports degrades to a partial-but-real result instead of an unbounded
+run time.
+
+Severity: degrades usability heavily at scale — for any time-boxed use (CI, a
+scheduled scan window) a target with 2-3 open web ports can make webaudit or
+deepscan run far longer than expected, and (see Issue D below) actually lose
+data if something does eventually kill it.
+
+
+--------------------------------------------------------------------------------
+Known Issue #2 — Gobuster soft-404/catch-all handling (4606-path false-positive
+pattern)
+--------------------------------------------------------------------------------
+Verdict: REFUTED / ALREADY FIXED — confirmed working correctly live.
+
+modules/web/gobuster_wrap.py's `_looks_like_wildcard_flood()` (and the
+identical guard in modules/web/dirb_wrap.py) exists specifically to catch this
+pattern — its own comment names "4606 of 4614 common.txt entries on one
+real-world target" as the motivating case. It fired correctly during this
+sweep:
+  "[!] [Gobuster] http://pentest-ground.com answers every URL with a 169-byte
+  page; retrying with that length excluded"
+  "[!] [Gobuster] http://pentest-ground.com — scan completed, no paths
+  discovered"
+No run in this sweep produced an implausible discovered-path count on any
+target/port. No further action needed; included here only to confirm the fix
+holds under a live run against a real wildcard-responding target.
+
+Severity: n/a (not a bug).
+
+
+--------------------------------------------------------------------------------
+Known Issue #3 — CVE lookup on malformed/concatenated Server banners (e.g.
+"Tengine/Aserver") returning zero matches
+--------------------------------------------------------------------------------
+Verdict: REFUTED / ALREADY FIXED (confirmed by code inspection; no garbled
+banner was encountered live in this sweep to exercise it end-to-end).
+
+modules/enrichment/cve_lookup.py:_parse_banner() (lines 141-168) already
+implements exactly the fix this issue describes: it splits the banner on its
+first whitespace-delimited token, then on that token's own "/", and discards a
+trailing "version" half that doesn't start with a digit rather than sending it
+to NVD as a bogus filter — its docstring explicitly names "Tengine/Aserver" as
+the motivating example this code defeats. Every banner actually seen in this
+sweep was clean ("nginx/1.31.3", "Apache/2.4.7 (Ubuntu)") and parsed correctly
+via lookup_cves_from_banner(). No zero-match-due-to-garbling was observed.
+
+Severity: n/a (not a bug) — see Issue E below for a different, real CVE-lookup
+accuracy problem this investigation did surface.
+
+
+--------------------------------------------------------------------------------
+Known Issue #4 — Findings with port+severity but no service/version/CVE in
+large volume (nmap --script exploded per line)
+--------------------------------------------------------------------------------
+Verdict: REFUTED.
+
+modules/scanning/port_scanner.py:_parse_nmap_scripts() (lines 86-138) appends
+exactly one finding dict per <script> XML element (i.e. one per script_id —
+ssl-enum-ciphers, http-headers, ssl-cert, ssl-date, ...), never one per output
+line. Confirmed directly from the DB across two compliance runs: the
+http-headers script's full 6-line raw output (Date/Server/Accept-Ranges/
+Vary/Connection/Content-Type) was persisted as exactly ONE row per scan
+(findings.id=4766 for scanme.nmap.org scan 47; findings.id=4774 for
+pentest-ground.com scan 57), each with the multi-line output crammed into a
+single `description` field (truncated to 300 chars per
+modules/profiles/compliance.py:_findings_from_scripts()), not one row per
+header line. deepscan's -sC scripts (ssl-cert, ssl-date on pentest-ground.com)
+showed the same one-row-per-script pattern.
+
+Severity: n/a (not a bug) — see Issue B below for a real, different problem
+with which port ssl-enum-ciphers actually runs against.
+
+
+--------------------------------------------------------------------------------
+Known Issue #6 — banner.py timing out on both 80 and 443 in deepscan
+--------------------------------------------------------------------------------
+Verdict: CONFIRMED as described, but the underlying behaviour is intentional
+per the module's own docs — the real defect is elsewhere (log severity/wasted
+time).
+
+Symptom, reproduced verbatim on pentest-ground.com's deepscan run, immediately
+after nmap-sV had already correctly identified nginx 1.31.3 on both ports:
+  "Tool failed: banner_grab:80 — timed out"
+  "Tool failed: banner_grab:443 — timed out"
+~24 seconds elapsed between "Starting tool: banner_grab" (00:22:12) and "Tool
+completed: banner_grab" (00:22:36) for just these two ports.
+
+Root cause: modules/scanning/banner.py:_grab_single() opens a raw socket and
+blocks on recv() with a 5s timeout, then retries once (another 5s + 1.5s pause)
+before giving up — a combined ~11.5s "timeout" per port. HTTP(S) servers don't
+send an unsolicited banner (they wait for a request first), so this always
+times out on ports 80/443/8080/8443 by construction — banner.py's own comments
+say as much ("Request-driven services (HTTP) simply time out here and yield an
+empty banner — that's fine, -sV covers them"). In this run, -sV genuinely had
+already captured the same information via a different code path (an actual
+HTTP request), so no data was lost.
+
+Why it's happening: banner.py probes every open port unconditionally, with no
+awareness of which ports scan_ports()/detect_services() already identified as
+HTTP(S) (where a raw-socket banner grab is known to be pointless).
+
+Recommended fix: skip ports already known to be HTTP/HTTPS (deepscan.py already
+computes _is_web_port() for this exact purpose — reuse it to filter the port
+list passed to grab_banners()), or at minimum log this specific outcome at
+INFO/DEBUG rather than ERROR so scan_errors.log doesn't read as if two real
+failures occurred.
+
+Severity: cosmetic / minor efficiency — no data loss, but ~24s wasted per
+deepscan run with 2 HTTP(S) ports open, and misleading ERROR-level log noise.
+
+
+--------------------------------------------------------------------------------
+Known Issue #7 — Target/hostname validation rejecting a full URL instead of
+extracting the hostname
+--------------------------------------------------------------------------------
+Verdict: NOT REPRODUCED — working as intended for the tested invocation shape.
+
+All 15 runs used bare hostnames as instructed, including pentest-ground.com
+(the target this issue specifically calls out), and every one was accepted by
+aegis.py:is_valid_target() (lines 62-71) on the first try with no rejection or
+retry needed. is_valid_target() deliberately requires a syntactically valid
+RFC1123 hostname/IP and does not special-case scheme/path stripping — a
+documented design choice (the _HOSTNAME_RE regex at aegis.py:57-59), not a bug
+this smoke test triggered.
+
+Not independently verified in this pass: explicitly feeding a full
+"https://pentest-ground.com/" URL to confirm it fails with a clear,
+user-facing error message rather than something confusing. Recommended as a
+quick, cheap follow-up check next time, but out of scope here since the
+instructions specified hostname-only invocation throughout and that path is
+confirmed healthy.
+
+Severity: n/a (not reproduced).
+
+
+--------------------------------------------------------------------------------
+Known Issue #8 — quickscan/stealthscan logging "no wrapper module" for
+whatweb/nuclei despite wrapper files existing under modules/web/
+--------------------------------------------------------------------------------
+Verdict: REFUTED for quickscan / mostly fixed codebase-wide, with one lingering
+staleness risk.
+
+modules/profiles/_common.py (untracked in git status — added specifically to
+fix this exact bug per its own docstring) provides GLOBAL_AVAILABLE_TOOLS +
+warn_unavailable_tools(), and quickscan.py, webaudit.py and compliance.py all
+now use it. quickscan.py explicitly wires in whatweb_wrap.py and nuclei_wrap.py
+(quickscan.py:41-42, 152-162), confirmed live in every quickscan run:
+  "[*] [WhatWeb] Fingerprinting http://pentest-ground.com"
+  "[*] [Nuclei] Scanning http://pentest-ground.com (severity=critical,high)"
+No "no wrapper module" false-negative for whatweb/nuclei appeared in any of the
+15 runs (nuclei's failures were all legitimately "binary not found on PATH" —
+see Issue H — a real missing binary, not a missing wrapper).
+
+Residual gap: modules/profiles/stealth.py:31 and modules/profiles/deepscan.py:
+73-77 each still carry their OWN local, stale `_AVAILABLE_TOOLS` set instead of
+importing modules.profiles._common.GLOBAL_AVAILABLE_TOOLS. This is harmless
+today only by coincidence — stealthscan's tool list (nslookup, nmap) happens to
+be a subset of stealth.py's local set, and deepscan's tools=="ALL" short-
+circuits the check entirely (modules/profiles/_common.py:46-47) — but it is a
+landmine: if PROFILES['stealthscan']['tools'] ever grows (e.g. someone adds
+'whatweb' the way quickscan already has it), stealth.py's local hardcoded set
+will immediately regress into exactly this bug, because migrating _common.py
+into quickscan/webaudit/compliance never touched stealth.py or deepscan.py.
+
+Recommended fix: delete stealth.py's local _AVAILABLE_TOOLS/
+_warn_unavailable_tools() and call modules.profiles._common.
+warn_unavailable_tools() instead, same as quickscan/webaudit/compliance; do the
+same in deepscan.py for consistency even though it's currently a no-op there.
+
+Severity: cosmetic today, but a real, low-effort-to-fix regression risk.
+
+
+--------------------------------------------------------------------------------
+NEW Issue A — Duplicate logging across virtually every tool wrapper (systemic)
+--------------------------------------------------------------------------------
+Symptom: every "Starting tool: X" / "Tool completed: X" / "Tool failed: X" line
+in scan_errors.log appears exactly twice, in every one of the 15 runs, e.g.
+(testphp.vulnweb.com deepscan, verbatim):
+  "2026-07-24 23:49:03 [INFO] ... Starting tool: subfinder"
+  "2026-07-24 23:49:03 [INFO] ... Starting tool: subfinder"
+  "2026-07-24 23:49:22 [INFO] ... Tool completed: subfinder (19.29s)"
+  "2026-07-24 23:49:22 [INFO] ... Tool completed: subfinder (19.29s)"
+Also reproduced for nmap, amass, theHarvester, nikto, gobuster, dirb, whatweb,
+sslyze, header_check, and every nmap timeout/failure message across all 15
+runs — this is a codebase-wide pattern, not a one-off.
+
+Root cause: modules/utils/error_handler.py:run_tool() already calls
+log_tool_start()/log_tool_success()/log_tool_failure() internally (lines 85,
+118, 121, 134) as part of its documented contract. But essentially every
+wrapper module that calls run_tool() — modules/recon/dns.py, subdomain.py,
+osint.py, modules/scanning/port_scanner.py, service_detect.py, and every
+module under modules/web/ (nikto_wrap.py, gobuster_wrap.py, dirb_wrap.py,
+whatweb_wrap.py, sslyze_wrap.py, zap_wrap.py, nuclei_wrap.py, wpscan_wrap.py,
+sqlmap_wrap.py) and modules/scanning/hydra_wrap.py, enum4linux_wrap.py — ALSO
+calls log_tool_start()/log_tool_success()/log_tool_failure() itself,
+independently and redundantly. The one correct exception is
+modules/scanning/banner.py, which does NOT go through run_tool() (raw sockets
+via safe_call(), which does not log start/success itself) — its explicit
+log_tool_start() call there is necessary and is the one place this pattern is
+NOT a bug.
+
+Why it's happening: a systemic copy-paste/legacy pattern — every wrapper was
+apparently written assuming it owned its own logging, and this was never
+reconciled after run_tool() itself grew the same logging as a first-class part
+of its contract.
+
+Recommended fix: remove the explicit log_tool_start/log_tool_success/
+log_tool_failure calls from every wrapper module listed above (leave run_tool's
+internal ones as the single source of truth); leave banner.py's calls alone.
+
+Severity: degrades data quality — doubles scan_errors.log volume across every
+single scan this tool ever runs, and makes debugging via logs noisier/more
+confusing (e.g. a single nmap timeout reads as two separate failure lines).
+
+
+--------------------------------------------------------------------------------
+NEW Issue B — compliance's ssl-enum-ciphers script often fails to run against
+the actual HTTPS port because nmap_args has no explicit port scope
+--------------------------------------------------------------------------------
+Symptom: in the live sweep, neither compliance run (scanme.nmap.org scan 47,
+pentest-ground.com scan 57) persisted an ssl-enum-ciphers finding for ANY port,
+despite pentest-ground.com definitely serving TLS on 443 (confirmed
+independently — see below). compliance.py's own fallback logic quietly papered
+over the gap by running sslyze against port 443 anyway (via its
+_FALLBACK_TLS_PORT path), so the TLS audit wasn't a total loss, but the
+profile's headline nmap-script cipher finding — which compliance.py's own
+docstring calls "the highest-priority gap in the whole codebase" — was
+silently absent both times, with no error logged.
+
+Root cause, confirmed by direct reproduction outside aegis-scanner: running the
+exact command compliance.py builds (`nmap -T4 --script
+ssl-enum-ciphers,http-headers -oX - pentest-ground.com`, no -p flag) three
+times in a row against the same live target produced three DIFFERENT outcomes:
+run 1 — ssl-enum-ciphers ran on NO port at all; run 2 — it ran on port 81 (an
+obscure secondary TLS listener) but NOT on port 443; only when explicitly
+scoped with `-p 443` did it reliably run against port 443 and return real
+cipher data every time. modules/utils/config.py's PROFILES['compliance']
+['nmap_args'] has no `-p` restriction (unlike webaudit's, which is scoped to
+`-p 80,443,8080,8443`), so nmap scans its default ~1000-port list and lets
+NSE's own portrule/service-detection heuristics opportunistically decide which
+of several plausible ports to run the SSL script against — a choice this
+sweep's evidence shows is not reliable.
+
+Why it's happening: without -sV and without explicit port scoping, nmap's
+script engine has to guess which open ports are "SSL-like" using only a
+table-based service-name guess plus its own script scheduling heuristics, and
+that guess is demonstrably inconsistent between runs against the very same
+target.
+
+Recommended fix: scope compliance's nmap_args to explicit candidate ports the
+same way webaudit already does (e.g. `-p 80,443,8443` ahead of `--script ...`
+in config.py), or — mirroring the two-stage pattern service_detect.py already
+uses for -sV — run scan_ports() first to learn open_ports, then issue a second,
+explicitly `-p <tls candidate ports>`-scoped `--script ssl-enum-ciphers` pass.
+
+Severity: degrades data quality — a silent, non-obvious gap in the compliance
+profile's core deliverable (no error is logged when it happens, so nobody
+would notice without diffing nmap's raw XML the way this investigation did).
+
+
+--------------------------------------------------------------------------------
+NEW Issue C — Product name silently dropped from persisted/reported findings
+(quickscan/stealthscan-shaped raw service rows)
+--------------------------------------------------------------------------------
+Symptom: nmap -sV correctly identifies both product and version and prints
+them correctly to the console:
+  "[+] [Services] pentest-ground.com:80 -> http (nginx 1.31.3)"
+but the persisted finding and the resulting report only ever say:
+  "1. [LOW     ] port 80 — http 1.31.3"
+"nginx" — the actual, most security-relevant piece of information nmap
+found — never appears anywhere in the database or the report for this profile.
+Confirmed in both scanme.nmap.org (Apache httpd 2.4.7 -> reported as merely
+"http") and pentest-ground.com (nginx 1.31.3 -> reported as merely "http")
+quickscan runs.
+
+Root cause: database/db.py's `findings` table schema has columns port,
+service, version, cve_id, cvss, severity, description, remediation,
+finding_type — there is no `product` column. modules/scanning/
+service_detect.py:_parse_sv_xml() correctly returns {port, service, version,
+product} per port, but modules/profiles/quickscan.py:134-144 passes that raw
+dict list straight into insert_findings_bulk() unmodified; database/db.py:
+insert_finding() only ever reads finding.get("service")/finding.get("version")
+(lines ~101-103), so "product" is silently dropped on the way into SQLite.
+(deepscan.py does not have this problem for its CVE-enriched findings, because
+_enrich_services() builds an explicit description string containing the
+product before those rows are ever inserted — but quickscan's raw,
+unenriched-by-design service rows go in as-is.)
+
+Why it's happening: a schema/mapping gap — the "findings" table was designed
+around CVE-shaped rows, and the raw-service-row code path was never updated to
+either add a product column or fold product into an existing text field before
+insertion.
+
+Recommended fix: either add a `product` column to the findings table (schema
+already has a documented history of not perfectly fitting every finding shape)
+and have insert_finding() persist it, or, with less schema churn, have
+quickscan.py build a description string that includes the product (the same
+way deepscan.py's _enrich_services() already does via `" ".join(x for x in
+(product, version) if x)`) before calling insert_findings_bulk().
+
+Severity: degrades data quality — an analyst reading a quickscan/stealthscan
+report has no idea whether a service is nginx, Apache, or IIS without
+re-running a deeper scan, which defeats much of the point of a "quick" pass.
+
+
+--------------------------------------------------------------------------------
+NEW Issue D — Interrupted profile runs lose 100% of their findings, not just
+the interrupted tool's
+--------------------------------------------------------------------------------
+Symptom: reproduced twice in this sweep, on the two runs killed by this test's
+900s external cap. pentest-ground.com's webaudit run logged 22 real,
+individually-recorded findings to scan_errors.log as DEBUG "Finding recorded:
+{...}" lines (nikto hits on port 80, six missing-security-header findings plus
+a Server fingerprint on port 443) before being killed mid-way through nikto on
+port 443 — yet the database shows finding_count=0 for that scan (scan_id=55),
+and no report.txt/report.pdf reflects any of that work. The deepscan run
+against the same target shows the identical pattern: 41 findings logged,
+finding_count=0 persisted, no report.pdf generated at all (confirmed via
+`ls output/pentest-ground.com/report.pdf` — file does not exist for this run,
+unlike the two deepscan runs that completed normally and each produced a
+~14KB PDF).
+
+Root cause: modules/profiles/webaudit.py (and deepscan.py, compliance.py,
+quickscan.py, stealth.py — the same pattern repeats in every profile
+orchestrator) accumulates findings in a plain Python list across the entire
+function body and calls insert_findings_bulk(scan_id, findings) exactly ONCE,
+at the very end (webaudit.py:280), after every port's full tool loop has
+already finished. Nothing is written to the findings table incrementally.
+
+Why it's happening: log_finding() (called by every tool wrapper as it goes)
+durably writes to scan_errors.log immediately, but that is a text log, not the
+structured findings table the report writers actually read from
+(modules/reporting/summary.py -> build_summary() only ever queries the
+database) — so a kill at any point before the final bulk insert throws away
+everything that was only ever sitting in an in-memory list.
+
+Recommended fix: call insert_findings_bulk() (or per-finding insert_finding())
+incrementally — e.g. once per port, right after that port's tool loop finishes,
+rather than batching the entire profile's findings into one list held for the
+whole run. This also naturally bounds how much work a kill at any point can
+lose to "the current port," rather than "the entire scan."
+
+Severity: BLOCKS USAGE / the most severe finding-quality issue in this report.
+Combined with Issue #1/A's lack of an aggregate time budget, any moderately-
+scoped webaudit or deepscan run against a real multi-port target is likely to
+eventually get killed by something (a CI timeout, an operator's Ctrl+C, an
+OOM), and when it does, the operator is left with a completely empty report
+despite the tool having genuinely done — and logged — real, useful work.
+
+
+--------------------------------------------------------------------------------
+NEW Issue E — NVD CVE keyword search produces a false-positive CRITICAL match
+on an ambiguous vendor name
+--------------------------------------------------------------------------------
+Symptom: scanme.nmap.org's webaudit run (scan_id=45) persisted a CRITICAL,
+CVSS 9.8 finding for CVE-2016-6814 against port 80's "Apache/2.4.7" web
+server:
+  {'cve_id': 'CVE-2016-6814', 'cvss': 9.8, 'severity': 'CRITICAL',
+   'description': '...Codehaus versions of Groovy...Apache Groovy 2.4.4 to
+   2.4.7 on classpath...it was possible for an attacker to bake a special
+   serialized object that will execute code directly when deserialized...'}
+CVE-2016-6814 is a Java deserialization RCE in Apache Groovy (a JVM scripting
+language) — completely unrelated to the Apache HTTP Server (httpd) binary
+nmap actually detected. This is a false positive that would send an analyst
+down a real dead end chasing a Groovy classpath vulnerability on a machine that
+almost certainly has no Groovy installed at all.
+
+Root cause: modules/enrichment/cve_lookup.py:_build_keyword() (line 126-134)
+joins product+version into a bare space-separated string ("Apache 2.4.7") and
+sends it to NVD's keywordSearch, which — per the module's own docstring — is a
+plain AND-of-words match with no product/CPE disambiguation. "Apache" is the
+name of a software foundation that owns dozens of unrelated projects (httpd,
+Groovy, Tomcat, Struts, ...), so any CVE whose free-text description happens
+to contain both "Apache" and "2.4.7" matches, regardless of which actual
+project it concerns.
+
+Recommended fix: qualify the query with a more specific product token before
+sending it to NVD (e.g. map nmap's generic "Apache" product string to "apache
+httpd" the way _parse_banner() already normalises Server-header product
+names), or post-filter NVD results by checking the returned CVE's CPE match
+strings actually reference the httpd product rather than trusting a bare
+keyword hit.
+
+Severity: degrades data quality significantly — a false CRITICAL/9.8 is
+exactly the kind of result that erodes trust in every other finding the tool
+produces.
+
+
+--------------------------------------------------------------------------------
+NEW Issue F — Naive substring keyword matching in severity.py inflates a
+routine nikto finding to CRITICAL
+--------------------------------------------------------------------------------
+Symptom: the same scanme.nmap.org webaudit run (scan_id=45) graded this nikto
+finding as CRITICAL:
+  "[999965] /index: Apache mod_negotiation is enabled with MultiViews, which
+  allows attackers to easily brute force file names. The following
+  alternatives for 'index' were found: index.html."
+This is a routine, low-impact information-disclosure finding (nikto itself
+does not flag it as especially severe) — it should never be CRITICAL.
+
+Root cause: modules/enrichment/severity.py:_NIKTO_KEYWORDS's CRITICAL tier
+(line ~182) includes the bare abbreviation "rce" (intended to mean "remote
+code execution"), and _match_keywords() (line ~289) does plain substring
+containment — `if keyword in lowered` — with no word-boundary check. The
+phrase "brute force" contains the literal substring "...fo-RCE...", so it
+coincidentally matches the CRITICAL "rce" keyword. Reproduced deterministically
+in isolation:
+  >>> score_finding({'type': 'nikto_finding', 'description': "...brute force
+      file names...", 'reference': ''})
+  {'severity': 'CRITICAL', 'severity_source': 'heuristic', ...}
+
+Recommended fix: switch _match_keywords() to word-boundary regex matching
+(`\bkeyword\b`) instead of plain `in` substring containment, and/or drop
+short, collision-prone abbreviations like "rce" from the keyword lists in
+favour of less ambiguous phrases (e.g. "remote code exec").
+
+Severity: degrades data quality — directly corrupts severity distribution
+(the same underlying category of concern as known issue #5, but at the
+per-finding rather than per-profile level) and produces alarming false-CRITICAL
+noise identical in effect to Issue E.
+
+
+--------------------------------------------------------------------------------
+NEW Issue G — testphp.vulnweb.com unreachable from this test environment
+(environmental, not a code bug)
+--------------------------------------------------------------------------------
+Symptom: all 5 profiles against testphp.vulnweb.com returned 0 open ports / 0
+findings, each completing in 3-5 seconds (quickscan/webaudit/compliance) —
+only stealthscan/deepscan took longer, and only because they still had to
+spend their own internal recon/nmap timeout budgets before concluding the same
+thing.
+
+Confirmed independently, outside aegis-scanner: `curl -sI --max-time 10
+http://testphp.vulnweb.com/` returned nothing at all, and raw TCP connects to
+both port 80 and port 443 timed out after 5s. As a control, the identical
+probes against scanme.nmap.org:80 and pentest-ground.com:80/443 both succeeded
+immediately. This means testphp.vulnweb.com is not reachable on any web port
+from this specific network/environment for the duration of this test — nmap
+and aegis-scanner both behaved correctly given what the network actually
+returned ("nmap completed but found no open ports" is the true state).
+
+Not a code bug. Flagged here purely so these 5 runs are not misread as
+"webaudit/deepscan found nothing on a known-vulnerable test app," which would
+be the wrong conclusion — this target's results in this report validate only
+the "target has zero open ports" code path, not real web-application scanning.
+
+
+--------------------------------------------------------------------------------
+NEW Issue H — nuclei and zap-baseline.py binaries entirely absent from this
+environment (environmental/tooling gap)
+--------------------------------------------------------------------------------
+Symptom: `nuclei` is not on PATH at all — confirmed via `command -v nuclei`
+(no output) and live in every quickscan/deepscan run: "[Nuclei] nuclei failed
+for http://... — binary not found on PATH: nuclei". `zap-baseline.py` is not
+on PATH and not present anywhere on the filesystem at all (`find / -iname
+"zap-baseline.py"` returns zero results), even though the `zaproxy` GUI
+package itself is installed and present on PATH.
+
+Both failures are handled gracefully — run_tool()'s FileNotFoundError branch
+catches them cleanly and no scan crashed — but every nuclei pass (quickscan x3,
+deepscan x3) and every ZAP baseline pass (deepscan x3) in this entire smoke
+test contributed zero findings for purely environmental reasons, unrelated to
+aegis-scanner's own code correctness.
+
+Not a code bug — an install.sh/setup.py provisioning gap on this particular
+box. Recommended: install nuclei and locate/install ZAP's baseline script
+before the next smoke test run, so those two wrappers get real exercise.
+
+
+--------------------------------------------------------------------------------
+Additional minor/cosmetic observation (not a full issue write-up)
+--------------------------------------------------------------------------------
+Every SCAN SUMMARY panel prints "Tools run: 0 | Tools failed: 0" regardless of
+how many tools actually ran or failed (confirmed in every one of the 15 runs'
+stdout). This is intentional and documented — modules/reporting/summary.py:
+summary_stats() explicitly hardcodes both to 0 with a comment explaining "which
+tools ran is not persisted in the scans table, and inventing a number would
+misreport the scan" — but the two numbers are visually indistinguishable from
+a real (and wrong) "0 tools ran" result, which could read as a scan-level
+failure to someone glancing at the summary. Consider either omitting the line
+entirely when the data isn't tracked, or persisting real tool-run/tool-failed
+counts (each profile orchestrator already computes them locally via `stats =
+{"tools_run": len(tool_results), ...}` and passes them to log_scan_end() —
+that same data just never reaches the summary panel).
+
+
+4. PRIORITY-ORDERED FIX LIST
+================================================================================
+Ordered by what would most unblock accurate smoke testing / restore trust in
+results next time, highest-impact first:
+
+ 1. NEW Issue D — incrementally persist findings (per-port, not once at the
+    very end) so an interrupted run doesn't lose everything it already found.
+    [BLOCKS USAGE]
+ 2. Known #5 — give nmap a realistic timeout for -p- profiles and/or recover
+    partial results on a kill, so stealthscan stops being 100% non-functional.
+    [BLOCKS USAGE]
+ 3. Known #1 / NEW A (aggregate side) — add a profile-level wall-clock budget
+    across the per-port tool loop in webaudit.py/deepscan.py, so a target with
+    several open web ports degrades gracefully instead of running unbounded
+    (this is also what triggers Issue D in practice).
+ 4. NEW Issue E — stop false-positive CVE matches on ambiguous vendor names
+    (Apache httpd vs. Apache Groovy) — a false CRITICAL is the single most
+    trust-damaging class of bug in this report.
+ 5. NEW Issue F — switch severity.py's keyword matching to word-boundary regex
+    so short abbreviations like "rce" stop false-matching inside unrelated
+    words ("brute force"). Cheap, mechanical fix, same trust-damage category
+    as #4.
+ 6. NEW Issue C — stop dropping the `product` field (nginx/Apache/IIS) from
+    persisted quickscan/stealthscan findings — restores the main practical
+    value of a "quick" report.
+ 7. NEW Issue B — scope compliance's nmap_args to explicit candidate ports so
+    ssl-enum-ciphers reliably targets the real HTTPS port instead of an
+    nmap-internal coin flip.
+ 8. NEW Issue A (duplicate logging) — remove the redundant log_tool_*() calls
+    from every wrapper module (keep only run_tool()'s). Cheap and mechanical;
+    doing this earlier would have made diagnosing every issue above easier.
+ 9. Known #8 residual — migrate stealth.py and deepscan.py's local, stale
+    _AVAILABLE_TOOLS sets onto modules.profiles._common.warn_unavailable_tools()
+    to close off the regression risk before it's ever triggered.
+10. Known #6 — skip banner.py probes on ports already known to be HTTP(S), or
+    at minimum log the expected-timeout case at INFO/DEBUG instead of ERROR.
+11. Environmental prerequisites for the next smoke test: install nuclei
+    (Issue H), locate/install ZAP's baseline script (Issue H), and either
+    confirm testphp.vulnweb.com's reachability from this network has recovered
+    or substitute a target known-reachable ahead of time (Issue G) — without
+    these, nuclei/ZAP and one of the three targets' web-app-scanning code
+    paths cannot be validated at all.
+
+================================================================================
+END OF REPORT
+================================================================================

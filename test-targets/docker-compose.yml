@@ -1,0 +1,133 @@
+# test-targets/docker-compose.yml
+#
+# Local, isolated, INTENTIONALLY VULNERABLE containers for authorized
+# scanning of Aegis Scanner only. See README.md in this directory before
+# touching anything here. Do not expose these ports beyond localhost.
+#
+# All four services are attached to a dedicated bridge network with static
+# IPs so Aegis can target each container directly (its own IP, native
+# service port) without host-port collisions between services. Host ports
+# are also published for manual curl/smbclient/ssh verification.
+
+version: "3.8"
+
+networks:
+  aegis-test-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  wp_db_data:
+  wp_html:
+
+services:
+  # -------------------------------------------------------------------
+  # WordPress target (wpscan trigger: wordpress_fingerprinted)
+  # -------------------------------------------------------------------
+  wordpress-db:
+    image: mysql:5.7
+    container_name: aegis-wordpress-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wordpress
+      MYSQL_PASSWORD: wordpress
+    volumes:
+      - wp_db_data:/var/lib/mysql
+    networks:
+      aegis-test-net:
+        ipv4_address: 172.28.0.4
+
+  wordpress-target:
+    image: wordpress:latest
+    container_name: aegis-wordpress-target
+    restart: unless-stopped
+    depends_on:
+      - wordpress-db
+    environment:
+      WORDPRESS_DB_HOST: wordpress-db:3306
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress
+      WORDPRESS_DB_NAME: wordpress
+    ports:
+      - "8081:80"
+    volumes:
+      - wp_html:/var/www/html
+    networks:
+      aegis-test-net:
+        ipv4_address: 172.28.0.10
+
+  # -------------------------------------------------------------------
+  # DVWA target (sqlmap trigger: injectable_param_found; XSS engine target)
+  # Self-contained image (bundles its own MariaDB + Apache).
+  # info.php (SQLi) and xss.php (reflected XSS) are small companion scripts
+  # added by this project (NOT part of stock DVWA) — see README.md for why
+  # they're needed. NOTE: on a fresh bring-up the DVWA database must still
+  # be created via setup.php (see README) before info.php returns rows.
+  # -------------------------------------------------------------------
+  dvwa-target:
+    image: vulnerables/web-dvwa
+    container_name: aegis-dvwa-target
+    restart: unless-stopped
+    ports:
+      - "8082:80"
+    volumes:
+      - ./dvwa-extra/info.php:/var/www/html/info.php:ro
+      - ./dvwa-extra/xss.php:/var/www/html/xss.php:ro
+    networks:
+      aegis-test-net:
+        ipv4_address: 172.28.0.20
+
+  # -------------------------------------------------------------------
+  # SSH target (hydra trigger: login_service_found)
+  #
+  # ssh-extra/disable-persource-penalties.sh runs as a linuxserver
+  # custom-cont-init.d hook: it disables OpenSSH's PerSourcePenalties
+  # anti-scanning feature (default-on as of the OpenSSH version this image
+  # ships) — without it, this container resets rapid repeated connection
+  # attempts from the same source, which silently defeats hydra (and any
+  # brute-forcer) after 2-3 tries. That's correct, desirable behaviour for
+  # a real server; it's exactly what we don't want on a fixture whose
+  # entire purpose is to be genuinely brute-forceable. See README.md.
+  # -------------------------------------------------------------------
+  ssh-target:
+    image: linuxserver/openssh-server
+    container_name: aegis-ssh-target
+    restart: unless-stopped
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: "Etc/UTC"
+      PASSWORD_ACCESS: "true"
+      USER_NAME: "admin"
+      USER_PASSWORD: "admin"
+      SUDO_ACCESS: "false"
+    volumes:
+      - ./ssh-extra/disable-persource-penalties.sh:/custom-cont-init.d/disable-persource-penalties.sh:ro
+    ports:
+      - "2222:2222"
+    networks:
+      aegis-test-net:
+        ipv4_address: 172.28.0.30
+
+  # -------------------------------------------------------------------
+  # SMB target (enum4linux trigger: smb_service_found)
+  # -------------------------------------------------------------------
+  smb-target:
+    image: dperson/samba
+    container_name: aegis-smb-target
+    restart: unless-stopped
+    command: >
+      -n
+      -w AEGISTEST
+      -u "smbtest;smbtest123"
+      -s "public;/share;yes;no;yes;all;none;Aegis test share - guest read/write"
+    ports:
+      - "139:139"
+      - "445:445"
+    networks:
+      aegis-test-net:
+        ipv4_address: 172.28.0.40

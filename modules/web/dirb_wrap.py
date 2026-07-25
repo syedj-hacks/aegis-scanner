@@ -15,16 +15,28 @@ import os
 import re
 
 from modules.utils.error_handler import run_tool
-from modules.utils.logger import (
-    log_tool_start, log_tool_success, log_tool_failure, log_finding,
-)
+from modules.utils.logger import log_tool_failure, log_finding
 from modules.utils.display import (
     print_info, print_success, print_warning, print_error,
 )
 
-# Same candidate list gobuster_wrap.py falls back to, in the same order —
-# dirb's own default wordlist is the first choice.
+# dirb/small.txt (959 words), not gobuster_wrap.py's common.txt (4614
+# words) — root-caused live against pentest-ground.com (smoke_test2's New
+# Issue E): dirb is single-threaded and opens one connection per request,
+# and a full common.txt run reliably died with "(!) FATAL: Too many errors
+# connecting to host" at the SAME word count (1711/4614) whether or not a
+# -z flood-delay was added, which rules out a rate-based limiter and points
+# at a target-side cumulative connection-count threshold instead — dirb has
+# no flag that reduces its per-request connection count, so the only real
+# fix is to not send that many requests in the first place. Verified live:
+# small.txt completed cleanly (exit 0, 959/959 downloaded, no FATAL) against
+# the same target where common.txt failed every time. gobuster still runs
+# the full common.txt list (its 30 concurrent threads finish fast enough
+# that this target's threshold was never observed to trip), so coverage
+# isn't lost — dirb remains a genuinely supplementary, different-engine
+# pass rather than a duplicate of gobuster's sweep.
 _DEFAULT_WORDLISTS = [
+    "/usr/share/wordlists/dirb/small.txt",
     "/usr/share/wordlists/dirb/common.txt",
     "/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt",
     "/usr/share/seclists/Discovery/Web-Content/common.txt",
@@ -41,6 +53,30 @@ _DIRB_BASE_ARGS = ["-S", "-w", "-r"]
 #   ==> DIRECTORY: http://example.com/images/
 _FOUND_LINE = re.compile(r"^\+\s+(?P<url>\S+)\s+\(CODE:(?P<code>\d+)\|SIZE:(?P<size>\d+)\)")
 _DIR_LINE = re.compile(r"^==>\s+DIRECTORY:\s+(?P<url>\S+)")
+
+# dirb writes its own fatal-abort reason ("(!) FATAL: Too many errors
+# connecting to host ...") to STDOUT, not stderr — a non-zero exit with no
+# stderr text used to fall through to run_tool()'s generic "non-zero exit
+# code (N)", losing the actual reason. Matched against raw_output as a
+# fallback so the real cause reaches scan_errors.log.
+_FATAL_LINE = re.compile(r"^\(!\)\s*(?P<reason>.+)$")
+
+# Same wildcard/soft-404 flood guard as gobuster_wrap.py — a SPA or edge-CDN
+# that answers every path with 200 can "discover" nearly the whole wordlist,
+# and dirb has no built-in wildcard detection of its own to catch it.
+_FLOOD_MIN_COUNT = 200
+_FLOOD_RATIO = 0.5
+
+
+def _looks_like_wildcard_flood(discovered_count: int, wordlist_path: str) -> bool:
+    if discovered_count < _FLOOD_MIN_COUNT:
+        return False
+    try:
+        with open(wordlist_path, "r", encoding="utf-8", errors="ignore") as fh:
+            wordlist_size = sum(1 for line in fh if line.strip())
+    except OSError:
+        return False
+    return bool(wordlist_size) and (discovered_count / wordlist_size) >= _FLOOD_RATIO
 
 
 def _build_url(target: str, port: int, use_https: bool) -> str:
@@ -67,6 +103,17 @@ def _resolve_wordlist(wordlist: str = None) -> tuple:
     )
 
 
+def _extract_fatal_reason(stdout: str) -> str:
+    """Pull dirb's own '(!) FATAL: ...' abort line(s) out of its stdout, if
+    present — see _FATAL_LINE's comment for why this is needed at all."""
+    reasons = [
+        m.group("reason").strip()
+        for m in (_FATAL_LINE.match(line.strip()) for line in (stdout or "").splitlines())
+        if m
+    ]
+    return " | ".join(reasons)
+
+
 def _path_from_url(url: str, base_url: str) -> str:
     """Strip the base URL prefix so only the discovered path remains."""
     path = url[len(base_url):] if url.startswith(base_url) else url
@@ -79,12 +126,17 @@ def _path_from_url(url: str, base_url: str) -> str:
 def _parse_dirb_output(stdout: str, base_url: str) -> list:
     """
     Parse dirb's result lines into a list of:
-        {path: str, status_code: int}
+        {path, status_code, size, url}
 
     Directory hits (which dirb reports without a status code) are recorded
     with status_code 301, matching how gobuster reports a bare directory
     redirect — this keeps severity heuristics (which look at the path, not
-    the code) consistent across both sources.
+    the code) consistent across both sources. Those lines carry no SIZE
+    either, so size stays None for them rather than being invented as 0.
+
+    dirb prints SIZE on every "+ <url> (CODE:n|SIZE:n)" hit and _FOUND_LINE
+    has always captured it; it was simply dropped when the dict was built.
+    url is dirb's own absolute URL, which carries the scheme and port.
     """
     discovered = []
     seen = set()
@@ -96,22 +148,35 @@ def _parse_dirb_output(stdout: str, base_url: str) -> list:
 
         match = _FOUND_LINE.match(line)
         if match:
-            path = _path_from_url(match.group("url"), base_url)
+            found_url = match.group("url")
+            path = _path_from_url(found_url, base_url)
             try:
                 status_code = int(match.group("code"))
             except (TypeError, ValueError):
                 continue
+            try:
+                size = int(match.group("size"))
+            except (TypeError, ValueError):
+                size = None
         else:
             dir_match = _DIR_LINE.match(line)
             if not dir_match:
                 continue
-            path = _path_from_url(dir_match.group("url"), base_url)
+            found_url = dir_match.group("url")
+            path = _path_from_url(found_url, base_url)
             status_code = 301
+            size = None
 
         if path in seen:
             continue
         seen.add(path)
-        discovered.append({"path": path, "status_code": status_code})
+        discovered.append({
+            "path": path,
+            "status_code": status_code,
+            "size": size,
+            "redirect": None,   # dirb never reports a redirect target
+            "url": found_url or None,
+        })
 
     discovered.sort(key=lambda d: d["path"])
     return discovered
@@ -137,21 +202,26 @@ def run_dirb(target: str, port: int = 80, use_https: bool = False,
     dict:
         target            : str
         port              : int
-        discovered_paths  : list[dict]  {path, status_code}
+        discovered_paths  : list[dict]  {path, status_code, size, redirect,
+                                        url}  size is None on directory
+                                        hits, which dirb reports without
+                                        one; redirect is always None —
+                                        dirb does not report redirect
+                                        targets at all
         raw_output        : str         dirb's stdout
         error             : str | None  human-readable failure reason
 
     Never raises. A missing dirb binary, a missing wordlist, or an
     unreachable target all come back as error set + discovered_paths empty.
     """
-    log_tool_start(target, "dirb")
-
     result = {
+        "tool": "dirb",
         "target": target,
         "port": port,
         "discovered_paths": [],
         "raw_output": "",
         "error": None,
+        "skipped": False,
     }
 
     resolved_wordlist, wordlist_error = _resolve_wordlist(wordlist)
@@ -166,21 +236,35 @@ def run_dirb(target: str, port: int = 80, use_https: bool = False,
 
     print_info(f"[Dirb] Enumerating {url} with {resolved_wordlist}")
 
+    # run_tool() already logs this call's start/success/failure under the
+    # "dirb" tool name — no need to log it again here.
     tool_result = run_tool(target, "dirb", command)
     result["raw_output"] = tool_result.get("stdout", "") or ""
+    result["skipped"] = tool_result.get("skipped", False)
 
     if not tool_result.get("success"):
         stderr = (tool_result.get("stderr") or "").strip()
-        err = stderr or tool_result.get("error") or "dirb failed"
-        result["error"] = err
-        log_tool_failure(target, "dirb", err)
-        print_error(f"[Dirb] dirb failed for {url} — {err}")
+        fatal = _extract_fatal_reason(result["raw_output"])
+        result["error"] = stderr or fatal or tool_result.get("error") or "dirb failed"
+        print_error(f"[Dirb] dirb failed for {url} — {result['error']}")
         return result
 
     discovered = _parse_dirb_output(result["raw_output"], url)
-    result["discovered_paths"] = discovered
 
-    log_tool_success(target, "dirb", tool_result.get("duration"))
+    if _looks_like_wildcard_flood(len(discovered), resolved_wordlist):
+        # A genuinely new fact worth its own log line (distinct from
+        # run_tool()'s "succeeded" — the process succeeded, the *data* is
+        # being discarded as noise), so this one stays.
+        msg = (
+            f"{url} answered {len(discovered)} of the wordlist's entries — "
+            "that's almost certainly a soft-404/wildcard response, not real "
+            "content; discarding these results"
+        )
+        log_tool_failure(target, "dirb", msg)
+        print_warning(f"[Dirb] {msg}")
+        return result
+
+    result["discovered_paths"] = discovered
 
     if discovered:
         for entry in discovered:
@@ -189,6 +273,8 @@ def run_dirb(target: str, port: int = 80, use_https: bool = False,
                 "port": port,
                 "path": entry["path"],
                 "status_code": entry["status_code"],
+                "size": entry["size"],
+                "url": entry["url"],
                 "source": "dirb",
             })
             print_success(f"[Dirb] {entry['path']} ({entry['status_code']})")

@@ -28,16 +28,22 @@ document markup written into a file, not console output.
 """
 
 import html
+import math
 import os
 from datetime import datetime
 
 from modules.utils.config import output_dir
+from modules.reporting.retention import report_filename
 from modules.utils.display import (
     print_info, print_success, print_warning, print_error,
 )
 from modules.utils.logger import get_logger
 from modules.enrichment.severity import SEVERITY_LEVELS
-from modules.reporting.summary import build_summary
+from modules.reporting.summary import (
+    build_summary, injection_findings, INJECTION_FINDING_TYPES,
+    field_display, service_display, cvss_display, distinct_identifiers,
+    profile_scope_note,
+)
 
 # Print-legible equivalents of display.SEVERITY_COLORS.
 #
@@ -84,15 +90,6 @@ def _format_timestamp(value) -> str:
         return datetime.fromisoformat(str(value)).strftime("%Y-%m-%d %H:%M:%S")
     except (TypeError, ValueError):
         return str(value)
-
-
-def _service_label(finding: dict) -> str:
-    """'http 2.4.7' / 'http' / 'unknown' — service and version as one cell."""
-    parts = [
-        str(finding.get("service") or "").strip(),
-        str(finding.get("version") or "").strip(),
-    ]
-    return " ".join(p for p in parts if p) or "unknown"
 
 
 def _severity_hex(severity) -> str:
@@ -144,10 +141,36 @@ def _stylesheet() -> str:
     .cover h1 { font-size: 24pt; letter-spacing: 3px; color: #12557f; }
     .cover .subtitle { font-size: 11pt; color: #555; margin-top: 4px; }
 
-    table.meta { width: 100%; margin-top: 14px; border-collapse: collapse; }
+    table.cover-band { width: 100%; margin-top: 14px; border-collapse: collapse; }
+    table.cover-band td { vertical-align: middle; }
+    table.cover-band td.cb-meta { width: 62%; }
+    table.cover-band td.cb-chart { width: 38%; text-align: center; }
+
+    table.meta { width: 100%; border-collapse: collapse; }
     table.meta td { padding: 2px 0; vertical-align: top; }
-    table.meta td.key { width: 32%; color: #555; }
+    table.meta td.key { width: 40%; color: #555; }
     table.meta td.value { font-weight: bold; }
+
+    .chart-box { display: inline-block; text-align: center; }
+    svg.donut { display: block; margin: 0 auto; }
+    table.legend { margin: 6px auto 0 auto; border-collapse: collapse; font-size: 8.5pt; }
+    table.legend td { padding: 1px 5px; }
+    table.legend td.lg-label { color: #444; text-align: left; }
+    table.legend td.lg-count { font-weight: bold; text-align: right; }
+    .swatch {
+        display: inline-block; width: 9px; height: 9px;
+        border-radius: 2px; vertical-align: middle;
+    }
+
+    .scope-note {
+        margin-top: 12px;
+        padding: 8px 10px;
+        border-left: 3px solid #9aa7b1;
+        background: #f4f6f8;
+        color: #3d4750;
+        font-size: 8.5pt;
+        line-height: 1.4;
+    }
 
     h2.section {
         font-size: 12pt;
@@ -223,6 +246,34 @@ def _stylesheet() -> str:
         color: #555;
         text-align: center;
     }
+
+    .inj-intro { color: #444; font-size: 9pt; margin: 0 0 10px 0; }
+    .injection {
+        border: 1px solid #d9c2c0;
+        border-left: 5px solid #b02418;
+        border-radius: 3px;
+        padding: 10px 12px;
+        margin-bottom: 12px;
+        page-break-inside: avoid;
+    }
+    .injection .head { font-size: 10.5pt; font-weight: bold; margin-bottom: 4px; }
+    .injection .facts { color: #555; font-size: 8.5pt; margin-bottom: 7px; }
+    .injection .label {
+        font-size: 8pt; font-weight: bold; color: #12557f;
+        letter-spacing: 0.6px; margin-top: 6px;
+    }
+    .injection pre {
+        margin: 3px 0 0 0;
+        background: #f4f2f0;
+        border: 1px solid #e0dcd9;
+        border-radius: 3px;
+        padding: 6px 8px;
+        font-family: "DejaVu Sans Mono", monospace;
+        font-size: 8pt;
+        color: #333;
+        white-space: pre-wrap;
+        word-break: break-all;
+    }
     .footer {
         margin-top: 22px;
         border-top: 1px solid #cfcfcf;
@@ -232,6 +283,82 @@ def _stylesheet() -> str:
         text-align: center;
     }
     """
+
+
+# Donut geometry. r/stroke chosen so the ring reads clearly at ~150px on
+# the cover; the circumference is what each severity segment's arc length is
+# measured against.
+_DONUT_RADIUS = 52
+_DONUT_CENTRE = 70
+_DONUT_STROKE = 24
+_DONUT_CIRCUMFERENCE = 2 * math.pi * _DONUT_RADIUS
+
+
+def _severity_donut_svg(summary: dict) -> str:
+    """
+    Inline SVG donut of the severity distribution, generated from the very
+    same by_severity counts the summary panel uses — no new data, just a
+    second, at-a-glance view of it on the cover.
+
+    Built as stacked stroked arcs (stroke-dasharray) in the four severity
+    hues (_SEVERITY_HEX), matching the terminal/summary colour scheme.
+    Static SVG, not script — WeasyPrint typesets it directly. A scan with no
+    findings renders an empty grey ring with a "0" centre rather than
+    nothing.
+    """
+    counts = summary.get("by_severity") or {}
+    total = summary.get("total_findings", 0) or 0
+    cx = cy = _DONUT_CENTRE
+    circ = _DONUT_CIRCUMFERENCE
+
+    # Grey base ring behind the coloured segments (also the whole ring when
+    # there are no findings to colour it in).
+    arcs = [
+        f'<circle cx="{cx}" cy="{cy}" r="{_DONUT_RADIUS}" fill="none" '
+        f'stroke="#eceff1" stroke-width="{_DONUT_STROKE}" />'
+    ]
+
+    offset = 0.0
+    for level in SEVERITY_LEVELS:
+        count = counts.get(level, 0)
+        if not count or not total:
+            continue
+        seg = (count / total) * circ
+        arcs.append(
+            f'<circle cx="{cx}" cy="{cy}" r="{_DONUT_RADIUS}" fill="none" '
+            f'stroke="{_severity_hex(level)}" stroke-width="{_DONUT_STROKE}" '
+            f'stroke-dasharray="{seg:.2f} {circ - seg:.2f}" '
+            f'stroke-dashoffset="{-offset:.2f}" />'
+        )
+        offset += seg
+
+    # Centre label sits outside the rotated group so it stays upright.
+    centre = (
+        f'<text x="{cx}" y="{cy - 3}" text-anchor="middle" '
+        f'font-size="21" font-weight="bold" fill="#1c1c1c">{total}</text>'
+        f'<text x="{cx}" y="{cy + 14}" text-anchor="middle" '
+        f'font-size="9" fill="#666">findings</text>'
+    )
+
+    return (
+        '<svg class="donut" viewBox="0 0 140 140" width="150" height="150">'
+        f'<g transform="rotate(-90 {cx} {cy})">{"".join(arcs)}</g>'
+        f"{centre}</svg>"
+    )
+
+
+def _severity_legend_html(summary: dict) -> str:
+    """Colour-swatch legend + per-tier count, paired with the donut."""
+    counts = summary.get("by_severity") or {}
+    items = "".join(
+        '<tr>'
+        f'<td><span class="swatch" style="background:{_severity_hex(level)}"></span></td>'
+        f'<td class="lg-label">{_esc(level.title())}</td>'
+        f'<td class="lg-count">{counts.get(level, 0)}</td>'
+        "</tr>"
+        for level in SEVERITY_LEVELS
+    )
+    return f'<table class="legend">{items}</table>'
 
 
 def _cover_html(summary: dict) -> str:
@@ -248,13 +375,38 @@ def _cover_html(summary: dict) -> str:
         f'<td class="value">{_esc(value)}</td></tr>'
         for key, value in rows
     )
+    # Two-column band under the title: scan metadata on the left, the
+    # severity-distribution donut (+ legend) on the right, so the cover
+    # leads with the shape of the result at a glance.
+    chart = (
+        '<div class="chart-box">'
+        f"{_severity_donut_svg(summary)}"
+        f"{_severity_legend_html(summary)}"
+        "</div>"
+    )
     return (
         '<div class="cover">'
         "<h1>AEGIS SCANNER</h1>"
         '<div class="subtitle">Vulnerability Assessment Report</div>'
         "</div>"
-        f'<table class="meta">{cells}</table>'
+        '<table class="cover-band"><tr>'
+        f'<td class="cb-meta"><table class="meta">{cells}</table></td>'
+        f'<td class="cb-chart">{chart}</td>'
+        "</tr></table>"
+        + _scope_note_html(metadata.get("profile"))
     )
+
+
+def _scope_note_html(profile) -> str:
+    """The profile's scope statement, worded identically to the text report.
+
+    Styled as a quiet note rather than a warning banner — it states what the
+    profile's scope is, which is not the same as saying something went wrong.
+    """
+    note = profile_scope_note(profile, labelled=True)
+    if not note:
+        return ""
+    return f'<div class="scope-note">{_esc(note)}</div>'
 
 
 def _summary_html(summary: dict) -> str:
@@ -318,11 +470,11 @@ def _top_findings_html(summary: dict) -> str:
 
     rows = "".join(
         "<tr>"
-        f'<td class="num">{_esc(finding.get("port"))}</td>'
-        f'<td>{_esc(finding.get("service"))}</td>'
-        f'<td>{_esc(finding.get("version"))}</td>'
-        f'<td>{_esc(finding.get("cve_id"))}</td>'
-        f'<td class="num">{_esc(finding.get("cvss"))}</td>'
+        f'<td class="num">{_esc(field_display(finding, "port"))}</td>'
+        f'<td>{_esc(field_display(finding, "service"))}</td>'
+        f'<td>{_esc(field_display(finding, "version"))}</td>'
+        f'<td>{_esc(field_display(finding, "cve_id"))}</td>'
+        f'<td class="num">{_esc(field_display(finding, "cvss"))}</td>'
         f'<td class="num">{_badge(finding.get("severity"))}</td>'
         "</tr>"
         for finding in top
@@ -336,6 +488,63 @@ def _top_findings_html(summary: dict) -> str:
         '<th>CVE</th><th class="num">CVSS</th><th class="num">Severity</th>'
         "</tr></thead>"
         f"<tbody>{rows}</tbody></table>"
+    )
+
+
+# Safe display cap for a payload / evidence snippet in the injection
+# section (see report_txt._INJECTION_FIELD_MAXLEN — same rationale).
+_INJECTION_FIELD_MAXLEN = 300
+
+
+def _truncate(value, limit: int = _INJECTION_FIELD_MAXLEN) -> str:
+    text = str(value or "").strip()
+    if len(text) > limit:
+        return text[: limit - 3].rstrip() + "..."
+    return text
+
+
+def _injection_html(summary: dict) -> str:
+    """
+    Dedicated "Injection & Scripting Vulnerabilities" section: one card per
+    confirmed SQL injection / reflected-XSS finding, each showing the exact
+    payload, the parameter/endpoint it was sent against, and a response
+    snippet proving exploitation.
+
+    Rendered separately from the general Detailed Findings list and only
+    when at least one such finding exists, so it does not restructure the
+    rest of the report. Scoped to exactly the two vulnerability classes in
+    summary.INJECTION_FINDING_TYPES.
+    """
+    injections = injection_findings(summary)
+    if not injections:
+        return ""
+
+    cards = []
+    for index, finding in enumerate(injections, start=1):
+        kind = str(finding.get("finding_type") or "").lower()
+        label = INJECTION_FINDING_TYPES.get(kind, "Injection")
+        severity = str(finding.get("severity") or "LOW").upper()
+
+        cards.append(
+            '<div class="injection">'
+            f'<div class="head">{index}. {_esc(label)} &nbsp;{_badge(severity)}</div>'
+            '<div class="facts">'
+            f'Endpoint {_esc(_truncate(finding.get("endpoint")) or "-")} '
+            f'&nbsp;|&nbsp; Parameter {_esc(finding.get("parameter") or "-")}'
+            "</div>"
+            '<div class="label">PAYLOAD</div>'
+            f'<pre>{_esc(_truncate(finding.get("payload")) or "(not recorded)")}</pre>'
+            '<div class="label">RESPONSE EVIDENCE</div>'
+            f'<pre>{_esc(_truncate(finding.get("evidence")) or "(no response snippet recorded)")}</pre>'
+            "</div>"
+        )
+
+    return (
+        '<h2 class="section">Injection &amp; Scripting Vulnerabilities</h2>'
+        '<p class="inj-intro">Confirmed SQL injection and cross-site scripting '
+        "findings, each shown with the exact payload used, the parameter/endpoint "
+        "it was sent against, and a response snippet proving exploitation.</p>"
+        + "".join(cards)
     )
 
 
@@ -354,23 +563,28 @@ def _details_html(summary: dict) -> str:
         )
 
     cards = []
-    for index, finding in enumerate(findings, start=1):
+    identifiers = distinct_identifiers(findings)
+    for index, (finding, title) in enumerate(zip(findings, identifiers), start=1):
         severity = str(finding.get("severity") or "LOW").upper()
-        cvss = finding.get("cvss")
-        cvss_cell = (
-            "not scored" if cvss is None
-            else f"{cvss} (source: {finding.get('severity_source', 'heuristic')})"
-        )
-        title = finding.get("cve_id") or _service_label(finding)
+        # Shared with the text report so the same finding cannot be titled
+        # two different things depending on which file the reader opens.
 
         cards.append(
             f'<div class="finding" style="border-left-color:{_severity_hex(severity)}">'
             f'<div class="head">{index}. {_esc(title)} &nbsp;{_badge(severity)}</div>'
             f'<div class="facts">'
-            f'Port {_esc(finding.get("port"))} &nbsp;|&nbsp; '
-            f'Service {_esc(_service_label(finding))} &nbsp;|&nbsp; '
-            f'CVE {_esc(finding.get("cve_id") or "none")} &nbsp;|&nbsp; '
-            f'CVSS {_esc(cvss_cell)}'
+            f'Port {_esc(field_display(finding, "port"))} &nbsp;|&nbsp; '
+            f'Service {_esc(service_display(finding))} &nbsp;|&nbsp; '
+            f'CVE {_esc(field_display(finding, "cve_id"))} &nbsp;|&nbsp; '
+            f'CVSS {_esc(cvss_display(finding))}'
+            f"</div>"
+            # Same two cells the text report's detail card gained, through
+            # the same field_display(), so the two files cannot disagree
+            # about what a finding's endpoint or citation was.
+            f'<div class="facts">'
+            f'Endpoint {_esc(_truncate(field_display(finding, "endpoint")))} '
+            f'&nbsp;|&nbsp; '
+            f'Reference {_esc(_truncate(field_display(finding, "reference")))}'
             f"</div>"
             f'<div class="label">DESCRIPTION</div>'
             f'<p>{_esc(finding.get("description") or "No description available.")}</p>'
@@ -400,6 +614,7 @@ def render_html(summary: dict) -> str:
         + _cover_html(summary)
         + _summary_html(summary)
         + _top_findings_html(summary)
+        + _injection_html(summary)
         + _details_html(summary)
         + '<div class="footer">Generated by Aegis Scanner — '
           "modular vulnerability assessment framework</div>"
@@ -407,16 +622,24 @@ def render_html(summary: dict) -> str:
     )
 
 
-def _resolve_output_path(target: str, output_path: str = None) -> str:
+def _resolve_output_path(target: str, output_path: str = None,
+                         profile: str = None, scan_id=None) -> str:
     """
     Decide where the PDF goes.
 
-    Mirrors report_txt._resolve_output_path: default is
-    config.output_dir(target)/report.pdf, and an explicit path has its
-    parent directory created so the caller does not have to.
+    Mirrors report_txt._resolve_output_path exactly, so the .txt and .pdf
+    for one scan are always a matching pair that retention.py can list and
+    prune as a unit: default is
+    config.output_dir(target)/report_<profile>_<target>_<scan_id>.pdf,
+    falling back to the historical fixed report.pdf when the profile or
+    scan_id is unknown. An explicit path has its parent directory created
+    so the caller does not have to.
     """
     if not output_path:
-        return os.path.join(output_dir(target), _DEFAULT_FILENAME)
+        directory = output_dir(target)
+        if profile and scan_id is not None:
+            return os.path.join(directory, report_filename(profile, target, scan_id, "pdf"))
+        return os.path.join(directory, _DEFAULT_FILENAME)
 
     parent = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(parent, exist_ok=True)
@@ -475,7 +698,10 @@ def generate_pdf_report(scan_id, output_path: str = None):
         return None
 
     try:
-        path = _resolve_output_path(target, output_path)
+        path = _resolve_output_path(
+            target, output_path,
+            profile=metadata.get("profile"), scan_id=metadata.get("id", scan_id),
+        )
     except OSError as exc:
         logger.error(f"[Report] could not prepare pdf output path for scan {scan_id}: {exc}")
         print_error(f"[Report] could not prepare the PDF output path: {exc}")

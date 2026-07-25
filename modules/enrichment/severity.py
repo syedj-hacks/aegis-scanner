@@ -25,6 +25,8 @@ The heuristic tables below are deliberately plain data so teammates can
 adjust a single entry without reading the control flow.
 """
 
+import re
+
 from modules.utils.logger import log_finding
 from modules.utils.display import print_info, print_warning
 
@@ -290,12 +292,36 @@ def _has_cve(finding: dict) -> bool:
     return bool(finding.get("cve_id") or finding.get("cves"))
 
 
+_keyword_pattern_cache = {}
+
+
+def _keyword_pattern(keyword: str):
+    """
+    Word-boundary regex for one keyword, cached so repeated scoring calls
+    don't recompile it every time.
+
+    Plain substring containment (the old `keyword in lowered` check) let
+    short, real keywords match inside unrelated words — "rce" (meant to
+    catch "RCE"/"remote code execution") also matched inside "brute-*f*orce*",
+    silently inflating a routine nikto brute-force finding to CRITICAL. \b
+    only anchors on alphanumeric/underscore boundaries, which still matches
+    a multi-word phrase like "sql injection" correctly (both edges of the
+    phrase land on word boundaries) while refusing to match "rce" as a
+    substring of a longer word.
+    """
+    pattern = _keyword_pattern_cache.get(keyword)
+    if pattern is None:
+        pattern = re.compile(r"\b" + re.escape(keyword) + r"\b")
+        _keyword_pattern_cache[keyword] = pattern
+    return pattern
+
+
 def _match_keywords(text: str, table) -> str:
     """Return the severity of the first keyword table entry that matches."""
     lowered = (text or "").lower()
     for severity, keywords in table:
         for keyword in keywords:
-            if keyword in lowered:
+            if _keyword_pattern(keyword).search(lowered):
                 return severity
     return ""
 
@@ -308,7 +334,13 @@ def _finding_type(finding: dict) -> str:
     log_finding) wins; otherwise the shape is sniffed from the keys those
     modules actually return.
     """
-    declared = str(finding.get("type") or "").strip().lower()
+    # Also honours `finding_type`, the column db.py persists under, so a row
+    # read back from SQLite is not put through shape-sniffing when it
+    # already declares its kind. Kept identical to
+    # remediation._finding_kind() on purpose — the two contracts are
+    # documented as the same.
+    declared = str(finding.get("type") or finding.get("finding_type")
+                   or "").strip().lower()
     if declared:
         return declared
 
@@ -318,7 +350,9 @@ def _finding_type(finding: dict) -> str:
         return "nmap_script"          # {port, script_id, output}
     if finding.get("header") or finding.get("missing_header"):
         return "missing_security_header"
-    if finding.get("description") is not None and "reference" in finding:
+    # Truthy reference, not just the key existing — see the same guard in
+    # remediation._finding_kind(): every SQLite row carries every column.
+    if finding.get("description") is not None and finding.get("reference"):
         return "nikto_finding"          # {description, reference}
     if finding.get("path"):
         return "discovered_path"        # {path, status_code}
@@ -331,6 +365,17 @@ def _finding_type(finding: dict) -> str:
     if finding.get("port") is not None:
         return "open_port"              # {port, protocol, service, state}
     return "unknown"
+
+
+def finding_kind(finding: dict) -> str:
+    """
+    Public entry point to this module's classifier, named identically to
+    remediation.finding_kind() because the two contracts are documented as
+    the same one. The attribution sweep
+    (modules/reporting/attribution.py) checks that claim mechanically for
+    every row in the database rather than trusting the docstrings.
+    """
+    return _finding_type(finding)
 
 
 def _heuristic_severity(finding: dict, kind: str) -> str:

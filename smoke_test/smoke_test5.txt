@@ -1,0 +1,520 @@
+================================================================================
+AEGIS SCANNER — SMOKE TEST REPORT #5
+"Zero open ports on a healthy target" regression — diagnosis, fix, re-verify
+================================================================================
+
+1. RUN METADATA
+--------------------------------------------------------------------------------
+Date (start)            : 2026-07-25 12:30 PKT
+Date (end)              : 2026-07-25 14:03 PKT
+Targets                 : scanme.nmap.org      (public, nmap's own designated
+                                                scan-testing host)
+                          pentest-ground.com   (public, intentionally
+                                                vulnerable)
+                          10.255.255.1         (unrouted address, used ONLY as
+                                                a deliberate-break fixture for
+                                                the new regression guard)
+Profiles run            : all five (stealthscan, quickscan, compliance,
+                          webaudit, deepscan)
+Invocation form         : python3 aegis.py <target> --profile <profile>,
+                          direct, no external timeout wrapper except where a
+                          `timeout 3000` guard is noted.
+
+Numbering note: #4 was the CONDITIONAL_TOOLS Docker pass. This is #5, scoped
+entirely to the port-detection regression first seen on scan 97. The planned
+SQLi/XSS enhancement work is NOT covered here and remains unstarted.
+
+This pass was opened on the hypothesis that the stealthscan/timeout rework had
+broken deepscan's port discovery. That hypothesis was WRONG, and section 3
+records why, because the wrong hypothesis is the more useful finding: the
+code was never at fault for the missing ports. It was at fault for how
+silently it reported them.
+
+
+2. THE REPORTED SYMPTOM
+--------------------------------------------------------------------------------
+scan 97 — deepscan against scanme.nmap.org, 2026-07-25 12:18:32 → 12:23:11:
+
+  - completed in 278.5s (vs. scan 85's ~1720s on the same target, same day)
+  - found ZERO open ports, so "no web port found among open ports"
+  - produced a clean, empty, entirely unalarming report
+  - summary panel read "Tools run: 4 | Tools failed: 1 | Tools skipped: 0"
+    but NOTHING anywhere named the failing tool or the reason
+  - scan_errors.log for that scan window contains NO [ERROR] line at all
+
+scan 85 (06:56:26 → 07:25:06, same target, same day) had found 22/ssh and
+80/http with 32/32 chunks completing. Hence the regression report.
+
+
+3. FIRST HYPOTHESIS — TESTED AND REJECTED
+================================================================================
+Proposed cause: the stealthscan redesign removed NMAP_TIMEOUTS['full_slow'],
+and that change silently altered _compute_nmap_timeout()'s behaviour for
+deepscan's 'full_fast' path, or disturbed _split_full_range /
+_FULL_RANGE_CHUNKS.
+
+Checked, and rejected on four independent grounds.
+
+3.1 There is no config.py in git at all
+    modules/utils/config.py is gitignored (.gitignore:10) and untracked; only
+    config.example.py is in the repo. `git log -p` has ZERO history for the
+    file the hypothesis is about. Timeline had to come from mtimes instead.
+    (Worth knowing independently of this bug.)
+
+3.2 No commit was made after smoke_test3
+    HEAD is 84f7ac7, dated 2026-07-24 08:51. Every 2026-07-25 change is
+    uncommitted working-tree state.
+
+3.3 The rework PREDATES the verified-good run
+        modules/utils/config.py           last modified  06:15
+        modules/scanning/port_scanner.py  last modified  06:50
+        scan 85 (verified good, 22/80)    STARTED        06:56:26
+    Neither file has been touched since. The code that produced 22/80 is
+    byte-identical to the code that produced zero. The documented claim that
+    _split_full_range/_FULL_RANGE_CHUNKS were "left in place, unchanged" is
+    accurate.
+
+3.4 Direct code inspection agrees
+    - 'full_slow' is entirely gone, with no dangling reference anywhere.
+    - _compute_nmap_timeout() has ONE clean branch: full-range ->
+      NMAP_TIMEOUTS['full_fast'] (19200), everything else ->
+      get_timeout('nmap'). No shared path, no silently-changed default, no
+      off-by-one in which key is looked up.
+    - _FULL_RANGE_CHUNKS = 32 and _split_full_range() are intact and
+      arithmetically correct.
+    - per-chunk budget = max(19200/32, 300) = 600s.
+
+3.5 The log falsifies it outright
+    All 32 chunks of scan 97 were logged as "Tool completed" in 4.5-8.4s
+    each — fast SUCCESSES, not timeouts. A timeout miscalculation cannot
+    produce that. The loop did not exit early; nothing was swallowed by
+    run_tool()'s never-raise contract; all 32/32 chunks ran.
+
+CONCLUSION: not a timeout bug, not a chunking bug, not a code regression.
+
+
+4. ACTUAL ROOT CAUSE
+================================================================================
+Two separate things, and keeping them apart matters:
+
+  (A) WHY THE PORTS WERE MISSING — target-side, not ours.
+      scanme.nmap.org was dropping every probe from this source during
+      12:19-12:23. nmap reported this honestly; Aegis recorded it faithfully.
+      The scanner was not wrong about what nmap returned.
+
+  (B) WHY IT WAS INVISIBLE — ours, and a real defect.
+      Aegis presented "the target answered nothing" identically to "the
+      target has nothing open", and counted a tool failure it never named.
+
+4.1 Evidence for (A)
+
+  Reproduced the exact failure shape directly. Against an unreachable host,
+  a 2047-port -T4 scan returns in 7.18s with:
+
+      <runstats>...<finished ... exit="success"/>
+      <ports><extraports state="filtered" count="2047">
+        <extrareasons reason="no-response" count="2047" .../>
+
+  nmap exits SUCCESS, with zero <port> elements. 7.18s matches scan 97's
+  4.5-8.4s chunk timings. Without inspecting the *reasons*, this is
+  indistinguishable from a clean "all closed" result — which is precisely
+  how it slipped through.
+
+  The decisive experiment (13:00, while scanme was blocked):
+      quickscan   / scanme.nmap.org     100 ports probed, ZERO answered, 2.4s
+      compliance  / scanme.nmap.org       3 ports probed, ZERO answered, 1.9s
+      stealthscan / pentest-ground.com  2 open ports found,           24.5s
+  Same machine, same network, same minute, same Docker containers running.
+  One target dead, the other fine. The fault is target-side.
+
+  Docker was explicitly ruled out (it was raised as a candidate because the
+  test containers were created at 08:34-09:21, i.e. after the good scan and
+  before the bad one):
+    - containers were up during SUCCESSFUL scans too (scan 101 found 22/80)
+    - nf_conntrack_count = 15 vs max 262144; zero drop messages in dmesg —
+      conntrack exhaustion was the one plausible Docker mechanism, and it
+      is not happening
+    - no routing conflict: test net 172.28.0.0/24, docker0 172.17.0.0/16,
+      scanme 45.33.32.156 via the default route
+  The Docker test fixtures are not implicated and need no changes.
+
+  What actually triggers it — concurrency, not volume:
+      4 back-to-back sequential 2047-port -T4 sweeps: 185s/167s/192s/157s,
+      ALL FOUR found 22 and 80. Sequential load alone does not trigger it.
+      The failures occurred only when a second scan OVERLAPPED one already
+      in flight against the same target.
+  Caveat, stated plainly: that overlap was self-inflicted by this session's
+  own test method (profile runs launched while a background sweep was still
+  running). It is a genuine reproduction of the user-visible symptom, but it
+  is not proof that scan 97's original trigger was identical — scan 96 had
+  fired a -p- chunk at 12:16:53, ~100s before scan 97 began, which is
+  consistent but not conclusive.
+
+  Recovery confirmed after a 6-minute settle with no overlapping scans —
+  see section 6.
+
+4.2 Evidence for (B) — the real codebase defect
+
+  port_scanner.py's chunked branch ended with:
+
+      if not result["open_ports"] and not result["scripts"] and result["error"] is None:
+          result["error"] = "nmap completed but found no open ports"
+
+  It set result['error'] WITHOUT calling log_tool_failure(). All five
+  profiles then counted it via
+
+      "tools_failed": sum(1 for r in tool_results if r.get("error") and not r.get("skipped"))
+
+  which yields a number and nothing else. Net effect: "Tools failed: 1",
+  no log line, no console line, no named tool. Exactly the reported gap.
+
+
+5. FIX APPLIED
+================================================================================
+Three changes, all additive; no existing behaviour removed or narrowed.
+
+5.1 Distinguish "no answer" from "nothing open"
+    modules/scanning/port_scanner.py
+      + _SILENT_PORT_REASONS = {"no-response"}
+      + _parse_nmap_reachability(xml) -> {host_up, responsive, silent}
+        Reads <state reason=> and <extraports>/<extrareasons reason=> to
+        count ports that genuinely answered (reset / conn-refused /
+        syn-ack) vs. ports that returned nothing. Accumulated across all 32
+        chunks. Malformed/empty XML yields zeroes, never raises — same
+        contract as the existing parsers.
+      + _diagnose_no_open_ports() — when ports were probed and NONE
+        answered, sets result['unreachable']=True and reports the result as
+        unreliable rather than as a clean finding. Always calls
+        log_tool_failure() AND print_error(), closing the silent path.
+      + result dict gains "tool": "nmap" and "unreachable": False.
+
+5.2 Regression guard
+    modules/utils/config.py (+ config.example.py, kept in sync)
+      + KNOWN_GOOD_TARGETS = {"scanme.nmap.org": [22, 80]}
+    modules/scanning/port_scanner.py
+      + _check_known_good_target() — flags loudly, to console and log, if a
+        known-good target returns ZERO open ports.
+      Deliberately scoped to the zero-port case only. Every profile's port
+      scope covers at least one of scanme's expected ports (stealthscan,
+      quickscan and deepscan all reach 22 and 80; webaudit and compliance
+      both include 80), so "zero ports on this host" is always wrong and
+      never a scope artefact. A PARTIAL result is not necessarily a
+      regression, so it is not flagged — that would false-positive on
+      webaudit/compliance by design.
+      Imported defensively (try/except ImportError with a built-in
+      fallback) because config.py is gitignored, so an older per-install
+      copy without the key is a real possibility.
+
+5.3 No tool failure may be invisible — applied generally, not as a one-off
+    modules/profiles/_common.py
+      + count_and_report_tool_failures(target, tool_results) -> int
+        Counting and reporting are deliberately the SAME function, so the
+        two cannot drift apart again: a failure that is counted is, by
+        construction, also printed. Drop-in replacement for the bare sum().
+    All five profiles now use it (deepscan, quickscan, webaudit, compliance,
+    stealth).
+    + "tool" key added to 17 wrapper result dicts (banner, service_detect,
+      hydra, enum4linux, dns, subdomain, osint, header_check, nikto,
+      gobuster, dirb, whatweb, nuclei, zap, wpscan, sqlmap, sslyze) so
+      failures are NAMED rather than reported as "unknown tool".
+
+5.4 Guard must not fire on a DELIBERATE user skip  (found by review, not test)
+    modules/scanning/port_scanner.py
+    First cut of the guard fired whenever a known-good target returned zero
+    ports — INCLUDING when the user had pressed Ctrl+C / the skip key on
+    nmap themselves. That is a false positive on a non-event, and this
+    project's own history contains two real instances of it (scan 96,
+    deepscan chunk 1 skipped by user; scan 99, stealthscan nmap skipped).
+    A guard that cries wolf on deliberate user action is one people learn
+    to ignore, which would defeat its whole purpose.
+    _check_known_good_target() now takes `skipped` and stays silent for it;
+    both call sites pass result["skipped"]. Verified both ways (fires when
+    not skipped, silent when skipped).
+
+5.5 zap_wrap.py dropped the skip flag — a live violation of a documented
+    non-negotiable convention  (found by reading the project docs/memory)
+    modules/web/zap_wrap.py:215
+    Its KeyboardInterrupt branch set result["error"] = "skipped by user
+    (Ctrl+C)" but never set result["skipped"] = True. Every profile counts
+    a tool as FAILED when it carries an error and is NOT marked skipped, so
+    a deliberate ZAP skip was being reported as a tool failure.
+
+    This is the exact bug CLAUDE_CONTEXT.md §0 lists as a non-negotiable
+    convention ("Every tool-wrapper module's result dict must set
+    'skipped'... any new wrapper module must include this line or the bug
+    reappears"). The earlier board-wide fix covered the 15 run_tool()-based
+    wrappers; zap_wrap.py drives a long-lived daemon over HTTP rather than
+    a subprocess and replicates run_tool()'s contract BY HAND, so it was
+    missed. Now fixed.
+
+    Severity note: this was pre-existing and independent of the scan-97
+    regression, but change 5.3 would have AMPLIFIED it — under the new
+    reporting a skipped ZAP run would not merely be miscounted, it would be
+    printed to the console as a failure. Found before that could happen.
+
+
+6. VERIFICATION
+================================================================================
+
+6.1 Unit tests against REAL nmap XML (not synthetic fixtures)
+    CASE 1  dropped/unreachable scan   reach={responsive:0, silent:2047}
+                                       -> unreachable=True, "NO answer"     PASS
+    CASE 2  real scanme scan           reach={responsive:2, silent:1},
+                                       host_up=True, open=[22,80]           PASS
+    CASE 3  guard, known-good + 0 ports fires (and is case-insensitive)     PASS
+    CASE 4  guard, ports ARE found     silent — no false positive           PASS
+    CASE 5  guard, non-known-good tgt  silent                               PASS
+    CASE 6  genuinely closed host      unreachable=False, correct wording   PASS
+    CASE 7  malformed / empty XML      returns zeroes, no raise             PASS
+
+6.2 Failure-reporter tests
+    mixed input (2 real failures, 1 skip, 1 success) -> count=2, both named
+    result dict with no "tool" key -> still surfaced as "unknown tool"
+    empty list / None -> 0, no crash, no output                             PASS
+
+6.3 Deliberate break test (guard proven to actually fire, then reverted)
+    Temporarily added "10.255.255.1": [22, 80] to KNOWN_GOOD_TARGETS and ran
+    a real CLI scan (scan 102, quickscan). Console:
+
+      [-] [Ports] 10.255.255.1: nmap probed 100 port(s) and got NO answer ...
+      [-] [Ports] REGRESSION GUARD: 10.255.255.1 is a known-good target ...
+      [-] [Failed] nmap: nmap probed 100 port(s) and got NO answer ...
+      [!] [Failed] 1 tool failure(s) above — see scan_errors.log ...
+      | Tools run: 2 | Tools failed: 1 | Tools skipped by user: 0
+
+    Both lines confirmed present in output/10.255.255.1/scan_errors.log as
+    [ERROR] entries. Temporary entry then REVERTED from config.py (verified
+    by re-reading the file) and the test output directory removed.
+
+6.4 The fix caught the real bug live
+    The 13:00 blocked window (section 4.1) was an unplanned reproduction of
+    the original scan-97 conditions. Under the OLD code that run would have
+    reported "no findings" and a bare "Tools failed: 1". Under the new code
+    it reported all three signals — unreachable diagnosis, regression guard,
+    and a named failure. This is the strongest single piece of evidence in
+    this pass: the fix was validated against a live recurrence, not a mock.
+
+6.5 Static checks
+    python3 -m compileall over modules/, database/, aegis.py     exit 0
+    all five profile modules import cleanly                       OK
+
+6.6 Compliance with CLAUDE_CONTEXT.md §0 "non-negotiable conventions"
+    Every convention re-checked against this pass's changes:
+      no direct subprocess          OK — nmap still goes via run_tool()
+      skip flag propagated          OK — and a VIOLATION was found+fixed (5.5)
+      no print() in modules         OK — display.py print_error/print_warning
+      no ad hoc logging             OK — logger.py log_tool_failure()
+      plain dict, never raises      OK — parsers return zeroes on ParseError
+      new config key in BOTH files  OK — KNOWN_GOOD_TARGETS in config.py AND
+                                    config.example.py
+      incremental persistence       unchanged by this pass
+
+6.7 Real-evidence check (findings read back from database/aegis.db)
+    Confirming the profiles still produce genuine, varied evidence — not
+    merely a non-zero port count:
+      scan 109 webaudit/scanme    13 discovered_path, 9 nikto_finding,
+                                  6 missing_security_header, 2 cve,
+                                  1 fingerprint_header
+                                  = 31 findings (1 HIGH, 5 MEDIUM, 25 LOW)
+      scan 111 quickscan/pg       6 nuclei_finding + 3 open ports
+                                  (2 CRITICAL, 4 HIGH)
+      scan 108 compliance/scanme  1 nmap_script (ssl-enum-ciphers/
+                                  http-headers path) + 1 open port
+      scans 106/110 stealthscan   2 open ports each (this profile persists
+                                  raw open_port rows by design; it runs no
+                                  second probing pass)
+    Nothing here is a placeholder or a synthesised finding.
+
+
+7. PER-RUN RESULTS
+================================================================================
+scan  target              profile      elapsed  ports found   failed  verdict
+------------------------------------------------------------------------------
+ 97   scanme.nmap.org     deepscan      278.5s  NONE            1     pre-fix; the
+                                                                      reported bug
+101   scanme.nmap.org     stealthscan   179.4s  22, 80          0     post-fix OK
+102   10.255.255.1        quickscan       ~2s   NONE            1     break test —
+                                                                      guard FIRED
+                                                                      (intended)
+103   scanme.nmap.org     quickscan       2.4s  NONE            1     blocked window,
+                                                                      correctly flagged
+104   scanme.nmap.org     compliance      1.9s  NONE            1     blocked window,
+                                                                      correctly flagged
+105   pentest-ground.com  stealthscan    24.5s  80, 443         0     OK (same minute
+                                                                      as 103/104)
+106   scanme.nmap.org     stealthscan    85.7s  22, 80          0     settled retest
+107   scanme.nmap.org     quickscan     143.2s  22, 80          0     settled retest
+108   scanme.nmap.org     compliance      3.2s  80              0     settled retest;
+                                                                      80 only = correct,
+                                                                      profile scans
+                                                                      80/443/8443
+------------------------------------------------------------------------------
+Port findings above are read back from database/aegis.db, not from console
+scrape: scans 101/106/107 -> ports [22, 80]; scan 108 -> port [80];
+scans 103/104 -> no findings rows.
+
+Supporting non-Aegis measurements:
+  manual `nmap -T4 -p 1-2047 scanme.nmap.org`        165s, found 22 and 80
+  4x back-to-back, same command    185s / 167s / 192s / 157s, all found 22, 80
+  `nmap -T4 -p 1-2047 10.255.255.1`  7.18s, exit=success, 2047x no-response
+
+
+8. HONEST LIMITATIONS
+================================================================================
+ 1. The rate-limiting reproduction was produced by this session's own
+    overlapping scans. It reproduces the SYMPTOM faithfully but does not
+    prove scan 97's original trigger was identical.
+ 2. scanme.nmap.org's blocking behaviour is not under our control and is not
+    directly observable — it is inferred from probe/response patterns. It is
+    a well-supported inference, not a measurement of their config.
+ 3. The regression guard covers exactly one host. It is a tripwire for a
+    known-good target, not a general health check.
+ 4. The guard flags zero-port results only. A scan that finds 22 but loses
+    80 will NOT be flagged. Broadening it would false-positive on
+    scope-limited profiles; the trade was made deliberately.
+ 5. config.example.py remains stale relative to config.py in other respects
+    (it is missing NMAP_TIMEOUTS, PROFILE_TIME_BUDGET_SECONDS,
+    COMPULSORY_TOOLS, SKIP_KEY). KNOWN_GOOD_TARGETS was added to both, but
+    the pre-existing drift was NOT fixed here — out of scope, still open.
+ 6. Some result dicts set an 'error' for benign no-op conditions (e.g.
+    "no open ports supplied; skipping service detection"). These were always
+    counted in "Tools failed"; they are now also PRINTED. Counting is
+    unchanged — visibility increased. In edge cases this makes the summary
+    slightly noisier, which is the intended direction.
+
+
+9. STATUS OF THIS PASS   (superseded by sections 10-11 — see those for final
+   results; this section records the state partway through)
+================================================================================
+COMPLETE and verified:
+  - root cause established (sections 3-4)
+  - fix applied (section 5)
+  - unit + reporter + deliberate-break tests (sections 6.1-6.3)
+  - live recurrence caught by the new code (section 6.4)
+  - stealthscan, quickscan, compliance re-verified against scanme.nmap.org
+    with real 22/80 findings after settling (scans 106-108)
+  - stealthscan re-verified against pentest-ground.com (scan 105)
+
+STILL RUNNING at the time this file was first written — see section 10 for
+results, which are appended once the runs land:
+  - webaudit  / scanme.nmap.org        (scan 109)
+  - stealthscan, quickscan, webaudit, compliance / pentest-ground.com
+  - deepscan  / both targets  (~30 min per run; deepscan is the profile the
+    bug was originally reported on, so this is the most important remaining
+    item, NOT an optional extra)
+
+NOT ATTEMPTED, deliberately:
+  - the "run each profile at least twice per target" requirement is only
+    partially met so far. Each repeat is a further full-range sweep against
+    a host that demonstrably rate-limits under concurrent load, so runs were
+    spaced out rather than stacked. Repeat coverage is stated per-run in
+    section 10 rather than claimed globally.
+  - conditional-tools Docker work and SQLi/XSS enhancements: untouched.
+
+
+10. FINAL RUN RESULTS
+================================================================================
+
+10.1 THE DECISIVE RESULT — deepscan / scanme.nmap.org (scan 115)
+--------------------------------------------------------------------------------
+This is the run that matters: same profile, same target, same command as the
+scan 97 failure that opened this pass.
+
+                              scan 97 (the bug)   scan 115 (post-fix)
+    elapsed                   278.5s              1530.5s
+    open ports found          NONE                22 (ssh), 80 (http)
+    findings persisted        0                   41
+    tools run                 4                   13
+    tools failed              1 (never named)     0
+    tools skipped by user     0                   0
+    32/32 chunks completed    yes                 yes
+
+  Findings by type (read back from database/aegis.db, scan_id=115):
+      discovered_path            13
+      nikto_finding               9
+      zap_finding                 7
+      missing_security_header     6
+      nuclei_finding              2
+      cve                         2
+      fingerprint_header          1
+      banner                      1
+  Severity spread: 1 HIGH, 10 MEDIUM, 30 LOW.
+
+  Notable: zap_finding = 7. ZAP produced real alerts on this run, so the
+  webaudit/deepscan ZAP path is working here — unlike smoke_test4's runs,
+  where zaproxy failed on every scan with a missing zapv2 package.
+
+  No REGRESSION GUARD line and no "NO answer" diagnosis fired — correct,
+  because this run genuinely found ports. The guard proves it is not
+  merely dormant via the deliberate break test (6.3).
+
+  Runtime note, stated because it bears directly on this pass's subject:
+  the 32-chunk sweep took ~7 minutes here (13:37:51 -> 13:44:57) against
+  ~29 minutes in scan 85, with identical code and target. deepscan's
+  runtime is strongly target-responsiveness-dependent, not a fixed cost.
+  The earlier characterisation of deepscan as a "~30 minute profile" is an
+  upper bound, not a constant.
+
+10.2 Full verified matrix
+--------------------------------------------------------------------------------
+scan  target              profile      elapsed  ports         failed  findings
+------------------------------------------------------------------------------
+106   scanme.nmap.org     stealthscan    85.7s  22, 80          0       2
+107   scanme.nmap.org     quickscan     143.2s  22, 80          0       2
+108   scanme.nmap.org     compliance      3.2s  80              0       2
+109   scanme.nmap.org     webaudit      876.8s  80              0      31
+115   scanme.nmap.org     deepscan     1530.5s  22, 80          0      41
+105   pentest-ground.com  stealthscan    24.5s  80, 443         0       2
+110   pentest-ground.com  stealthscan    23.3s  80, 443         0       2
+111   pentest-ground.com  quickscan     300.0s  80, 443, +1     0       9
+------------------------------------------------------------------------------
+  ALL FIVE PROFILES verified against scanme.nmap.org with real, correct
+  port detection and zero tool failures. Every profile found the ports its
+  own scope covers:
+    stealthscan/quickscan/deepscan -> 22 AND 80 (scopes include both)
+    webaudit                       -> 80 only   (scans 80/443/8080/8443)
+    compliance                     -> 80 only   (scans 80/443/8443)
+  These are correct results, not partial ones.
+
+  pentest-ground.com: stealthscan verified TWICE (scans 105, 110 — 24.5s
+  and 23.3s, identical 80/443 result, so not a fluke), quickscan once
+  (2 CRITICAL + 4 HIGH nuclei findings — real evidence).
+
+10.3 NOT COMPLETED — scope cut, stated plainly
+--------------------------------------------------------------------------------
+The following were in the original brief and were deliberately NOT run,
+after the user asked to drop the multi-target chain and its settle gaps:
+  - webaudit    / pentest-ground.com   (was mid-run when stopped)
+  - compliance  / pentest-ground.com   (queued, never started)
+  - deepscan    / pentest-ground.com   (queued, never started)
+  - the "at least twice per target per profile" requirement is met ONLY for
+    stealthscan on pentest-ground.com. Every other profile/target pair was
+    run once post-fix.
+
+Do not read this file as evidence of a fully doubled matrix. It is not one.
+What it does establish: all five profiles detect real ports correctly on
+scanme.nmap.org, the regression is fixed on the exact profile+target that
+exhibited it, and the new guards fire correctly when broken on purpose.
+
+
+11. FINAL VERDICT
+================================================================================
+Root cause: NOT a code regression. The stealthscan/timeout rework was
+innocent (section 3). scanme.nmap.org was dropping every probe during the
+scan 97 window; nmap reported that honestly and Aegis recorded it
+faithfully. The genuine codebase defects were that Aegis presented "the
+target answered nothing" identically to "the target has nothing open", and
+counted a tool failure it never named.
+
+Both are fixed, plus two further bugs found by reviewing the project docs
+and memory rather than by testing:
+  - the regression guard would have cried wolf on deliberate user skips (5.4)
+  - zap_wrap.py dropped the skip flag, violating a documented
+    non-negotiable convention, and change 5.3 would have amplified it from
+    a miscount into a printed false failure (5.5)
+
+The fix was validated against a LIVE recurrence of the original conditions
+(6.4), not only against mocks — and deepscan, the profile the bug was
+reported on, now returns 41 real findings and both expected open ports
+where it previously returned nothing at all.
+

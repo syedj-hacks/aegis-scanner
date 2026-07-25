@@ -9,7 +9,7 @@ and parses its section-based stdout into structured emails/hosts/IPs.
 import re
 
 from modules.utils.error_handler import run_tool
-from modules.utils.logger import log_tool_start, log_tool_success, log_tool_failure, log_finding
+from modules.utils.logger import log_finding
 from modules.utils.display import print_info, print_success, print_warning, print_error
 
 _SECTION_HEADER = re.compile(r"^\[\*\]\s*(Emails|Hosts|IPs)\s+found:\s*(\d+)", re.IGNORECASE)
@@ -95,12 +95,13 @@ def harvest_osint(target: str, source: str = "crtsh", limit: int = 500) -> dict:
         success : bool
         error   : str | None
     """
-    log_tool_start(target, "theHarvester")
-
     command = ["theHarvester", "-d", target, "-b", source, "-l", str(limit)]
+    # run_tool() already logs this call's start/success/failure under the
+    # "theHarvester" tool name — no need to log it again here.
     tool_result = run_tool(target, "theHarvester", command)
 
     result = {
+        "tool": "theHarvester",
         "target": target,
         "emails": [],
         "hosts": [],
@@ -108,6 +109,7 @@ def harvest_osint(target: str, source: str = "crtsh", limit: int = 500) -> dict:
         "counts": {"emails": 0, "hosts": 0, "ips": 0},
         "success": False,
         "error": None,
+        "skipped": tool_result.get("skipped", False),
     }
 
     if tool_result.get("success"):
@@ -119,7 +121,6 @@ def harvest_osint(target: str, source: str = "crtsh", limit: int = 500) -> dict:
             "hosts": len(parsed["hosts"]),
             "ips": len(parsed["ips"]),
         }
-        log_tool_success(target, "theHarvester", tool_result.get("duration"))
         for email in parsed["emails"]:
             log_finding(target, {"type": "osint_email", "value": email})
         for host in parsed["hosts"]:
@@ -130,10 +131,8 @@ def harvest_osint(target: str, source: str = "crtsh", limit: int = 500) -> dict:
             f"{result['counts']['hosts']} host(s), {result['counts']['ips']} ip(s)"
         )
     else:
-        err = tool_result.get("error") or tool_result.get("stderr") or "theHarvester failed"
-        result["error"] = err
-        log_tool_failure(target, "theHarvester", err)
-        print_warning(f"[OSINT] theHarvester failed for {target}: {err}")
+        result["error"] = tool_result.get("error") or tool_result.get("stderr") or "theHarvester failed"
+        print_warning(f"[OSINT] theHarvester failed for {target}: {result['error']}")
 
     return result
 

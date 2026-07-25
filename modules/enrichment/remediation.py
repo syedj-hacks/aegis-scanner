@@ -309,7 +309,13 @@ def _finding_kind(finding: dict) -> str:
     `type` wins, otherwise the shape is inferred from the keys the
     scanning/web modules actually return.
     """
-    declared = str(finding.get("type") or "").strip().lower()
+    # `finding_type` is the column name db.py persists under, so a row read
+    # back from SQLite declares its kind under that key rather than `type`.
+    # Reading only `type` sent every stored row through the shape-sniffing
+    # below, which is guesswork applied to a finding that already knows what
+    # it is.
+    declared = str(finding.get("type") or finding.get("finding_type")
+                   or "").strip().lower()
     if declared:
         return declared
 
@@ -319,7 +325,12 @@ def _finding_kind(finding: dict) -> str:
         return "nmap_script"
     if finding.get("header") or finding.get("missing_header"):
         return "missing_security_header"
-    if finding.get("description") is not None and "reference" in finding:
+    # A truthy reference, not merely the key being present: rows read back
+    # from SQLite carry EVERY column, so `"reference" in finding` is true for
+    # all of them and this branch claimed any described finding as nikto's.
+    # A stealthscan open-port row was being told to "review this nikto
+    # finding" — naming a tool that never ran.
+    if finding.get("description") is not None and finding.get("reference"):
         return "nikto_finding"
     if finding.get("path"):
         return "discovered_path"
@@ -332,6 +343,20 @@ def _finding_kind(finding: dict) -> str:
     if finding.get("port") is not None:
         return "open_port"
     return "unknown"
+
+
+def finding_kind(finding: dict) -> str:
+    """
+    Public entry point to this module's classifier.
+
+    modules/reporting/attribution.py's whole-database attribution sweep has
+    to ask the exact question a rendered report asks — "what kind of finding
+    will this row be treated as?" — and answering it any other way would
+    check something other than what the reader sees. Exposed by name rather
+    than left to callers reaching into _finding_kind(), so the sweep is
+    tied to the real classifier and not to a copy of it.
+    """
+    return _finding_kind(finding)
 
 
 def remediation_text(finding: dict) -> str:
@@ -409,6 +434,14 @@ def remediation_text(finding: dict) -> str:
             "injection; deploy a WAF rule as an interim mitigation."
         )
 
+    if kind == "xss_finding":
+        return (
+            f"Contextually encode the '{finding.get('parameter') or 'reflected'}' "
+            "parameter on output (HTML/attribute/JS encoding as appropriate) and "
+            "validate input, to eliminate this confirmed reflected XSS; deploy a "
+            "Content-Security-Policy as defence in depth."
+        )
+
     if kind == "weak_credentials":
         return (
             "Change this credential immediately, enforce a strong password "
@@ -472,7 +505,16 @@ def get_remediation(finding: dict) -> dict:
         }
 
     enriched = dict(finding)
-    enriched["remediation"] = remediation_text(enriched)
+    # A remediation the TOOL supplied wins over this module's generic text.
+    # ZAP returns a per-rule `solution` written for that exact alert ("Ensure
+    # that the HttpOnly flag is set for all cookies"), which is strictly more
+    # useful than "review the ZAP baseline alert '<name>' against OWASP
+    # guidance" — and overwriting it discarded real tool output in favour of
+    # a sentence that tells the reader to go and look it up themselves.
+    # Only findings whose wrapper genuinely populated this field are
+    # affected; everything else still gets remediation_text() as before.
+    existing = str(finding.get("remediation") or "").strip()
+    enriched["remediation"] = existing or remediation_text(enriched)
     return enriched
 
 

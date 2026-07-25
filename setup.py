@@ -30,11 +30,22 @@ CONFIG_EXAMPLE_PATH = os.path.join(REPO_ROOT, "modules", "utils", "config.exampl
 # codebase actually imports it (port_scanner.py/service_detect.py shell out
 # to the nmap binary and parse its XML output with the stdlib) — checking
 # for it here would flag a false failure, so it's deliberately omitted.
+#
+# zapv2 (pip: python-owasp-zap-v2.4) IS imported — by modules/web/zap_wrap.py
+# — and used to be absent from this check. That omission is exactly how a
+# venv missing the ZAP client passed post-install verification while every
+# deepscan/webaudit silently lost ZAP and reported "tools failed: 1": the one
+# check meant to catch a missing dependency could not see this one. The pip
+# name python-owasp-zap-v2.4 (>=0.1.0) is a shim that pulls in the renamed
+# `zaproxy` package, which is what actually provides the `zapv2` module; this
+# check imports `zapv2` so it verifies the real, importable end state rather
+# than the shim's mere presence.
 REQUIRED_MODULES = {
     "rich": "rich",
     "requests": "requests",
     "scapy": "scapy",
     "weasyprint": "weasyprint",
+    "zapv2": "python-owasp-zap-v2.4",
 }
 
 

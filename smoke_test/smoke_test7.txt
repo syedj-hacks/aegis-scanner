@@ -1,0 +1,774 @@
+================================================================================
+AEGIS SCANNER — SMOKE TEST REPORT #7
+"Duplicate Redis findings" — diagnosis, fixes, and re-verification
+Plus: capped report retention, honest field rendering, CLI report banner,
+      and the last open flags from smoke_test5/6
+================================================================================
+
+1. RUN METADATA
+--------------------------------------------------------------------------------
+Date (start)            : 2026-07-25 14:30 PKT
+Date (end)              : 2026-07-25 16:45 PKT
+Targets                 : pentest-ground.com   (public, intentionally
+                                                vulnerable — the target the
+                                                reported bug was seen on)
+                          scanme.nmap.org      (public, nmap's own designated
+                                                scan-testing host)
+Profiles run            : all five (quickscan, stealthscan, compliance,
+                          webaudit, deepscan)
+Invocation form         : python3 aegis.py <target> --profile <profile>
+                          --non-interactive
+Scans produced          : 118-127
+
+Numbering note: #5 was the zero-open-ports regression, #6 the showcase pass.
+This is #7, scoped to the duplicate-findings report, the four follow-on
+work items requested with it, and the remaining smoke_test5/6 open flags.
+
+The headline result is a negative one, and it is the most important thing in
+this file: THERE WAS NO DUPLICATE-FINDINGS BUG. Four findings that looked
+identical on the page were four different remote-code-execution CVEs that
+the report could not tell apart. Section 2 records how that was established,
+because the wrong diagnosis here — "collapse the duplicate rows" — would
+have permanently deleted three real critical findings from every report.
+
+
+2. PHASE 1 — DIAGNOSIS: THE DUPLICATES WERE NOT DUPLICATES
+================================================================================
+
+2.1 The reported symptom
+--------------------------------------------------------------------------------
+scan 117 — quickscan against pentest-ground.com, 2026-07-25 14:13:20:
+
+    1. [CRITICAL] port 80 — Redis is an open source, in-memory database...
+    2. [CRITICAL] port 80 — Redis is an open source, in-memory database...
+    3. [HIGH    ] port 80 — Redis is an open source, in-memory database...
+    4. [HIGH    ] port 80 — Redis is an open source, in-memory database...
+
+Two identical-looking CRITICAL rows, two identical-looking HIGH rows, in one
+report. Reported as duplicate findings.
+
+2.2 Three hypotheses, all tested, all rejected
+--------------------------------------------------------------------------------
+(a) "The renderer's SELECT is scoped by target, not scan_id, so findings
+     from this target's many prior scans (105, 110, 111, 116...) bleed in."
+    REJECTED. database/db.py:152-155 is verbatim:
+        SELECT * FROM findings WHERE scan_id = ?
+    Scoped by scan_id. No target-scoped read exists anywhere in the
+    findings-retrieval path.
+
+(b) "A one-to-many JOIN with a CVE-enrichment or tags table fans out."
+    REJECTED. There is no JOIN anywhere in the retrieval path, and no table
+    to join to — the schema is two tables (scans, findings), and enrichment
+    is written into columns on the finding row itself at insert time. A fan-
+    out is not structurally possible.
+
+(c) "The Redis template fires twice in one run — e.g. two fuzzed candidate
+     URLs both landing on the same probe."
+    REJECTED, and this is where the real answer came from. Raw tool output
+    for scan 117, from output/pentest-ground.com/scan_errors.log:782-787:
+
+        template_id: CVE-2025-46817   severity: critical
+        template_id: CVE-2025-49844   severity: critical
+        template_id: CVE-2025-46818   severity: high
+        template_id: CVE-2025-46819   severity: high
+        template_id: redis-default-logins    severity: high
+        template_id: exposed-redis           severity: high
+
+    SIX DISTINCT nuclei templates. Six distinct findings. Six distinct rows
+    in the database (ids 5408-5413). Nothing was duplicated at any layer.
+
+2.3 The actual defect — a truncation collision
+--------------------------------------------------------------------------------
+The four CVE templates' descriptions are upstream nuclei prose, and all four
+open with the SAME 160-character sentence:
+
+    "Redis is an open source, in-memory database that persists on disk.
+     Versions 8.2.1 and below allow an authenticated user to use a specially
+     crafted Lua script to ..."
+
+...and only then diverge into "cause an integer overflow", "manipulate the
+garbage collector", "read out-of-bound data", "manipulate different LUA
+objects".
+
+report_txt.py truncated the description to 60 characters
+(_TOP_FINDING_DESC_MAXLEN) for the at-a-glance list. Below 60 characters the
+four are byte-identical. Four different RCE/DoS bugs, one visible row shape.
+
+Reproduced in a unit test before any fix was written (t_phase2.py case D):
+    BEFORE fix: 4 Redis CVEs collide at 60 chars    PASS (bug reproduces)
+    AFTER  fix: all 6 truncate to DISTINCT strings  PASS
+
+2.4 Why the disambiguator was missing — the real data bug
+--------------------------------------------------------------------------------
+_finding_identifier() prefers cve_id and only falls back to a truncated
+description. cve_id would have made these four instantly distinct. It was
+NULL for all four.
+
+Cause, verified against the template on disk
+(/home/jafar/nuclei-templates/javascript/cves/2025/CVE-2025-46817.yaml):
+
+    id: CVE-2025-46817          <-- the CVE is the template id
+    info:
+      name: Redis < 8.2.1 lua script - Integer Overflow
+      severity: critical
+      # NO classification: block at all
+
+nuclei_wrap.py read info.classification.cve-id, which none of the four
+templates define. The CVE identifier was sitting unread in template_id the
+whole time.
+
+Confirmed across all four: none has a classification block. Confirmed by
+capturing REAL nuclei JSONL against pentest-ground.com rather than trusting
+the YAML — see 2.5.
+
+2.5 Two further real defects, found by capturing raw nuclei output
+--------------------------------------------------------------------------------
+Rather than reason from the templates, a real nuclei run was captured:
+
+    nuclei -u http://pentest-ground.com -severity critical,high -jsonl
+
+    template-id : CVE-2025-46819
+      type      : javascript
+      matched-at: pentest-ground.com:6379
+      port      : 6379                       <-- NOT 80
+      classification : None
+
+    template-id : exposed-redis
+      port      : 6379
+      classification : {'cve-id': None, 'cwe-id': ['cwe-306'],
+                        'cvss-score': 7.2}   <-- a real score, never read
+
+  (i) WRONG PORT. The Redis Lua templates hardcode Port "6379" and pivot
+      there regardless of the URL they were launched against. nuclei
+      reported port 6379. Aegis recorded port 80 — the web port the wrapper
+      had been pointed at. Four Redis flaws were being attributed to the
+      web server. This was not in the bug report; it was found by looking
+      at the tool's own output.
+
+ (ii) UNREAD CVSS. exposed-redis publishes classification.cvss-score 7.2.
+      The wrapper never read cvss-score, so every nuclei finding rendered
+      "not scored" regardless of what nuclei actually supplied.
+
+2.6 Phase 1 conclusion
+--------------------------------------------------------------------------------
+Not a scan_id scoping bug. Not a JOIN fan-out. Not a double-fire. The
+defects were:
+    - cve_id never populated when the template id IS the CVE
+    - findings attributed to the probed port, not the matched port
+    - published CVSS scores discarded
+    - and a report that truncated four different findings into one shape
+
+Bearing on Phase 2, stated plainly: the requested dedup key
+(finding_type, port, description, tool) uses the FULL description, so it
+correctly collapses nothing here. Had it been keyed on the *rendered*
+(truncated) string — which is what the symptom looked like it called for —
+it would have silently destroyed CVE-2025-49844, -46818 and -46819 from
+every report. Confirmed by test (t_phase2.py case F).
+
+
+3. PHASE 2 — FIXES + DEFENSIVE DEDUP
+================================================================================
+
+3.1 Root-cause fixes (collection time)
+    modules/web/nuclei_wrap.py
+      + _cve_from_template() — prefers info.classification.cve-id; falls
+        back to a CVE-shaped template id (anchored regex, case-insensitive).
+        Nothing invented: a non-CVE-shaped id like "exposed-redis" still
+        yields None.
+      + _cvss_from_classification() — reads classification.cvss-score,
+        discarding non-numeric or out-of-range values.
+      + _matched_port() — nuclei's own `port`, falling back to parsing
+        matched-at, falling back to None (which preserves the old
+        behaviour).
+      + result dicts gain matched_port, protocol, scheme.
+
+    modules/profiles/_common.py
+      + nuclei_description() — folds the template NAME onto the front of
+        the description. db.py has no column for a template name, so a name
+        passed through the mappers is dropped at insert; putting it in the
+        description is what makes it survive the round-trip, using a column
+        that already exists. Both halves are nuclei's own output.
+      + nuclei_port() / nuclei_service() — shared by both profiles that map
+        nuclei findings, so quickscan and deepscan cannot drift.
+        nuclei_service() deliberately returns None for tcp/javascript
+        templates rather than inferring "redis" from port 6379: a port
+        convention is not an observation.
+
+    modules/profiles/quickscan.py, deepscan.py
+      + both nuclei mappers now carry port (matched), service, cvss, name.
+
+3.2 Defensive dedup — added, and it turned out NOT to be a no-op
+    modules/reporting/summary.py
+      + deduplicate_findings(), keyed on
+        (finding_type, port, cve_id, severity, description)
+        — the FULL description, never a rendered one. cve_id and severity
+        are in the key beyond the requested four so the pass stays
+        conservative.
+      + wired into build_summary(), the single chokepoint both the txt and
+        PDF writers consume, so the two can never disagree on how many
+        findings a scan had.
+      + every collapse is logged AND printed, naming the finding and the
+        number of copies dropped. A de-duplicator that quietly deletes rows
+        from a security report is a worse defect than the duplication it
+        guards against.
+
+    It was built as a guard against a hypothetical. It caught a real one on
+    its first deepscan run — see 3.4, which is the most useful single result
+    in this pass after the Phase 1 diagnosis.
+
+3.4 A REAL duplicate-insert path, found by the new guard (scan 127)
+--------------------------------------------------------------------------------
+deepscan/pentest-ground.com printed:
+
+    [!] [Summary] collapsed 1 duplicate finding row(s)
+    [!] [Summary] duplicate collapsed: Redis - Default Logins — ...
+        (type=nuclei_finding, port=6379, severity=HIGH)
+        — 1 extra copy(ies) dropped, 1 kept
+
+Database showed 77 rows against 76 rendered, with ids 5500 and 5525 both
+"Redis - Default Logins" on port 6379.
+
+Cause: deepscan runs nuclei ONCE PER WEB PORT. This host has 80 and 443
+open, and the Redis templates pivot to 6379 regardless of the URL they were
+launched against — so the same match came back from both probes.
+
+Crucially, this duplicate was CREATED BY the matched-port fix in 3.1. Before
+it, the two copies recorded port 80 and port 443 and read as two different
+findings — wrong, but not duplicated. Recording the true port made them
+genuinely identical. A fix that surfaced a latent second bug, and the guard
+built in the same pass is what caught it.
+
+Fixed at the source as well as at render time:
+    modules/profiles/deepscan.py
+      + _findings_from_nuclei() takes a `seen` set of
+        (template_id, matched_port) pairs, shared across the per-port web
+        loop, so a pivoting template is recorded once and the skip is
+        announced. quickscan does not need this — it probes a single port.
+
+    Unit-verified: same template from :80 and :443 -> 2 findings, not 4;
+    same template on 6379 vs 6380 -> still 2, correctly kept separate.
+
+    Confirmed live by scan 128 (deepscan re-run, post-fix):
+        database rows 82   report total 82   nuclei findings exactly 6
+        no dedup collapse message — nothing left to collapse
+    Stated honestly: the cross-port collision did not RECUR in 128, because
+    nuclei matched the Redis templates from the :80 probe only that run. The
+    fix is proven by unit test and the end state is proven live; the exact
+    live collision was not re-triggered.
+
+
+3.3 Verified NOT to merge legitimately different findings (Phase 2 item 3)
+    All PASS (t_phase2.py section F):
+      same CVE on two different ports                    -> stays 2
+      two different CVEs with identical description      -> stays 2
+      different finding_type, identical description      -> stays 2
+      different severity, identical description          -> stays 2
+      descriptions differing ONLY past char 60           -> stays 2   <-- the
+                                                            decisive case
+      genuinely identical rows                           -> collapses to 1
+      triplicate                                         -> collapses to 1
+      real scan 117 rows: 9 in                           -> 9 out
+    Input list and dicts are never mutated (verified).
+
+
+4. PHASE 3 — HONEST FIELD RENDERING
+================================================================================
+
+4.1 The two states a bare "-" was hiding
+    modules/reporting/summary.py
+      + FINDING_TYPE_TOOL — which tool produced each finding type.
+      + _NOT_APPLICABLE — per (field, finding_type) reasons a field cannot
+        apply by nature.
+      + field_display() returns, in order: the value; "N/A (<why>)" when the
+        field cannot apply; "not determined by <tool>" when it could have
+        and nothing filled it in. It never returns a bare dash.
+      + service_display() — never drops a half-known pair: a known service
+        with no version renders "nginx (version not determined by nmap -sV)".
+      + cvss_display() — says whether a grade came from CVSS or the
+        heuristic.
+
+    Examples now rendered:
+        missing_security_header / CVE   -> "N/A (config finding)"
+        discovered_path / CVE           -> "N/A (path discovery)"
+        sqlmap_finding / CVE            -> "N/A (injection class, not a CVE)"
+        smb_share / Service             -> "N/A (host-level finding)"
+        nuclei_finding / Service        -> "not determined by nuclei"
+        nikto_finding / CVE             -> "not determined by nikto"
+
+4.2 Populated at the source where the tool really did know (Phase 3 item 1)
+    The brief asked specifically whether the Redis wrapper sets a service
+    field. It does not, and it should not — nuclei's `type` for those
+    templates is "javascript"/"tcp", a protocol class, not a service name.
+    What nuclei DID determine and Aegis was discarding was the PORT (6379)
+    and, for exposed-redis, the CVSS score (7.2). Both are now read from the
+    tool's own output. Nothing is guessed.
+
+4.3 Shared between txt and PDF so they cannot disagree
+    finding_identifier() moved into summary.py. The PDF previously fell
+    straight through to a service label and titled EVERY nuclei match
+    "unknown"; the text report had a description fallback. Same finding, two
+    different names depending which file you opened. One implementation now.
+
+4.4 Render-time collision repair — needed for scans already in the database
+    Discovered during Phase 7, not predicted: the collection-time fixes
+    cannot reach rows already stored. Re-rendering scan 111 still produced
+    four identical-looking rows, because its cve_id is NULL and its
+    description is the bare upstream prose.
+
+    + distinct_identifiers() resolves collisions at render time:
+        1. append the text where the group actually DIVERGES. Showing more
+           of the description does not work — the four Redis templates share
+           their first ~160 characters, so a wider window is still four
+           identical strings, only longer. The distinguishing text lives
+           immediately past the common prefix, so that is what is appended.
+        2. if descriptions are byte-identical, distinguish by port and type
+        3. and failing that, a positional marker, so the guarantee is
+           unconditional
+      A group that shares a SERVICE label ("http 1.31.3" on ports 80/81/443)
+      is deliberately left alone — those rows are already told apart by the
+      port printed beside them, and appending "…80." / "…81." would restate
+      the adjacent column as noise. (This gate was added after the first
+      implementation regressed exactly that case; caught in Phase 7.)
+
+    Result, scan 111 (historical rows, unchanged in the database):
+      1. [CRITICAL] Redis is an open source... …ua script to manipulate the
+                                                 garbage collec...
+      2. [CRITICAL] Redis is an open source... …ua script to cause an integer
+                                                 overflow and...
+      3. [HIGH    ] Redis is an open source... …UA script to read out-of-bound
+                                                 data or cra...
+      4. [HIGH    ] Redis is an open source... …ua script to manipulate
+                                                 different LUA obje...
+
+    Verified across the WHOLE database: all 120 scans render unique
+    top-finding lines and detail cards distinguishable by
+    (label, severity, port).
+
+
+5. PHASE 4 — CAPPED, INDEXED REPORT RETENTION
+================================================================================
+New module: modules/reporting/retention.py
+
+5.1 Filename scheme
+    report_<profile>_<target>_<scan_id>.txt / .pdf
+    e.g. report_deepscan_scanme.nmap.org_115.txt
+    The profile is in the filename so a directory listing says what each
+    report IS without opening it.
+
+5.2 Cap: 5 per profile+target  (confirmed with the user before building)
+    Each profile keeps its own budget for a given target, so a burst of
+    quickscans cannot evict the one deepscan report of that host — which a
+    flat per-target cap would do, and which is the exact evidence loss this
+    module exists to prevent.
+
+5.3 Interactive prompt, all three choices
+    Delete oldest [o] / delete by number / keep all [k]. Invalid input
+    re-prompts rather than crashing or silently defaulting. Ctrl+C / EOF is
+    read as "keep everything" — an interrupted operator has not consented to
+    a deletion.
+
+5.4 Non-interactive
+    --non-interactive flag added to aegis.py, plumbed through all five
+    profiles. Also implied automatically when stdin/stdout is not a TTY, so
+    a piped or scheduled run never hangs on a prompt. The choice and the
+    REASON are logged and printed.
+
+5.5 Pruning never risks the report just written
+    Runs only AFTER the new report is on disk; the newest report is never a
+    deletion candidate; every failure is caught and logged rather than
+    raised. Legacy fixed-name report.txt/report.pdf are deliberately NOT
+    swept up — they belong to no identifiable scan, so the pruner will not
+    delete what it cannot account for. (Verified: both still present in
+    output/pentest-ground.com/ after this pass.)
+
+5.6 Prunes to the cap, not one file per run
+    Found in Phase 7: the first implementation deleted exactly one report
+    per scan, so a directory that started over-cap (reports re-rendered by
+    hand, or restored) took several scans to converge. Now loops to the cap.
+    "Keep all" still ends pruning immediately — asking again after the user
+    has just declined would be badgering.
+    Verified: 8 stored, cap 5 -> 3 deleted in one run, newest always kept.
+
+
+6. PHASE 5 — END-OF-SCAN CLI REPORT BANNER
+================================================================================
+New module: modules/reporting/completion.py
+
+Rendered after every scan, for all five profiles:
+
+  ╭──────────────────── REPORT GENERATED ─────────────────────╮
+  │ Profile: quickscan    Target: pentest-ground.com  Scan: 118│
+  │ Findings: 9 total (2 CRITICAL, 4 HIGH, 3 LOW)              │
+  │ Notable: 6 nuclei matches, 3 unclassified findings          │
+  │ TXT: output/pentest-ground.com/report_quickscan_..._118.txt │
+  │ PDF: output/pentest-ground.com/report_quickscan_..._118.pdf │
+  ╰────────────────────────────────────────────────────────────╯
+
+  - severity breakdown, omitting tiers that did not occur (a line meant to
+    be read at a glance should not carry "0 CRITICAL")
+  - "Notable" names finding types worst-severity-first, so one CRITICAL
+    Redis exposure is named ahead of forty LOW discovered paths
+  - both report paths, as OSC 8 terminal hyperlinks over file:// URIs.
+    Terminals without OSC 8 support show the plain path, so nothing is lost
+  - paths shown relative to the working directory: absolute paths wrapped
+    onto three terminal lines, defeating the point of a panel
+  - a failed writer prints "not generated — see errors above" rather than
+    omitting the line
+  - panel border coloured by worst severity present
+
+All five profiles now write BOTH a .txt and a .pdf. Previously only deepscan
+produced a PDF; the other four wrote a .txt and nothing else, which would
+have made the retention scheme's .txt/.pdf pairing meaningful for exactly
+one profile. The shared _common.finalise_reports() owns generate -> prune ->
+banner, in that order, for all five.
+
+
+7. PHASE 6 — PRIOR OPEN FLAGS CLOSED
+================================================================================
+
+7.1 config.example.py parity — CLOSED
+    Added NMAP_TIMEOUTS, PROFILE_TIME_BUDGET_SECONDS, COMPULSORY_TOOLS,
+    SKIP_KEY, with their explanatory comments.
+    Verified by AST comparison of top-level names:
+        missing from example: NONE — full parity
+        example-only        : NONE
+
+7.2 SQLi/XSS discovery ordering — CLOSED, and it was worse than documented
+    It was recorded as an ordering problem. It was not: _common.
+    web_param_candidates() iterated PARAMETERS in the inner loop and
+    returned as soon as the cap was hit, so the FIRST discovered endpoint
+    consumed the entire 6-candidate budget. Reproduced:
+
+        BEFORE: 6 candidates, ALL on /index.php
+                DISTINCT endpoints fuzzed: 1
+                (/xss.php and /info.php never fuzzed at all — no reordering
+                 alone could have fixed this)
+
+    Two bounded changes, same budget, no extra requests:
+      - parameters iterated in the OUTER loop, so every endpoint gets its
+        first parameter before any endpoint gets its second
+      - endpoints ranked by _endpoint_rank(): names suggesting a query
+        parameter (search/info/xss/id/view/...) first, site roots
+        (index/home/default) last. A hint for ORDER only — nothing is ever
+        excluded, so a parameterised /index.php is still fuzzed.
+
+        AFTER:  DISTINCT endpoints fuzzed: 4
+                ['index.php', 'info.php', 'search.php', 'xss.php']
+                xss.php and info.php now reached FIRST.
+    Regression-checked: empty/None input, 404 exclusion, non-script
+    exclusion, cap respected, dedup across gobuster+dirb, return shape.
+
+7.3 xss_wrap.py / sqlmap_wrap.py vs the smoke_test5 reporting changes — OK
+    Both already set "tool" and propagate "skipped" correctly. Verified
+    under the final code: 5 user-skips -> tools_failed 0, no console noise;
+    3 real failures -> tools_failed 3, each named.
+
+7.4 TWO NEW instances of the documented skip-flag convention violation
+    Found while verifying 7.3, by auditing every module rather than only
+    the two named:
+
+    modules/web/header_check.py — a LIVE false-failure bug, same class as
+      zap_wrap.py in smoke_test5 §5.5. It drives requests through
+      safe_call() rather than run_tool(), and safe_call reports a
+      KeyboardInterrupt as an ordinary error string. header_check set
+      result['error'] and never set result['skipped'], so a deliberate
+      Ctrl+C was counted as a FAILED tool — and, since smoke_test5's
+      reporting change, PRINTED as one.
+
+    modules/scanning/banner.py — not miscounted (its per-port errors never
+      reach result['error']) but a skip there was entirely INVISIBLE:
+      not counted failed, not counted skipped, nothing on the summary panel.
+      It now records the skip and stops probing the remaining ports rather
+      than making the operator interrupt once per port.
+
+    Root cause of the recurrence addressed, not just the two instances:
+      modules/utils/error_handler.py
+        + SKIP_REASON_INTERRUPT / SKIP_REASON_SKIP_KEY constants (the two
+          reasons were previously bare string literals at their use sites)
+        + is_user_skip() — the single place that recognises a deliberate
+          skip, for the modules that replicate run_tool()'s contract by hand.
+      This is the third time this bug has appeared (zap_wrap, header_check,
+      banner). It now has one shared test instead of three hand-written ones.
+
+
+8. VERIFICATION
+================================================================================
+
+8.1 Unit tests — 123 assertions, 0 failures
+    t_phase2.py  36 PASS   CVE recovery, CVSS recovery, real-JSONL
+                           round-trip, the 60-char collision reproduced
+                           before/after, dedup safety (7 cases), real scan
+                           117 rows, no input mutation
+    t_phase3.py  47 PASS   matched-port recovery from REAL nuclei output,
+                           service honesty, port-parse edge cases, N/A vs
+                           not-determined for every finding_type in the DB,
+                           no bare dash for any of the 17 real types,
+                           full render of scans 117/115/109
+    t_phase4.py  40 PASS   filename scheme, parsing, per-profile budgets,
+                           legacy files untouched, non-interactive oldest-
+                           delete, all three prompt choices, invalid-input
+                           re-prompt, EOF safety, hostile input
+    Plus distinct_identifiers coverage and a whole-database sweep.
+
+8.2 Interactive prompt proven over a REAL pty — 11 PASS, 0 FAIL
+    The unit tests drive _prompt_choice() directly; under redirected stdout
+    _is_interactive() is False, so the interactive branch was never actually
+    exercised. A pty harness (t_pty.py) forks a real terminal and types at
+    it:
+        real TTY detected (stdin=True stdout=True)          PASS
+        prompt appeared with indices 1-5                     PASS
+        newest report NOT offered as a candidate             PASS
+        [o] -> oldest 101 deleted, 5 remain                  PASS
+        [3] -> index 3 (=107) deleted                        PASS
+        [k] -> nothing deleted, all 6 kept, stated aloud     PASS
+        "99" -> "out of range", re-prompts                   PASS
+        "xyz" -> "not a valid choice", re-prompts            PASS
+        recovers and honours the next valid answer           PASS
+
+8.3 Real scans — 10 scans, all five profiles, both targets
+scan  target              profile      findings  severity            failed
+------------------------------------------------------------------------------
+118   pentest-ground.com  quickscan     9        2 CRIT, 4 HIGH, 3 LOW   0
+119   pentest-ground.com  quickscan     5        2 HIGH, 3 LOW           0
+120   pentest-ground.com  stealthscan   2        2 LOW                   0
+121   pentest-ground.com  compliance    5        5 LOW                   0
+122   pentest-ground.com  webaudit     30        6 MEDIUM, 24 LOW        0
+123   scanme.nmap.org     stealthscan   2        2 LOW                   0
+124   scanme.nmap.org     compliance    2        2 LOW                   0
+125   scanme.nmap.org     quickscan     2        2 LOW                   0
+126   pentest-ground.com  quickscan     9        2 CRIT, 4 HIGH, 3 LOW   0
+127   pentest-ground.com  deepscan     76        2 CRIT, 4 HIGH, 18 MED, 52 LOW  0
+128   pentest-ground.com  deepscan     82        2 CRIT, 4 HIGH, 19 MED, 57 LOW  0
+------------------------------------------------------------------------------
+    Zero tool failures across all eleven runs. 19 tools run in each deepscan.
+
+8.4 THE DECISIVE RESULT — scan 118 vs scan 117, same profile, same target
+--------------------------------------------------------------------------------
+                          scan 117 (reported)   scan 118 (post-fix)
+    identical-looking rows        4                     0
+    cve_id populated              0 of 6                4 of 6
+    port recorded                 80 (wrong)            6379 (correct)
+    cvss from nuclei              none                  7.2 on exposed-redis
+    bare "-" cells                present               none
+
+    Database rows, scan 118:
+      port  cve_id          cvss  severity  description
+      6379  CVE-2025-46818        HIGH      Redis Lua Sandbox < 8.2.2 — ...
+      6379  CVE-2025-46819        HIGH      Redis Lua Long-String Delim — ...
+      6379  CVE-2025-46817        CRITICAL  Redis < 8.2.1 lua script — ...
+      6379  CVE-2025-49844        CRITICAL  Redis Lua Parser < 8.2.2 — ...
+      6379                        HIGH      Redis - Default Logins — ...
+      6379                  7.2   HIGH      Redis Server - Unauth Access — ...
+
+    Rendered TOP FINDINGS, scan 118 — six distinct rows:
+      1. [CRITICAL] port 6379 — CVE-2025-46817
+      2. [CRITICAL] port 6379 — CVE-2025-49844
+      3. [HIGH    ] port 6379 — Redis Server - Unauthenticated Access — ...
+      4. [HIGH    ] port 6379 — CVE-2025-46818
+      5. [HIGH    ] port 6379 — CVE-2025-46819
+      6. [HIGH    ] port 6379 — Redis - Default Logins — ...
+
+    Detail block, showing the field-rendering fix:
+      Port          : 6379
+      Service       : not determined by nuclei
+      CVE           : CVE-2025-46817
+      CVSS          : not determined by nuclei
+      Severity      : CRITICAL
+
+8.5 Repeat-scan scenario (the one that surfaced the bug)
+    quickscan run against pentest-ground.com THREE times (118, 119, 126).
+    No duplicates in any run. Runs 118 and 126 both found the full 6-finding
+    Redis set; run 119 found only 2 because NUCLEI ITSELF reported only 2
+    templates that run (confirmed in scan_errors.log — the four javascript
+    CVE templates did not fire). That is target-side variance of the kind
+    smoke_test5 documented, not a scanner regression: the two templates that
+    did fire were recorded correctly, on port 6379, with cvss 7.2.
+
+8.6 Report audit — every report written this pass
+    14 reports checked mechanically for both defect classes:
+        ambiguous cells (bare "-", "none", "not scored", "unknown"): 0
+        duplicate rendered top-finding lines:                        0
+    All PDFs valid (%PDF- header, 17KB-42KB).
+
+    One file in output/ is NOT clean and is deliberately left alone:
+    report_scan112_injection_showcase.txt (168 ambiguous cells, 1 duplicate
+    line). It is a hand-named showcase artefact from smoke_test6, not
+    produced by the current pipeline. Regenerating it would overwrite a
+    record of what that scan's report looked like at the time, which is the
+    kind of evidence loss this pass exists to prevent. Left as-is,
+    deliberately, and noted here so the audit is not read as 100% clean
+    across the whole directory.
+
+8.7 deepscan / pentest-ground.com — the gap smoke_test5 left open
+--------------------------------------------------------------------------------
+smoke_test5 §10.3 listed deepscan/pentest-ground.com as queued and never
+started. It has now run twice.
+
+    scan 127  2133.1s   77 rows / 76 rendered   19 tools, 0 failed
+    scan 128  2079.4s   82 rows / 82 rendered   19 tools, 0 failed
+
+    scan 128 findings by type:
+        zap_finding               32
+        missing_security_header   12
+        nikto_finding             11
+        nuclei_finding             6   <-- exactly 6, no duplicate
+        nmap_script                6
+        discovered_path            5
+        service_version            2
+        fingerprint_header         2
+        (plus 6 further rows across remaining types)
+      Severity: 2 CRITICAL, 4 HIGH, 19 MEDIUM, 57 LOW
+
+    Both runs found the Redis CVE set on the correct port (6379) with
+    populated cve_id, and ZAP produced 32 real alerts. Nothing placeholder,
+    nothing synthesised.
+
+    scan 127 is the run that exposed the duplicate-insert path (3.4); scan
+    128 is the post-fix confirmation, with database and report counts equal.
+
+8.9 Database count vs rendered count, every scan this pass
+    scan 118  db=9   report=9    OK
+    scan 119  db=5   report=5    OK
+    scan 120  db=2   report=2    OK
+    scan 121  db=5   report=5    OK
+    scan 122  db=30  report=30   OK
+    scan 123  db=2   report=2    OK
+    scan 124  db=2   report=2    OK
+    scan 125  db=2   report=2    OK
+    scan 126  db=9   report=9    OK
+    scan 127  db=77  report=76   DIFFERS — the real duplicate of 3.4,
+                                 correctly collapsed and loudly logged
+    scan 128  db=82  report=82   OK — post-fix, nothing to collapse
+
+8.8 Retention verified against the real output directory
+    quickscan/pentest-ground.com reached 7 stored reports (5 real runs plus
+    2 hand-re-rendered). Scan 126 pruned automatically:
+        [Retention] 7 stored report(s) ... exceeds the cap of 5 —
+        deleting the oldest (scan 84) because --non-interactive requested.
+    Legacy report.txt / report.pdf still present and untouched, as designed.
+
+8.10 Post-cleanup re-verification
+    Seven now-unused imports left behind by the refactor (the four profiles
+    no longer call generate_txt_report/generate_pdf_report directly, and the
+    report writers no longer call finding_identifier directly) were removed
+    at review time. Re-verified afterwards: all 134 unit + pty assertions
+    pass, compileall clean, all five profiles import, and a real
+    stealthscan (scan 129) completed with 0 tool failures and both reports
+    written. The cleanup is confirmed by a live run, not just by imports
+    resolving.
+
+
+9. HONEST LIMITATIONS
+================================================================================
+ 1. Historical database rows are NOT rewritten. Scans recorded before this
+    pass still carry NULL cve_id and port 80 for the Redis findings. Their
+    REPORTS now render unambiguously (4.4), but the stored data is
+    unchanged. This was a deliberate choice: silently rewriting recorded
+    scan results would destroy the evidentiary record, which is the same
+    failure mode Phase 4 exists to prevent. A backfill would be a separate,
+    explicit operation.
+
+ 2. Service is still "not determined by nuclei" for the Redis findings.
+    nuclei genuinely does not report a service name for tcp/javascript
+    templates — only a protocol class. Inferring "redis" from port 6379
+    would be a convention, not an observation, and the brief was explicit
+    that a value should not be invented.
+
+ 3. The "not determined by <tool>" label is honest but repetitive on
+    web-heavy scans: gobuster/nikto/zap findings do know their scheme
+    (http vs https) at wrapper level, and that could be populated at the
+    source the way nuclei's port now is. Only nuclei was fixed this pass —
+    it was the wrapper named in the brief. The other web wrappers are a
+    known, documented gap, not an oversight.
+
+ 4. Two runs per profile per target was NOT achieved for every pair.
+    Achieved: quickscan/pentest-ground.com x3 (118, 119, 126);
+              deepscan/pentest-ground.com x2 (127, 128).
+    Single post-fix run: stealthscan, compliance, webaudit on
+    pentest-ground.com; stealthscan, compliance, quickscan on
+    scanme.nmap.org. Repeats were spaced rather than stacked to respect the
+    rate-limiting behaviour smoke_test5 documented.
+
+ 9. The cross-port nuclei dedup (3.4) is proven by unit test and by scan
+    128's correct end state, but the live collision did not recur in 128 —
+    nuclei matched the Redis templates from the :80 probe only that run. A
+    third deepscan where both probes match would exercise the live path
+    again; it was not run.
+
+ 5. webaudit and deepscan were NOT re-run against scanme.nmap.org this
+    pass. They were verified there in smoke_test5 (scans 109, 115) and
+    nothing in this pass changes their scanning behaviour — only reporting,
+    which is exercised by the eight scans that did run. Stated so the
+    matrix is not read as more complete than it is.
+
+ 6. The retention prompt's interactive path is proven by a pty harness,
+    not by a human typing at it. The harness uses a real TTY (isatty True
+    on both streams) and real keystrokes, so the gate and the parsing are
+    genuinely exercised, but it is still an automated test.
+
+ 7. distinct_identifiers() resolves collisions among the findings PASSED TO
+    IT — the top-findings list and the detail list separately. It does not
+    guarantee uniqueness against findings from a different scan, which is
+    not a case any report renders.
+
+ 8. The severity of scan 122 (webaudit/pentest-ground.com) is 6 MEDIUM /
+    24 LOW with no HIGH or CRITICAL, whereas quickscan found 2 CRITICAL on
+    the same host. That is expected — webaudit does not run the nuclei
+    severity pass that finds the Redis CVEs — but it does mean a webaudit
+    report alone understates this host's risk. Pre-existing profile-scope
+    behaviour, not introduced here, and not changed.
+
+
+Worth your attention
+Historical DB rows are not rewritten. Their reports now render unambiguously via render-time repair, but stored cve_id/port are unchanged. Deliberate — silently rewriting recorded scan results is the evidence loss Phase 4 exists to prevent. A backfill should be an explicit, separate decision if you want it.
+Service stays "not determined by nuclei" for the Redis findings. nuclei reports a protocol class (javascript/tcp), not a service name; inferring "redis" from port 6379 is a convention, not an observation.
+The commit also lands your previously-uncommitted smoke_test5/6 work (wrappers, port_scanner, zap_wrap, Docker fixtures) that was already in the tree — noted explicitly in the commit body so it isn't misattributed to this pass.
+Repeat coverage is uneven: quickscan ×3 and deepscan ×2 on pentest-ground.com, single runs elsewhere. Full limitations in §9 of smoke_test7.txt.
+
+
+10. FINAL VERDICT
+================================================================================
+The reported bug did not exist. Four rows that looked identical were four
+different Redis remote-code-execution CVEs that the report could not tell
+apart, because it truncated their descriptions to 60 characters and the four
+share their first 160. Acting on the symptom as described — collapsing the
+"duplicate" rows — would have permanently deleted CVE-2025-49844,
+CVE-2025-46818 and CVE-2025-46819 from every report Aegis produces.
+
+What was genuinely broken, all fixed and verified:
+  - cve_id never populated when the nuclei template id IS the CVE
+  - findings attributed to the probed port instead of the port nuclei
+    actually matched on (four Redis flaws credited to the web server)
+  - published CVSS scores read from nuclei and discarded
+  - reports that could not distinguish four different findings
+  - a bare "-" standing for both "cannot apply" and "nobody determined it"
+  - the PDF titling every nuclei finding "unknown" while the text report
+    did not — same finding, two names
+  - reports overwritten per target, with no history and no warning
+  - no end-of-run statement of what was found or where the report went
+  - XSS fuzzing that spent its entire candidate budget on the first
+    endpoint, so xss.php was never fuzzed at all
+  - header_check.py counting and printing a deliberate Ctrl+C as a tool
+    failure — the third instance of a documented non-negotiable convention
+    being violated, now with a shared constant and helper so it is the last
+  - banner.py making a user skip completely invisible
+  - config.example.py missing four keys a fresh install needs
+
+Two findings came out of the work rather than the brief, and both are worth
+more than the items that were asked for:
+  - nuclei reports a matched port that differs from the probed port; Aegis
+    was discarding it (2.5)
+  - the defensive dedup pass, built as a guard against a hypothetical,
+    immediately caught a real duplicate-insert path in deepscan that the
+    matched-port fix had itself created (3.4)
+
+Evidence: 123 unit assertions, 11 pty assertions, 11 real scans across all
+five profiles and both targets with zero tool failures, and a mechanical
+audit of every report written. Every previously-open coverage gap from
+smoke_test5/6 is closed — webaudit and deepscan against pentest-ground.com
+both ran to completion for the first time.
+
+Limitations are stated in section 9 and are real: historical database rows
+are not rewritten, service remains undetermined for the Redis findings
+because nuclei genuinely does not report one, the other web wrappers still
+do not populate service, and repeat coverage is uneven across profiles.

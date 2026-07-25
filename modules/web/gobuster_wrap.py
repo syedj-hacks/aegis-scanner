@@ -22,9 +22,7 @@ import os
 import re
 
 from modules.utils.error_handler import run_tool
-from modules.utils.logger import (
-    log_tool_start, log_tool_success, log_tool_failure, log_finding,
-)
+from modules.utils.logger import log_tool_failure, log_finding
 from modules.utils.display import (
     print_info, print_success, print_warning, print_error,
 )
@@ -48,7 +46,20 @@ _GOBUSTER_BASE_ARGS = ["-q", "--np", "-t", "30"]
 # Matches gobuster's result lines, e.g.
 #   admin                (Status: 301) [Size: 0] [--> /admin/]
 #   /index.html          (Status: 200) [Size: 55]
-_RESULT_LINE = re.compile(r"^(?P<path>\S+)\s+\(Status:\s*(?P<status>\d+)\)")
+#
+# Size and the redirect target are gobuster's own output and were previously
+# matched-but-discarded — the pattern stopped at the status code. Both are
+# real, tool-reported detail: the size distinguishes a 0-byte stub from a
+# real page, and the redirect target says where a 301/302 actually goes
+# (verified against live gobuster output — see smoke_test8.txt §3.1). Both
+# groups are optional: gobuster omits [--> ...] on non-redirects, and a
+# future/older build that omits [Size: ...] must still parse rather than
+# silently yielding zero paths.
+_RESULT_LINE = re.compile(
+    r"^(?P<path>\S+)\s+\(Status:\s*(?P<status>\d+)\)"
+    r"(?:\s*\[Size:\s*(?P<size>\d+)\])?"
+    r"(?:\s*\[-->\s*(?P<redirect>[^\]]+)\])?"
+)
 
 # Single-page apps and sites with a soft 404 answer *every* URL with the
 # same page, so gobuster refuses to start and exits 1. Its own error text
@@ -65,6 +76,28 @@ _WORDPRESS_MARKERS = (
     "/wp-includes",
     "/xmlrpc.php",
 )
+
+# Some SPAs / edge-CDN setups answer *every* path with 200 and a body that
+# varies just enough (a per-request token, a timestamp) to defeat gobuster's
+# own wildcard auto-detection (which only fires when the response is
+# byte-for-byte identical). Left unchecked this "discovers" nearly the whole
+# wordlist as real content — e.g. 4606 of 4614 common.txt entries on one
+# real-world target — flooding the findings table with noise. If a
+# suspiciously large fraction of the wordlist "hit", treat the whole run as
+# a soft-404 wildcard the tool missed rather than real content.
+_FLOOD_MIN_COUNT = 200
+_FLOOD_RATIO = 0.5
+
+
+def _looks_like_wildcard_flood(discovered_count: int, wordlist_path: str) -> bool:
+    if discovered_count < _FLOOD_MIN_COUNT:
+        return False
+    try:
+        with open(wordlist_path, "r", encoding="utf-8", errors="ignore") as fh:
+            wordlist_size = sum(1 for line in fh if line.strip())
+    except OSError:
+        return False
+    return bool(wordlist_size) and (discovered_count / wordlist_size) >= _FLOOD_RATIO
 
 
 def _build_url(target: str, port: int, use_https: bool) -> str:
@@ -126,10 +159,20 @@ def _normalise_path(path: str) -> str:
     return path
 
 
-def _parse_gobuster_output(stdout: str) -> list:
+def _parse_gobuster_output(stdout: str, base_url: str = "") -> list:
     """
     Parse gobuster's result lines into a list of:
-        {path: str, status_code: int}
+        {path, status_code, size, redirect, url}
+
+    size is None when gobuster did not print a [Size: ...] block, and
+    redirect is None on anything that is not a redirect — in both cases the
+    tool genuinely said nothing, which the report renders as "not determined
+    by gobuster" rather than as a zero or a dash.
+
+    url is the absolute URL the path was found at. gobuster is launched
+    against a scheme-qualified base URL, so http-vs-https and the port are
+    known here for certain; recording the composed URL keeps that knowledge
+    instead of discarding it and leaving the report to guess a scheme.
 
     Non-matching lines (blank lines, stray progress output) are skipped.
     Duplicates are collapsed. Malformed/empty input yields [].
@@ -156,7 +199,16 @@ def _parse_gobuster_output(stdout: str) -> list:
             continue
         seen.add(path)
 
-        discovered.append({"path": path, "status_code": status_code})
+        size = match.group("size")
+        redirect = (match.group("redirect") or "").strip()
+
+        discovered.append({
+            "path": path,
+            "status_code": status_code,
+            "size": int(size) if size is not None else None,
+            "redirect": redirect or None,
+            "url": f"{base_url.rstrip('/')}{path}" if base_url else None,
+        })
 
     discovered.sort(key=lambda d: d["path"])
     return discovered
@@ -197,8 +249,13 @@ def run_gobuster(target: str, port: int = 80, use_https: bool = False,
     dict:
         target                 : str
         port                   : int
-        discovered_paths       : list[dict]  {path, status_code}
-                                             path always leading-slashed
+        base_url               : str         the scheme-qualified URL gobuster
+                                             was actually pointed at
+        discovered_paths       : list[dict]  {path, status_code, size,
+                                             redirect, url}
+                                             path always leading-slashed;
+                                             size/redirect are None where
+                                             gobuster reported neither
         wordpress_fingerprinted: bool        True when a /wp-* marker was
                                              found — this is the flag
                                              config.CONDITIONAL_TOOLS maps
@@ -214,15 +271,16 @@ def run_gobuster(target: str, port: int = 80, use_https: bool = False,
     gobuster refuse to run; that one case is retried automatically with the
     wildcard page's length excluded, so such targets still return results.
     """
-    log_tool_start(target, "gobuster")
-
     result = {
+        "tool": "gobuster",
         "target": target,
         "port": port,
+        "base_url": "",
         "discovered_paths": [],
         "wordpress_fingerprinted": False,
         "raw_output": "",
         "error": None,
+        "skipped": False,
     }
 
     resolved_wordlist, wordlist_error = _resolve_wordlist(wordlist)
@@ -233,6 +291,7 @@ def run_gobuster(target: str, port: int = 80, use_https: bool = False,
         return result
 
     url = _build_url(target, port, use_https)
+    result["base_url"] = url
     command = ["gobuster", "dir", "-u", url, "-w", resolved_wordlist] + _GOBUSTER_BASE_ARGS
     if use_https:
         command.append("-k")
@@ -243,6 +302,7 @@ def run_gobuster(target: str, port: int = 80, use_https: bool = False,
     # argument is passed or accepted here.
     tool_result = run_tool(target, "gobuster", command)
     result["raw_output"] = tool_result.get("stdout", "") or ""
+    result["skipped"] = tool_result.get("skipped", False)
 
     # A wildcard-response refusal isn't a real failure — retry once with the
     # offending page length excluded, otherwise SPA targets always yield
@@ -259,25 +319,36 @@ def run_gobuster(target: str, port: int = 80, use_https: bool = False,
                 command + ["--exclude-length", retry_length],
             )
             result["raw_output"] = tool_result.get("stdout", "") or ""
+            result["skipped"] = tool_result.get("skipped", False)
 
     if not tool_result.get("success"):
         # gobuster writes the real reason (connection refused, bad
         # wordlist) to stderr and exits non-zero, so prefer stderr text
         # over run_tool's generic "non-zero exit code" wording.
         stderr = (tool_result.get("stderr") or "").strip()
-        err = stderr or tool_result.get("error") or "gobuster failed"
-        result["error"] = err
-        log_tool_failure(target, "gobuster", err)
-        print_error(f"[Gobuster] gobuster failed for {url} — {err}")
+        result["error"] = stderr or tool_result.get("error") or "gobuster failed"
+        print_error(f"[Gobuster] gobuster failed for {url} — {result['error']}")
         return result
 
-    discovered = _parse_gobuster_output(result["raw_output"])
+    discovered = _parse_gobuster_output(result["raw_output"], base_url=url)
+
+    if _looks_like_wildcard_flood(len(discovered), resolved_wordlist):
+        # New information beyond run_tool()'s own success/failure verdict
+        # (the process succeeded; the *data* is being discarded as noise),
+        # so this one keeps its own log line.
+        msg = (
+            f"{url} answered {len(discovered)} of the wordlist's entries — "
+            "that's almost certainly a soft-404/wildcard response gobuster's "
+            "own detection missed, not real content; discarding these results"
+        )
+        log_tool_failure(target, "gobuster", msg)
+        print_warning(f"[Gobuster] {msg}")
+        return result
+
     result["discovered_paths"] = discovered
 
     wordpress_hits = _detect_wordpress(discovered)
     result["wordpress_fingerprinted"] = bool(wordpress_hits)
-
-    log_tool_success(target, "gobuster", tool_result.get("duration"))
 
     if discovered:
         for entry in discovered:
@@ -286,6 +357,9 @@ def run_gobuster(target: str, port: int = 80, use_https: bool = False,
                 "port": port,
                 "path": entry["path"],
                 "status_code": entry["status_code"],
+                "size": entry["size"],
+                "redirect": entry["redirect"],
+                "url": entry["url"],
             })
             print_success(f"[Gobuster] {entry['path']} ({entry['status_code']})")
         print_info(f"[Gobuster] {url} — {len(discovered)} path(s) discovered")

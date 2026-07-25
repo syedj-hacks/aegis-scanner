@@ -1,0 +1,246 @@
+================================================================================
+AEGIS SCANNER — STATUS, CAPABILITIES, AND HONEST ASSESSMENT
+Written 2026-07-25, after the smoke_test3 verification pass
+================================================================================
+
+WHAT THIS DOCUMENT IS
+--------------------------------------------------------------------------------
+A plain-language snapshot for anyone who wasn't in the room for the last two
+fix-and-verify passes (smoke_test1, smoke_test2, smoke_test3): what the
+scanner actually does today, what's genuinely solid, what's still a known
+gap, and what a professor or external reviewer would notice if they poked
+at it live. This is not a sales pitch — where something doesn't work, it
+says so.
+
+
+1. WHAT AEGIS SCANNER IS
+================================================================================
+A modular Kali Linux vulnerability-assessment CLI (`python3 aegis.py
+<target> --profile <profile>`) that wraps ~20 real, industry-standard
+security tools behind one consistent framework: a shared subprocess runner
+(run_tool()) that never raises and always returns a structured result, a
+shared per-target logger, a shared Rich-based terminal renderer, a SQLite
+findings database, and two report writers (plain text + PDF). Five scan
+profiles trade off speed, stealth, and depth:
+
+  quickscan    — fast overview: DNS, top-port nmap, service detection,
+                 whatweb + high-severity nuclei
+  stealthscan  — quiet, minimal-footprint scan of a curated list of ~20
+                 ports that matter (web/mail/db/remote-admin), no service
+                 probing
+  webaudit     — web-focused: headers, nikto, gobuster, whatweb, ZAP
+                 baseline, CVE enrichment on discovered web ports
+  deepscan     — the full assessment: everything above plus subdomain
+                 enum, OSINT, banner grabbing, dirb, nuclei, conditional
+                 tools (wpscan/sqlmap/hydra/enum4linux when triggered),
+                 CVE/severity/remediation on every finding, TXT+PDF reports
+  compliance   — TLS cipher + HTTP header baseline (nmap ssl-enum-ciphers,
+                 sslyze, whatweb) on the well-known web/TLS ports
+
+Every scan persists to database/aegis.db and produces output/<target>/
+report.txt (and, for deepscan, report.pdf too) plus a scan_errors.log with
+a full audit trail of every tool call, success, failure, timeout, and skip.
+
+
+2. DOES IT PRODUCE REAL EVIDENCE? — YES, for the large majority of the
+   toolset, verified live this session and in the two prior passes
+================================================================================
+This is the question that matters most for a demo. Short answer: yes, most
+of the toolset produces genuine, verifiable findings against real targets
+— not placeholder text, not mocked data. Evidence gathered this session
+alone (2026-07-25):
+
+  - nmap found real open ports on every target tested (22/80 on
+    scanme.nmap.org; 80/443 on pentest-ground.com)
+  - nuclei found real Redis misconfiguration findings (default logins,
+    unauthenticated access) on pentest-ground.com, and smoke_test2 recorded
+    four genuine 2025 Redis CVEs (e.g. CVE-2025-49844) on the same target
+  - the NVD CVE lookup pipeline returned two genuine, current Apache CVEs
+    (CVE-2021-44224, CVE-2025-66200) for the Apache 2.4.7 banner detected
+    on scanme.nmap.org — a live query against the real NVD API, not a
+    canned response
+  - header_check found 6 real missing security headers on
+    pentest-ground.com (HSTS, CSP, X-Frame-Options, etc.)
+  - theHarvester found a real OSINT email address
+    (cmartorella@edge-security.com) tied to scanme.nmap.org
+  - banner_grab captured a real SSH banner string
+    (SSH-2.0-OpenSSH_6.6.1p1 Ubuntu-2ubuntu2.13)
+  - sslyze and nmap's ssl-enum-ciphers script both produced real TLS/cipher
+    findings on every one of 3 back-to-back compliance runs
+  - dirb and gobuster both produce real discovered-path findings when a
+    target has discoverable content — dirb was broken (exit 255 / 300s
+    timeout) on BOTH targets tested this session until root-caused and
+    fixed; a full deepscan run against scanme.nmap.org after the fix found
+    3 real dirb paths in 246s where the same target previously timed out
+    twice under the old wordlist
+  - a full deepscan run against scanme.nmap.org this session found 40 real
+    findings end-to-end (1 HIGH, 8 MEDIUM, 31 LOW) across 13/13 tools with
+    zero failures — nikto (9 findings, including a real outdated-Apache-
+    version notice), gobuster (10 paths), dirb (3 paths), nuclei
+    (CVE-2023-48795 "OpenSSH Terrapin Attack" + weak SSH algorithms), and
+    two genuine NVD-sourced Apache CVEs — where this exact target had
+    silently produced ZERO findings from deepscan in every prior session
+
+Update: OWASP ZAP's baseline scan was found returning 0 findings on every
+target during this session, root-caused, and then fixed outright (not
+left as a gap) — see section 3.1 below for what was actually wrong and
+what fixed it. It now also produces real findings:
+  - pentest-ground.com: "Server Leaks Version Information via 'Server'
+    HTTP Response Header Field"
+  - scanme.nmap.org: 7 real alerts, including "Missing Anti-clickjacking
+    Header" (MEDIUM), "Content Security Policy (CSP) Header Not Set"
+    (MEDIUM), and "Sub Resource Integrity Attribute Missing" (MEDIUM)
+Every tool in the toolset that runs cleanly and reports a finding now
+reports a real one — there is no remaining tool whose "0 findings" result
+is actually a disguised broken state.
+
+
+3. BOTTLENECKS AND KNOWN GAPS (as of 2026-07-25)
+================================================================================
+
+3.1 ZAP baseline produced no findings — WAS an environment gap, NOW FIXED
+--------------------------------------------------------------------------------
+Root cause (confirmed, not guessed): the "Passive scanner rules" ZAP
+add-on (the actual ruleset — missing headers, CSP, cookie flags, info
+disclosure, vulnerable-JS-library detection, ~60 checks) had been
+uninstalled from this machine's ZAP profile. Grepping ZAP's own zap.log
+showed it WAS correctly installed and loaded earlier the same day, then
+vanished from every later "Installed add-ons" listing with no error
+logged against it specifically — while roughly a dozen unrelated add-ons
+visibly updated to newer versions in that same window. The likely
+mechanism: an add-on auto-update reconciliation (most plausibly triggered
+by an earlier `-addonupdate` diagnostic call made while investigating
+this very issue) uninstalled the old pscanrules version as part of
+updating everything else, then failed to reinstall the replacement
+because the marketplace catalog lookup for that specific id kept failing
+("Failed to find Add-on: pscanrules") — leaving it permanently
+uninstalled instead of restored.
+
+Three narrow in-daemon install attempts (marketplace-by-id, the API's
+local-file-install action, the installScannerRules config flag) each
+failed for a distinct, confirmed reason and none of them addressed the
+actual problem, which wasn't "never installed" but "installed once, then
+silently lost." The real fix: `~/.ZAP` is pure local cache/state that
+nothing in this codebase depends on persisting, so a fresh copy (full
+backup taken first) forces ZAP's own bootstrap to reinstall every bundled
+add-on from scratch. Confirmed live: a from-nothing daemon start detected
+31 pending add-on updates, downloaded them for real over the network
+(let run to completion, NOT killed mid-download — that's the exact
+corruption mode this project's own zap_wrap.py design notes already warn
+about), came up with 61 real passive-scan rules active, and a clean API
+shutdown (`zap.core.shutdown()`) persisted that state for the first time.
+A second, independent daemon start afterward loaded all 61 rules again
+with no re-bootstrap needed, confirming the fix survives a restart. Then
+confirmed end-to-end through the real zap_wrap.py code path (not a
+diagnostic script) with real findings on both test targets (see above).
+
+No code changed — this was purely an environment/state fix. One
+practical note for whoever next touches this machine: avoid running
+`-addonupdate` or a marketplace-based `-addoninstall` against this ZAP
+profile casually; that specific action sequence is the leading suspect
+for how this got silently broken the first time.
+
+3.2 dirb's default wordlist could re-trip a similar limit on other targets
+--------------------------------------------------------------------------------
+This session root-caused and fixed dirb's exit-255 failure against
+pentest-ground.com (see smoke_test3.txt, Part 2 item 8, for the full
+diagnosis): dirb's single-threaded, one-connection-per-request behaviour
+was tripping what looks like a connection-count threshold on that specific
+target/network path around ~1700 requests into a ~4600-word run. The fix —
+defaulting dirb to its own smaller bundled wordlist (959 words) instead of
+sharing gobuster's larger one — resolves it for this target and reduces
+the same risk generally, but a sufficiently aggressive rate-limiter on a
+DIFFERENT target could still trip it at an even lower request count. This
+isn't fully eliminated, just made significantly less likely; watch for it
+if dirb starts failing again on a new target.
+
+3.3 Full 65535-port sweeps (deepscan's discovery pass) have wide,
+    target-dependent variance
+--------------------------------------------------------------------------------
+deepscan's bare -T4 '-p-' discovery pass is chunked into 32 sequential
+sub-scans specifically so a slow/filtered target still yields partial real
+results instead of the whole sweep timing out with nothing to show. Against
+scanme.nmap.org this session, chunk 1 (the low port range, historically the
+slowest because of how many "filtered" ports live there) took ~354-484s
+across two measurements, while every subsequent chunk completed in ~7-9s.
+Total wall-clock for the full 32-chunk sweep is therefore highly
+target-dependent — a network/target with more filtered ports spread across
+the whole range would take meaningfully longer than one where only the low
+range is slow. This is inherent to nmap's own probing behaviour against a
+filtering target, not something the framework can further optimize away
+without dropping coverage. Budget deepscan runs generously in a live demo
+(don't assume they'll finish in under 2 minutes) or lead with quickscan/
+webaudit/compliance/stealthscan, all of which are consistently fast.
+
+3.4 CONDITIONAL_TOOLS (wpscan/sqlmap/hydra/enum4linux) require a matching
+    target to demonstrate
+--------------------------------------------------------------------------------
+These four tools only fire when their trigger condition is met (WordPress
+fingerprinted, an injectable-looking parameter found, a brute-forceable
+login service open, an SMB port open). Neither scanme.nmap.org nor
+pentest-ground.com triggers any of the four. This is not a bug — it's
+correct, target-dependent behaviour — but it does mean a live demo cannot
+show these four tools actually running unless a target that meets one of
+those conditions is available. This session added a fix so the reason is
+now always explicit in scan_errors.log ("condition 'X' not met — skipping
+Y") instead of the tool being invisibly absent with no explanation, which
+at least makes the "why didn't this run" question answerable during a demo
+without needing to explain the framework's internals.
+
+
+4. IDEAS TO MAKE IT LOOK MORE PROFESSIONAL FOR A DEMO / REVIEW
+================================================================================
+- Lead the demo with stealthscan, quickscan, or compliance — all three are
+  fast (under 3 minutes even on a slow target) and all three now reliably
+  produce real, non-zero findings. Save deepscan for a moment where a
+  longer wait is acceptable, or kick it off early and let it run in the
+  background while narrating the other profiles.
+- Show the PDF report, not just the terminal output or the .txt file — it
+  has a proper cover page, a colour-coded severity summary with
+  proportional bars, and per-finding cards with description/remediation.
+  It reads like a real vendor pentest deliverable, which is a much
+  stronger visual than a terminal scrollback.
+- If asked "does this find real vulnerabilities," point at the NVD CVE
+  lookup and nuclei findings specifically — those are traceable to a
+  public CVE ID or a named, real-world template match, which is more
+  convincing than a generic "missing header" finding even though both are
+  genuine.
+- ZAP is now a legitimate evidence source too (fixed this session — see
+  3.1) — its findings (missing CSP, missing anti-clickjacking header,
+  missing SRI attribute, server version disclosure) are a good complement
+  to nikto/nuclei/gobuster's since ZAP's passive ruleset catches some
+  things those don't.
+- If a reviewer asks about wpscan/sqlmap/hydra/enum4linux and the demo
+  target doesn't trigger them, the "condition not met" log line (now
+  present) is the answer — show it rather than letting it look like the
+  tool was silently skipped or forgotten.
+- Consider trying a deliberately WordPress-hosted, deliberately
+  SMB-exposed, or deliberately SQLi-vulnerable target once (even a local
+  DVWA/Metasploitable VM, not necessarily one of the two internet targets
+  used throughout this session) purely to get one real, live demonstration
+  of the conditional-tools path working end-to-end before a demo — it's
+  the one part of the toolset that's never been observed actually firing.
+
+
+5. IF EVIDENCE ISN'T REAL SOMEWHERE — WHAT TO DO
+================================================================================
+As of this pass, every tool in the toolset that completes without an
+error message has been directly observed producing genuine findings this
+session or in smoke_test2 (ZAP included, as of this session — see 3.1;
+it was the one exception until it got fixed). The general playbook for
+treating a scanner's "no findings" result honestly, if this comes up
+again with a different tool in the future:
+  1. Confirm the tool's own subprocess actually ran and exited cleanly
+     (scan_errors.log's "Tool completed: X (duration)" line) — don't
+     conflate "completed" with "found something."
+  2. Check whether the target genuinely has nothing to find for that
+     specific check (a clean, hardened target legitimately produces 0
+     nikto findings) versus whether the tool's own ruleset/dictionary/
+     signature set is empty or misconfigured (as ZAP's was here).
+  3. If unsure, re-run the same tool standalone (bypassing the framework)
+     against a target KNOWN to trigger it, and compare. That's exactly
+     the method that root-caused (and then fixed) the ZAP gap in this
+     pass: it wasn't obvious from a single 0-finding run against one
+     target, but became unambiguous once the same 0-finding result
+     reproduced identically
+     against a second target with genuinely different content.
