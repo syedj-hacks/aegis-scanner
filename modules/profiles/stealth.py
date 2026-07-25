@@ -79,7 +79,14 @@ def run_stealthscan(target: str, non_interactive: bool = False):
         # profile's flow anyway, but keeping the insert immediately after
         # the data exists (not gated behind anything further) means an
         # interrupt anywhere after this point can never cost these findings.
-        insert_findings_bulk(scan_id, open_ports)
+        #
+        # type="open_port" is stamped on here rather than left off: a row
+        # inserted with no finding_type has to be classified by SHAPE when a
+        # report reads it back, and shape-sniffing on columns every SQLite
+        # row carries is exactly what mislabelled a stealthscan open port as
+        # a nikto finding (smoke_test8 §4.2). A finding that declares what it
+        # is cannot be guessed at wrongly.
+        insert_findings_bulk(scan_id, [dict(p, type="open_port") for p in open_ports])
         advance("Persisting findings")
 
     stats = {

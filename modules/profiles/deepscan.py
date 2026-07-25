@@ -140,9 +140,54 @@ def _score_and_remediate(findings: list) -> list:
     return out
 
 
-def _findings_from_cves(cves: list, port, service_name: str) -> list:
+def _findings_from_cves(cves: list, port, service_name: str, seen: set = None) -> list:
+    """
+    Map an NVD lookup's CVEs to findings, skipping any already recorded.
+
+    `seen` is a set of (cve_id, port) pairs accumulated across the WHOLE
+    scan, and it is what stops this profile inserting the same CVE twice.
+    deepscan enriches CVEs down two independent paths — nmap's detected
+    service product (_enrich_services, scanning phase) and the Server
+    header's product (the web loop) — and on a host where both name the
+    same software, both lookups return the same CVE. Observed live on three
+    separate hosts (scans 130, 138, 140):
+
+        [CVE] Querying NVD for 'Apache httpd 2.4.25'       <- service detect
+        [CVE]   CVE-2016-8743 — CVSS 7.5 (HIGH)
+        [CVE] Querying NVD for 'apache http server 2.4.25' <- header banner
+        [CVE]   CVE-2017-7659 — CVSS 7.5 (HIGH)
+        [CVE]   CVE-2016-8743 — CVSS 7.5 (HIGH)            <- same finding
+        [CVE]   CVE-2016-4975 — CVSS 6.1 (MEDIUM)
+
+    Two things scan 140's run settles, and which decided the shape of this
+    guard:
+
+      - the second lookup is NOT redundant. It returned two CVEs the first
+        one missed, so skipping the call (or reusing the first result for
+        the second path) would have cost two real findings.
+      - a cache keyed on product+version would not have fired anyway: nmap
+        reports the product as "Apache httpd", the Server header parses to
+        "Apache". Same software, different keys.
+
+    Keying on the CVE id and the port is therefore the only key that
+    identifies the actual duplicate — and it keeps the SAME CVE on a
+    DIFFERENT port as two separate findings, which it must: one service
+    being vulnerable on 80 and another on 8080 is two facts, not one.
+    Same shape as _findings_from_nuclei()'s (template_id, matched_port)
+    guard, for the same reason.
+    """
     findings = []
     for cve in cves:
+        cve_id = cve.get("cve_id")
+        if seen is not None and cve_id:
+            key = (cve_id, port)
+            if key in seen:
+                print_info(
+                    f"[{PROFILE_NAME}] {cve_id} was already recorded on port "
+                    f"{port} by an earlier lookup — not recorded twice"
+                )
+                continue
+            seen.add(key)
         finding = dict(cve)
         finding["port"] = port
         finding["service"] = finding.get("product") or service_name
@@ -150,9 +195,13 @@ def _findings_from_cves(cves: list, port, service_name: str) -> list:
     return _score_and_remediate(findings)
 
 
-def _enrich_services(target: str, services: list) -> list:
+def _enrich_services(target: str, services: list, seen: set = None) -> list:
     """CVE-lookup each detected service; fall back to a heuristic grade
-    when there is no product to query or NVD matched nothing."""
+    when there is no product to query or NVD matched nothing.
+
+    `seen` is the scan-wide (cve_id, port) set described in
+    _findings_from_cves() — this is the first of the two paths that fill it.
+    """
     findings = []
     for svc in services:
         product = svc.get("product")
@@ -161,7 +210,8 @@ def _enrich_services(target: str, services: list) -> list:
             cve_result = lookup_cves(product, svc.get("version"), target=target)
             cves = cve_result.get("cves") or []
         if cves:
-            findings.extend(_findings_from_cves(cves, svc.get("port"), svc.get("service")))
+            findings.extend(_findings_from_cves(cves, svc.get("port"),
+                                                svc.get("service"), seen=seen))
         else:
             raw = dict(svc, type="service_version")
             label = " ".join(x for x in (svc.get("product"), svc.get("version")) if x)
@@ -639,6 +689,13 @@ def run_deepscan(target: str, non_interactive: bool = False):
     gobuster_results = []
     dirb_results = []
 
+    # (cve_id, port) pairs already recorded, shared by BOTH of this
+    # profile's CVE-enrichment paths — the service-detect lookup below and
+    # the Server-header lookup in the web loop. See _findings_from_cves()
+    # for the live evidence that both paths hit the same CVE on a host whose
+    # nmap product and Server banner name the same software.
+    seen_cve_matches = set()
+
     # --- Recon -----------------------------------------------------
     print_phase("RECON")
     with scan_progress_bar(3, f"Recon: {target}") as advance:
@@ -690,7 +747,7 @@ def run_deepscan(target: str, non_interactive: bool = False):
     # module even starts — service/version + CVE enrichment, nmap --script
     # results and banners are already final at this point, so an interrupt
     # anywhere in the (often much longer) web phase below can't cost them.
-    findings.extend(_enrich_services(target, services))
+    findings.extend(_enrich_services(target, services, seen=seen_cve_matches))
     findings.extend(_score_and_remediate(_findings_from_banners(banner_result)))
     for script in nmap_scripts:
         findings.extend(_score_and_remediate([dict(script, type="nmap_script", description=(
@@ -735,6 +792,7 @@ def run_deepscan(target: str, non_interactive: bool = False):
                     cve_result = lookup_cves_from_banner(server_banner, target=target)
                     port_findings.extend(_findings_from_cves(
                         cve_result.get("cves") or [], port, server_banner,
+                        seen=seen_cve_matches,
                     ))
                 advance(f"Headers :{port}")
 

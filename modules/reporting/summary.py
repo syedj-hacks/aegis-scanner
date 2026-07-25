@@ -191,9 +191,18 @@ FINDING_TYPE_TOOL = {
     "smb_share": "enum4linux",
     "smb_user": "enum4linux",
     "sqlmap_finding": "sqlmap",
+    "sslyze_finding": "sslyze",
     "technology_fingerprint": "whatweb",
     "weak_credentials": "hydra",
-    "wordpress_fingerprinted": "wpscan",
+    # gobuster, NOT wpscan. The finding is raised when gobuster's path sweep
+    # hits a /wp-* marker (gobuster_wrap sets wordpress_fingerprinted, and
+    # both deepscan and webaudit map that flag to this finding type) — it is
+    # the *trigger* for wpscan under CONDITIONAL_TOOLS, not a wpscan result.
+    # Naming wpscan here made webaudit — which never runs wpscan — render
+    # "not determined by wpscan" on a finding gobuster produced. Same defect
+    # class as smoke_test8 §4.2, found by the attribution sweep this pass
+    # added (modules/reporting/attribution.py).
+    "wordpress_fingerprinted": "gobuster",
     "wpscan_finding": "wpscan",
     "xss_finding": "nuclei DAST",
     "zap_finding": "zaproxy",
@@ -216,6 +225,7 @@ _NOT_APPLICABLE = {
         "smb_share": "share enumeration",
         "smb_user": "user enumeration",
         "sqlmap_finding": "injection class, not a CVE",
+        "sslyze_finding": "TLS configuration finding",
         "technology_fingerprint": "fingerprint",
         "weak_credentials": "credential finding",
         "wordpress_fingerprinted": "fingerprint",
@@ -234,6 +244,7 @@ _NOT_APPLICABLE = {
         "service_version": "no CVE to score",
         "smb_share": "no CVE to score",
         "smb_user": "no CVE to score",
+        "sslyze_finding": "no CVE to score",
         "technology_fingerprint": "no CVE to score",
         "weak_credentials": "no CVE to score",
         "wordpress_fingerprinted": "no CVE to score",
@@ -250,6 +261,9 @@ _NOT_APPLICABLE = {
         "open_port": "port observation",
         "smb_share": "host-level finding",
         "smb_user": "host-level finding",
+        # sslyze reports the TLS configuration of a port, not a software
+        # version — the protocol versions it names live in the description.
+        "sslyze_finding": "TLS configuration finding",
     },
     # endpoint is the URL a finding concerns. Host- and port-level findings
     # are not about a URL at all, so an empty cell there is correct rather
@@ -262,6 +276,7 @@ _NOT_APPLICABLE = {
         "service_version": "port-level observation",
         "smb_share": "host-level finding",
         "smb_user": "host-level finding",
+        "sslyze_finding": "port-level observation",
         "weak_credentials": "credential finding",
     },
     # reference is a citation the tool itself supplied. Tools that report
@@ -277,6 +292,7 @@ _NOT_APPLICABLE = {
         "service_version": "service observation",
         "smb_share": "share enumeration",
         "smb_user": "user enumeration",
+        "sslyze_finding": "TLS configuration finding",
         "technology_fingerprint": "fingerprint",
         "weak_credentials": "credential finding",
         "wordpress_fingerprinted": "fingerprint",

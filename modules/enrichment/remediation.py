@@ -345,6 +345,20 @@ def _finding_kind(finding: dict) -> str:
     return "unknown"
 
 
+def finding_kind(finding: dict) -> str:
+    """
+    Public entry point to this module's classifier.
+
+    modules/reporting/attribution.py's whole-database attribution sweep has
+    to ask the exact question a rendered report asks — "what kind of finding
+    will this row be treated as?" — and answering it any other way would
+    check something other than what the reader sees. Exposed by name rather
+    than left to callers reaching into _finding_kind(), so the sweep is
+    tied to the real classifier and not to a copy of it.
+    """
+    return _finding_kind(finding)
+
+
 def remediation_text(finding: dict) -> str:
     """
     Return the remediation string for `finding` without copying the dict.

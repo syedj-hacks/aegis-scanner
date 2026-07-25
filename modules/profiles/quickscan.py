@@ -158,7 +158,14 @@ def run_quickscan(target: str, non_interactive: bool = False):
         if ports:
             service_result = detect_services(target, ports)
             tool_results.append(service_result)
-            findings = service_result.get("services") or []
+            # type="service_version" stamped at the source: these rows come
+            # from nmap -sV and nothing else, so a report should never have
+            # to infer that from which columns happen to be populated (see
+            # stealth.py's insert and smoke_test8 §4.2).
+            findings = [
+                dict(svc, type="service_version")
+                for svc in (service_result.get("services") or [])
+            ]
         advance("Service detection")
 
     # Persisted here — before whatweb/nuclei even start — rather than held

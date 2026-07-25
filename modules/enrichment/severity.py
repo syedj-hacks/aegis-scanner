@@ -367,6 +367,17 @@ def _finding_type(finding: dict) -> str:
     return "unknown"
 
 
+def finding_kind(finding: dict) -> str:
+    """
+    Public entry point to this module's classifier, named identically to
+    remediation.finding_kind() because the two contracts are documented as
+    the same one. The attribution sweep
+    (modules/reporting/attribution.py) checks that claim mechanically for
+    every row in the database rather than trusting the docstrings.
+    """
+    return _finding_type(finding)
+
+
 def _heuristic_severity(finding: dict, kind: str) -> str:
     """
     Grade a finding that has no CVSS score behind it.

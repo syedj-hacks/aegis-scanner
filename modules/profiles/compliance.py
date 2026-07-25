@@ -135,7 +135,9 @@ def run_compliance(target: str, non_interactive: bool = False):
         scripts = port_result.get("scripts") or []
         advance("Compliance nmap scan")
 
-        findings.extend(open_ports)
+        # type="open_port" stamped at the source — see stealth.py for why an
+        # untyped row is a liability once a report has to classify it.
+        findings.extend(dict(p, type="open_port") for p in open_ports)
         findings.extend(_score_and_remediate(_findings_from_scripts(scripts)))
         advance("Scoring script findings")
 
