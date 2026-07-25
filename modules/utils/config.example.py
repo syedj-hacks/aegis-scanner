@@ -164,7 +164,16 @@ PROFILES = {
     },
     "stealthscan": {
         "tools": ["nslookup", "nmap"],
-        "nmap_args": ["-T1", "-p-", "--randomize-hosts", "-Pn"],
+        # REDESIGNED: a full 65535-port '-p-' sweep at any quiet timing
+        # template is an architectural dead end — live-measured at ~0.29
+        # ports/sec at -T2 against a real filtered target (60+ hours
+        # extrapolated). No amount of chunk/timeout tuning fixes that, so
+        # this scans a curated port list at -T2 ("Polite") instead:
+        # measured at 22.5-96.0s against two real targets.
+        "nmap_args": [
+            "-T2", "-Pn", "--randomize-hosts",
+            "-p", "21,22,23,25,53,80,110,139,143,443,445,993,995,1723,3306,3389,5432,5900,8080,8443",
+        ],
         "nuclei_severity": ["critical", "high", "medium"],
     },
     "webaudit": {
@@ -174,11 +183,16 @@ PROFILES = {
     },
     "deepscan": {
         "tools": "ALL",                       # full top-20 toolset
-        "nmap_args": ["-T4", "-p-", "-sV", "-sC"],
+        # Bare discovery sweep — NO -sV/-sC. Combining either with a
+        # 65535-port sweep is nmap's slowest possible shape and, even
+        # chunked, routinely blew every chunk's budget and returned zero
+        # ports (confirmed live). service_detect.py runs -sV -sC as a
+        # second pass against only the ports this one found.
+        "nmap_args": ["-T4", "-p-"],
     },
     "compliance": {
         "tools": ["nmap", "sslyze", "whatweb"],
-        "nmap_args": ["-T4", "--script", "ssl-enum-ciphers,http-headers"],
+        "nmap_args": ["-T4", "-p", "80,443,8443", "--script", "ssl-enum-ciphers,http-headers"],
     },
 }
 

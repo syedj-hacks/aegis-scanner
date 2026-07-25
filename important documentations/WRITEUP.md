@@ -1,7 +1,7 @@
 # Aegis Scanner — Project Writeup
 
 **Cyber404 Academy 2026 — team project**
-Branch under review: `dev`. This round of work hardened the interrupt/reliability model (a
+Branch under review: `dev`. Earlier rounds hardened the interrupt/reliability model (a
 skip-current-tool keybind, a saner Ctrl+C, chunked full-port nmap sweeps that survive a slow
 target, per-port incremental result persistence, wall-clock budgets on the web-audit loops),
 closed the last "listed in config but never actually run" gaps in `quickscan`/`compliance`,
@@ -10,6 +10,23 @@ root-caused and fixed a handful of live-reproduced bugs (dirb's connection-thres
 substring-match false positive in severity scoring, a same-vendor/wrong-product false positive
 in CVE lookups), and rewrote the ZAP wrapper to drive ZAP's own daemon API directly instead of a
 bundled script Kali's apt package never actually ships.
+
+The rounds since then have been about **making the output trustworthy**, which turned out to be a
+different problem from making the scan work:
+
+- **Injection & scripting became first-class.** A dedicated XSS wrapper (nuclei in DAST mode,
+  `-dast -tags xss`) and read-only sqlmap enumeration now produce findings that carry the exact
+  payload, the parameter it went into, and a response snippet proving the reflection — rendered in
+  their own report section instead of being one more line of prose.
+- **Every report is kept, named and capped.** Reports were being silently overwritten (this
+  destroyed one for real), so they are now named per scan and the history is capped per
+  profile+target.
+- **Findings say who found them, and that claim is now checked.** Every report field distinguishes
+  "not applicable to this kind of finding" from "this tool should have filled this in and didn't",
+  and a mechanical audit re-checks every row of every scan in the database for whether the tool a
+  finding is credited to actually ran on that scan.
+- **The database now records which tools actually ran**, per scan, per port, with their outcome —
+  so that audit can ask "did this tool run on *this* scan", not just "does this profile wire it in".
 
 ---
 
@@ -25,6 +42,10 @@ It is not a single tool — it's an orchestration layer over existing Kali tools
 `nikto`, `gobuster`, `dirb`, `whatweb`, `nuclei`, `sqlmap`, `hydra`, `wpscan`, `enum4linux`,
 `sslyze`, ZAP, `nslookup`, `subfinder`, `amass`, `theHarvester`) plus a homegrown NVD CVE
 lookup, severity grading, and remediation-advice engine.
+
+Every profile writes both a plain-text and a PDF report, named per scan
+(`report_<profile>_<target>_<scan_id>.txt` / `.pdf`) so nothing is overwritten, with the history
+capped per profile+target.
 
 ## 2. Why it's built this way
 
@@ -50,32 +71,41 @@ Every phase described in the profile table below is implemented end-to-end and w
 `aegis.py`. There is no phase left as an empty stub, and every tool named anywhere in a
 `PROFILES` entry has a real wrapper module. See
 [BACKEND_STRUCTURE.md](BACKEND_STRUCTURE.md) for the full module-by-module map, including the
-handful of gaps that remain by design (mainly: `webaudit` deliberately never calls `zaproxy`,
-`deepscan` deliberately never calls `sslyze`, and ZAP's passive-scanner add-on needs a one-time
-manual install to produce non-trivial findings).
+handful of gaps that remain by design (mainly: `webaudit` deliberately never calls `zaproxy`, and
+`deepscan` deliberately never calls `sslyze`).
 
 | Phase | Directory | Status |
 |---|---|---|
 | Foundation | `modules/utils/` | Done — logger, error handler (Popen-based, timeout + skip-keybind + Ctrl+C handling), config (+ `.env` auto-load), display |
-| Tool-availability model | `modules/profiles/_common.py` | Done — shared, codebase-wide "does a wrapper exist / does this profile call it" check, replacing five separate hand-rolled copies |
+| Shared profile layer | `modules/profiles/_common.py` | Done — codebase-wide "does a wrapper exist / does this profile call it" check (replacing five hand-rolled copies), the one ran/skipped/failed predicate, the tools-run record, XSS candidate discovery, and the shared end-of-scan report sequence |
 | Recon | `modules/recon/` | Done — DNS, subdomain enum, OSINT |
 | Scanning | `modules/scanning/` | Done — port scan (chunked full-range sweeps, `--script` parsing), service detect (`-sV -sC` combined), banner grabber, enum4linux, hydra |
-| Web | `modules/web/` | Done — header audit, Nikto, gobuster, dirb, whatweb, nuclei, sqlmap, sslyze, wpscan, ZAP (now via its own daemon API) |
+| Web | `modules/web/` | Done — header audit, Nikto, gobuster, dirb, whatweb, nuclei, sqlmap (read-only enumeration), **XSS (nuclei DAST)**, sslyze, wpscan, ZAP (via its own daemon API) |
 | Enrichment | `modules/enrichment/` | Done — CVE lookup (NVD, with product-disambiguation), severity scoring (word-boundary keyword matching), remediation text |
-| Reporting | `modules/reporting/` | Done — summary builder, TXT report, PDF report; no more "unknown" fallback for CVE-shaped findings with no service field |
-| Profiles | `modules/profiles/` | Done — quickscan (now runs whatweb+nuclei), stealthscan (curated port list), webaudit, deepscan, compliance (now runs whatweb too); all persist findings incrementally, all return real tool-run stats |
-| CLI | `aegis.py` | Done — argparse entry point (target/profile optional, interactive prompt mode), dispatch table, final summary with real (not always-zero) tool counts |
-| Install | `install.sh`, `setup.py` | Done — apt tool install, venv, dependency check, automatic `config.py` bootstrap, `.env` key prompt, nuclei/ZAP fallback checks |
+| Reporting | `modules/reporting/` | Done — summary builder (the shared report vocabulary), TXT report, PDF report (severity donut cover), **capped report history**, **end-of-scan banner**, **attribution audit** |
+| Profiles | `modules/profiles/` | Done — quickscan (runs whatweb+nuclei), stealthscan (curated port list), webaudit, deepscan, compliance (runs whatweb too); all persist findings incrementally, all record which tools ran, all produce TXT + PDF |
+| CLI | `aegis.py` | Done — argparse entry point (target/profile optional, interactive prompt mode, `--non-interactive`), dispatch table, final summary with real (not always-zero) tool counts |
+| Install | `install.sh`, `setup.py` | Done — apt tool install, venv, dependency check (incl. the ZAP client), automatic `config.py` bootstrap, `.env` key prompt, nuclei fallback, one-time ZAP passive-rules bootstrap |
+| Verification | `tests/`, `smoke_test/` | Done — per-pass assertion scripts, real captured tool fixtures, a PTY test for the skip keybind, and a whole-database audit gate; each pass's evidence and open items written up in `smoke_test/` |
 
 ## 4. The five scan profiles
 
-| Profile | What it actually runs | Report |
-|---|---|---|
-| `quickscan` (default) | DNS resolve → fast top-port nmap (`-T4 -F`) → service detection → whatweb + high-severity nuclei on the first open web port | TXT |
-| `stealthscan` | DNS resolve → quiet `-T2` scan of a fixed ~20-port list (web/mail/DB/remote-admin basics) — **no** second service-detect pass, keeps footprint minimal | TXT |
-| `webaudit` | DNS resolve → nmap scoped to web ports (80/443/8080/8443) → banner grab on non-web ports → header audit + Nikto + gobuster + dirb + whatweb (+ sslyze on HTTPS ports) on each open web port, wall-clock-bounded to 30 min → CVE lookup on the `Server` banner + nmap-script findings | TXT |
-| `deepscan` | Everything: DNS + subdomain enum + OSINT → chunked full-port nmap discovery (no -sV/-sC) + a targeted `-sV -sC` pass (this is also where nmap-script findings come from) + banner grab on non-web ports → web module (header/nikto/gobuster/dirb/whatweb/nuclei/ZAP) on any discovered web port, wall-clock-bounded to 1 hour → conditional sqlmap/hydra/wpscan/enum4linux where their trigger conditions are detected → CVE lookup + severity + remediation on every finding | TXT + PDF |
-| `compliance` | nmap with `--script ssl-enum-ciphers,http-headers` (no DNS — not in this profile's tool list) → sslyze + whatweb on the TLS port(s) the script identified; script/sslyze/whatweb results are scored and remediated | TXT |
+All five write both a TXT and a PDF report.
+
+| Profile | What it actually runs |
+|---|---|
+| `quickscan` (default) | DNS resolve → fast top-port nmap (`-T4 -F`) → service detection → whatweb + high-severity nuclei on the first open web port |
+| `stealthscan` | DNS resolve → quiet `-T2` scan of a fixed ~20-port list (web/mail/DB/remote-admin basics) — **no** second service-detect pass, keeps footprint minimal |
+| `webaudit` | DNS resolve → nmap scoped to web ports (80/443/8080/8443) → banner grab on non-web ports → header audit + Nikto + gobuster + dirb + whatweb (+ sslyze on HTTPS ports) on each open web port, wall-clock-bounded to 30 min → an XSS fuzzing pass over the parameterised URLs built from gobuster/dirb's discovered paths → CVE lookup on the `Server` banner + nmap-script findings |
+| `deepscan` | Everything: DNS + subdomain enum + OSINT → chunked full-port nmap discovery (no -sV/-sC) + a targeted `-sV -sC` pass (this is also where nmap-script findings come from) + banner grab on non-web ports → web module (header/nikto/gobuster/dirb/whatweb/nuclei/XSS/ZAP) on any discovered web port, wall-clock-bounded to 1 hour → conditional sqlmap/hydra/wpscan/enum4linux where their trigger conditions are detected → CVE lookup + severity + remediation on every finding |
+| `compliance` | nmap with `--script ssl-enum-ciphers,http-headers` (no DNS — not in this profile's tool list) → sslyze + whatweb on the TLS port(s) the script identified; script/sslyze/whatweb results are scored and remediated |
+
+`webaudit` is the one profile whose report carries a **scope note**, because the honest statement
+about it is subtle: it runs nuclei in DAST/XSS mode but *not* the severity template pass, so a
+quickscan or deepscan of the same host can surface findings a webaudit report does not. Writing
+"webaudit does not run nuclei" would have been false, and saying nothing left a real gap
+unexplained — a webaudit of a host once reported 0 CVEs where a quickscan of the same host found
+2 CRITICAL, with nothing in the report saying why.
 
 Full command reference: [COMMANDS.txt](COMMANDS.txt).
 Step-by-step walkthrough: [TUTORIAL.md](TUTORIAL.md).
@@ -120,10 +150,53 @@ Internals / data flow / known gaps: [BACKEND_STRUCTURE.md](BACKEND_STRUCTURE.md)
   slow tool." A handful of load-bearing tools (nmap, DNS resolution) refuse the skip since
   everything downstream depends on their output.
 - **The `findings` table schema is no longer CVE-only-shaped.** `description`, `remediation`,
-  `finding_type`, and (new this round) `product` columns exist, all nullable, migrated in
-  idempotently. Web-only findings, nmap-script output, and every tool's findings carry their own
-  description/remediation instead of being squeezed into `port/service/version/cve_id/cvss/
-  severity` alone.
+  `finding_type`, `product`, the injection-evidence group (`parameter`/`payload`/`evidence`/
+  `endpoint`) and `reference` all exist, nullable, migrated in idempotently. Web-only findings,
+  nmap-script output, and every tool's findings carry their own description/remediation instead of
+  being squeezed into `port/service/version/cve_id/cvss/severity` alone.
+- **Adding a column broke a classifier, and that's why there's now an audit.** `reference` was
+  added so nikto/ZAP/wpscan citations had somewhere to go. But the report's classifier sniffed
+  nikto findings by `"reference" in finding` — and SQLite rows carry *every* column, so overnight
+  every stored untyped finding was reclassified as nikto's: a stealthscan open-port finding was
+  told to "review this nikto finding", naming a tool that never ran in that profile. 317 unit
+  assertions and a whole-database render sweep all passed it; a human reading one report caught
+  it. Two things came out of that: findings are now typed at the source instead of classified by
+  shape, and `modules/reporting/attribution.py` re-asks "is this finding credited to a tool that
+  actually ran, and does its declared type still fit the columns it carries?" for every row of
+  every scan. **That third check is specifically aimed at the next shared column.**
+- **The database records which tools actually ran.** A `scan_tools_run` table stores one row per
+  (tool, port) with a `ran`/`skipped`/`failed` outcome, classified by the same single predicate
+  the on-screen "Tools run/failed/skipped" counts use — so the record cannot drift from what the
+  operator saw. It lets the attribution audit ask the sharper question: not "does this profile
+  wire in the tool this finding is credited to", but "did that tool run on *this* scan". Collected
+  going forward only; historical scans keep the profile-level answer rather than being backfilled
+  with a record that was never captured.
+- **Reports are never silently overwritten, and never accumulate forever.** They used to be one
+  fixed `report.txt` per target, which destroyed evidence for real (one scan's report was gone an
+  hour later, overwritten by the next, with nothing warning). Reports are now named per scan and
+  capped at 5 **per profile+target** — a per-target cap would let a burst of quickscans evict the
+  one deepscan report of that host, which is exactly the loss being prevented. Interactive runs
+  are asked what to drop; scripted runs drop the oldest and log it.
+- **XSS is a first-class check rather than an incidental one.** nuclei's real XSS coverage only
+  fires in DAST mode against a URL that actually has a parameter to mutate — run without either,
+  the templates never fire and *the scan looks clean*. So the wrapper refuses a URL with no query
+  string rather than run a scan that can only report nothing, and the profiles build fuzzable URLs
+  from the paths gobuster/dirb already found. Candidate ordering turned out to matter: without it,
+  six probes went to `/index.php` and `/xss.php` was never fuzzed at all.
+- **sqlmap enumerates, and only enumerates.** A confirmed injection is followed by three read-only
+  metadata requests (`--banner --current-db --dbs`) so the finding carries real evidence instead
+  of a bare `vulnerable: true`. It never requests `--dump`, `--os-shell`, `--sql-shell` or file
+  read/write — that line is deliberate and is documented where the flags are built.
+- **A blank field in a report is never left ambiguous.** "Nothing found" and "never looked" read
+  identically as an empty cell, so a field that is inapplicable by nature to a finding type prints
+  why ("TLS configuration finding"), and one that should have been filled names the tool that
+  didn't fill it ("not determined by nuclei"). Both writers read that wording from one module, so
+  the TXT and the PDF cannot describe the same row differently.
+- **Duplicates are fixed where they're produced, not where they're displayed.** deepscan enriches
+  CVEs down two independent paths and on some hosts both named the same CVE. The fix is a shared
+  `(cve_id, port)` set across both call sites — keyed on the CVE id because the two paths name the
+  product differently ("Apache httpd" vs "Apache"), and per port so the same CVE on two ports
+  still counts twice. The second lookup is still made: it returned two CVEs the first one missed.
 - **Severity has 4 tiers, never 5.** `CRITICAL / HIGH / MEDIUM / LOW` — no `INFO` tier.
   Keyword-based grading now matches on word boundaries, not plain substring containment — the
   old check let a short keyword like `"rce"` match inside an unrelated word (`"brute-force"`),
@@ -139,10 +212,14 @@ Internals / data flow / known gaps: [BACKEND_STRUCTURE.md](BACKEND_STRUCTURE.md)
 
 ## 6. Known gaps / honesty notes
 
-- **ZAP's passive-scanner add-on isn't installed by default**, so `deepscan`'s ZAP step, while
-  functionally correct end-to-end (it drives ZAP's own daemon over its REST API now, not a
-  bundled script Kali's apt package never actually shipped), returns few or no findings until
-  that add-on is installed once via ZAP's own desktop GUI. Not a code problem.
+- **ZAP's passive-scanner add-on** (`pscanrules` — without it ZAP scans complete cleanly and
+  return nothing, forever) is now bootstrapped automatically by `install.sh`, once, on a fresh
+  `~/.ZAP`. If it ever goes missing on a machine that skipped that step, the recovery is to delete
+  `~/.ZAP` and re-run the bootstrap — **not** `zap.sh -addonupdate`, which is the leading suspect
+  for how it got uninstalled during development in the first place.
+- **ZAP is not reliably interruptible mid-scan.** Two attempts to skip it with a real interrupt
+  did not skip it; its phase is dominated by daemon startup/shutdown, so the signal can land
+  outside the wrapper's poll loop. A property of ZAP, not of the skip machinery.
 - `webaudit` never calls `zaproxy`; `deepscan` never calls `sslyze` — both permanently unwired
   by design (scope decisions documented in each profile's own file), not oversights.
 - `whatweb_wrap.py`'s CMS-detection flag (`cms_detected`) has no consumer yet — only gobuster's
@@ -151,6 +228,19 @@ Internals / data flow / known gaps: [BACKEND_STRUCTURE.md](BACKEND_STRUCTURE.md)
   against targets purpose-built to trigger them — this project's two default smoke-test targets
   don't meet any of the four trigger conditions on their own, so everyday smoke-test runs don't
   exercise that dispatch path.
+- **The tools-run record has live coverage on deepscan and quickscan only.** The other three
+  profiles wire it identically (the same one line in the same place) and compile clean, but were
+  not exercised live in the pass that added it. Low risk; not the same as a live run.
+- **Two historical attribution mismatches are reported and allowlisted, not rewritten.** Old rows
+  have not been edited to make the audit quiet. Likewise, the one historical data repair that was
+  done (`tools/backfill_nuclei_identity.py`) deliberately restored only values recoverable from
+  the logs verbatim and left `port` NULL, because that value was never recorded for those runs —
+  writing it in would have inserted an inferred value into a historical record.
 - `config.example.py` ships a real, working, project-shared NVD API key as a committed default —
   intentional (see §5), worth knowing if you're used to a stricter "never commit a real key"
   policy.
+
+Each work pass's full evidence — what was run, against what, and what it left open — is written up
+in `smoke_test/smoke_test1-10.txt`, and the next pass opens by resolving the previous one's open
+items. That is this project's substitute for a bug tracker, and it is the honest place to look for
+current state.

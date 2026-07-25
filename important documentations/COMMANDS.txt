@@ -6,8 +6,10 @@ Run everything from the repo root (aegis-scanner/). All relative paths
 (output/, database/aegis.db, .env) resolve from there.
 
 LEGAL: only run this against targets you own or have explicit written authorization
-to test -- this now includes sqlmap (SQL injection probing), hydra (credential
-brute-forcing), and wpscan/enum4linux, which are more intrusive than the original
+to test -- this now includes sqlmap (SQL injection probing, plus read-only DB
+metadata enumeration on a confirmed injection), the nuclei DAST XSS pass (which
+actively injects payloads into query parameters), hydra (credential brute-forcing),
+and wpscan/enum4linux. All of these are more intrusive than the original
 recon/scan/audit toolset and can trip IDS/WAF alerts or lock out accounts.
 
 
@@ -47,6 +49,19 @@ recon/scan/audit toolset and can trip IDS/WAF alerts or lock out accounts.
   # zap-baseline.py script -- apt's zaproxy package doesn't ship one anyway. You
   # need a JRE and zap.sh on this host (both covered by install.sh's apt step);
   # if either is missing, ZAP is reported unavailable rather than the scan failing.
+  # install.sh ALSO bootstraps ZAP's passive-scan-rules add-on (pscanrules) once,
+  # on a fresh ~/.ZAP -- without it ZAP scans complete cleanly and return 0
+  # findings forever. If ZAP findings ever drop to zero after previously working,
+  # do NOT run `zap.sh -addonupdate` / `-addoninstall <id>` to fix it (that
+  # sequence is the leading suspect for how the add-on gets uninstalled): back up
+  # and delete ~/.ZAP, then re-run install.sh.
+
+  # venv note: run Aegis through the SAME interpreter you installed into.
+  #   venv/bin/python aegis.py <target> --profile <profile>
+  # A venv missing one dependency is invisible until a scan reports "tools
+  # failed: 1" -- exactly what happened when venv/ lacked the ZAP client while
+  # the system Python had it. `python3 setup.py` verifies every REQUIRED_MODULES
+  # entry (rich, requests, scapy, weasyprint, zapv2) actually imports.
 
   # nuclei note: if apt's nuclei package is missing/stale on your mirror, install.sh
   # falls back to `go install` automatically (requires a Go toolchain on PATH).
@@ -56,7 +71,8 @@ recon/scan/audit toolset and can trip IDS/WAF alerts or lock out accounts.
  2. RUNNING A SCAN (main entry point)
 --------------------------------------------------------------------------------
 
-  python3 aegis.py [target] [--profile PROFILE] [-v | --verbose] [--version] [-h | --help]
+  python3 aegis.py [target] [--profile PROFILE] [-v | --verbose] [--non-interactive]
+                   [--version] [-h | --help]
 
   # target        hostname or IP address (validated before anything runs); now OPTIONAL --
   #               omit it entirely and you'll be interactively prompted for one, then for
@@ -65,6 +81,10 @@ recon/scan/audit toolset and can trip IDS/WAF alerts or lock out accounts.
   #               omitting this with a target given still silently defaults to quickscan
   #               (unchanged behavior); the profile menu only appears in interactive mode
   # -v/--verbose  prints the resolved tool list + nmap_args for the chosen profile
+  # --non-interactive
+  #               never prompt: when the stored-report cap (5 per profile+target) is hit,
+  #               delete the oldest report automatically instead of asking. IMPLIED
+  #               whenever stdin/stdout is not a terminal, so piped/cron runs get it free
   # --version     prints "Aegis Scanner 1.0.0" and exits
   # -h/--help     full usage + profile table
 
@@ -76,6 +96,7 @@ Examples:
   python3 aegis.py 10.0.0.5 --profile stealthscan
   python3 aegis.py example.com --profile compliance
   python3 aegis.py                                      # interactive: prompts for target + profile
+  venv/bin/python aegis.py example.com --profile deepscan --non-interactive   # scripted run
 
   # While a scan is running (interactive terminal only):
   #   s          skip just the tool currently running, move to the next one
@@ -124,7 +145,14 @@ Examples:
   python3 -c "from modules.web.sslyze_wrap import run_sslyze; print(run_sslyze('example.com', port=443))"
   python3 -c "from modules.web.wpscan_wrap import run_wpscan; print(run_wpscan('example.com', port=80))"
   python3 -c "from modules.web.sqlmap_wrap import run_sqlmap; print(run_sqlmap('example.com', 'http://example.com/page.php?id=1'))"
+  python3 -c "from modules.web.xss_wrap import run_xss; print(run_xss('example.com', 'http://example.com/search.php?q=1'))"
+  # NOTE: sqlmap and xss both REQUIRE a URL with a query string and refuse one without
+  # it -- nuclei's DAST XSS templates have nothing to mutate against a bare path, and a
+  # scan that can only report nothing would look falsely clean.
   python3 -c "from modules.web.zap_wrap import run_zap_baseline; print(run_zap_baseline('example.com', port=80))"
+
+  # Build the fuzzable URLs the XSS pass uses, from gobuster/dirb output:
+  python3 -c "from modules.profiles._common import web_param_candidates; print(web_param_candidates({'discovered_paths':[{'path':'/search.php','status_code':200}],'base_url':'http://example.com'}, None))"
 
   # Enrichment
   python3 -c "from modules.enrichment.cve_lookup import lookup_cves; print(lookup_cves('nginx', '1.18.0'))"
@@ -136,6 +164,37 @@ Examples:
   python3 -c "from modules.reporting.summary import build_summary; print(build_summary(1))"
   python3 -c "from modules.reporting.report_txt import generate_txt_report; print(generate_txt_report(1))"
   python3 -c "from modules.reporting.report_pdf import generate_pdf_report; print(generate_pdf_report(1))"
+  python3 -c "from modules.reporting.summary import build_summary, injection_findings; print(injection_findings(build_summary(1)))"
+  python3 -c "from modules.reporting.summary import profile_scope_note; print(profile_scope_note('webaudit'))"
+  python3 -c "from modules.reporting.retention import list_stored_reports; print(list_stored_reports('output/example.com', 'quickscan', 'example.com'))"
+
+  # Attribution audit -- 'is this finding credited to a tool that actually ran?'
+  python3 -c "from database.db import get_findings_for_scan; from modules.reporting.attribution import check_scan; print(check_scan(1, 'quickscan', get_findings_for_scan(1)))"
+
+
+--------------------------------------------------------------------------------
+ 4b. TESTS & THE WHOLE-DATABASE AUDIT GATE
+--------------------------------------------------------------------------------
+
+  # The gate: re-renders EVERY scan in the database and checks four defect classes --
+  # crashes, ambiguous cells, duplicate rendered lines, and attribution. Exits 0 only
+  # when all pass, so it is usable in CI / as a pre-push check.
+  python3 tests/db_sweep.py               # every scan
+  python3 tests/db_sweep.py 149 150       # only these scan ids
+
+  # Per-pass assertion scripts (stdlib only, no pytest; non-zero exit on failure):
+  python3 tests/t_phase2.py               # web wrapper parsing (against tests/fixtures/)
+  python3 tests/t_phase3.py
+  python3 tests/t_phase4.py
+  python3 tests/t_phase8.py
+  python3 tests/t_phase9.py               # attribution checks
+  python3 tests/t_phase10.py              # the per-scan tools-run record
+  python3 tests/t_pty.py                  # skip-key / Ctrl+C under a real PTY
+
+  # One-off historical repair tool. Dry-run by default; nothing in the scanner calls it.
+  python3 tools/backfill_nuclei_identity.py            # show what it WOULD change
+  python3 tools/backfill_nuclei_identity.py --apply    # actually write
+  python3 tools/backfill_nuclei_identity.py --revert smoke_test/backfill_nuclei_identity_<ts>.txt
 
 
 --------------------------------------------------------------------------------
@@ -145,18 +204,29 @@ Examples:
   # Open a shell on the scan database directly
   sqlite3 database/aegis.db
 
-  # Useful queries once inside sqlite3:
+  # Three tables: scans, findings, scan_tools_run
   .tables
   .schema scans
   .schema findings
+  .schema scan_tools_run
   SELECT * FROM scans ORDER BY timestamp DESC LIMIT 10;
   SELECT * FROM findings WHERE scan_id = 1;
   SELECT id, target, profile, timestamp FROM scans WHERE target = 'example.com';
+
+  # Which tools actually ran on a scan, and how each one ended
+  # (recorded from scan 147 onward; older scans have no rows and were NOT backfilled):
+  SELECT tool_name, port, outcome FROM scan_tools_run WHERE scan_id = 150;
+  SELECT outcome, COUNT(*) FROM scan_tools_run WHERE scan_id = 150 GROUP BY outcome;
+
+  # The injection evidence columns (NULL on every non-injection finding):
+  SELECT port, finding_type, parameter, payload, endpoint FROM findings
+    WHERE finding_type IN ('sqlmap_finding','xss_finding');
 
   # From Python instead of the sqlite3 CLI:
   python3 -c "from database.db import get_scan_history; print(get_scan_history())"
   python3 -c "from database.db import get_scan_history; print(get_scan_history('example.com'))"
   python3 -c "from database.db import get_findings_for_scan; print(get_findings_for_scan(1))"
+  python3 -c "from database.db import get_scan_tools_run; print(get_scan_tools_run(150))"
   python3 -c "from database.db import get_latest_scan; print(get_latest_scan('example.com'))"
   python3 -c "from database.db import init_db; init_db()"   # re-create tables if missing
 
@@ -166,13 +236,22 @@ Examples:
 --------------------------------------------------------------------------------
 
   # Every target gets its own output directory:
-  #   output/<target>/scan_errors.log   — per-target tool/scan error log
-  #   output/<target>/report.txt        — plain-text report (all profiles)
-  #   output/<target>/report.pdf        — PDF report (deepscan only)
+  #   output/<target>/scan_errors.log
+  #   output/<target>/report_<profile>_<target>_<scan_id>.txt
+  #   output/<target>/report_<profile>_<target>_<scan_id>.pdf
+  #
+  # ALL FIVE profiles now write both a .txt and a .pdf (not deepscan only), and both
+  # are named per scan so a new scan never overwrites an older report. The exact paths
+  # are printed in the REPORT GENERATED block at the end of every run.
+  #
+  # History is capped at 5 reports PER PROFILE+TARGET (the .txt and .pdf of one scan
+  # count as one unit). Interactive runs are asked which to drop; --non-interactive
+  # runs drop the oldest and log it.
 
-  tail -f output/<target>/scan_errors.log      # watch a scan's errors live
-  cat   output/<target>/report.txt             # read the last text report
-  xdg-open output/<target>/report.pdf          # open the PDF report (Linux)
+  tail -f output/<target>/scan_errors.log         # watch a scan's errors live
+  ls -t  output/<target>/report_*.txt             # newest report first
+  cat    output/<target>/report_quickscan_<target>_<scan_id>.txt
+  xdg-open output/<target>/report_deepscan_<target>_<scan_id>.pdf
 
 
 --------------------------------------------------------------------------------

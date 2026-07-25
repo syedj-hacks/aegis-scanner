@@ -77,6 +77,9 @@ What you'll see, in order:
    whatweb + high-severity nuclei check on whatever web port came back open.
 4. A "SCAN COMPLETE" panel with the scan ID, elapsed time, and the report file path.
 5. A colour-coded findings summary table (severity counts) and a tool run/failed/skipped line.
+6. Last of all, a `REPORT GENERATED` block: what was found, what kind of findings they were
+   ("2 CVEs, 7 ZAP alerts, 13 discovered paths"), and the full path to both the `.txt` and the
+   `.pdf`. In most terminals those paths are clickable.
 
 **Prefer to be prompted instead of typing flags?** Just run `python3 aegis.py` with no
 arguments — you'll be asked for a target (re-prompted if it's invalid) and shown a numbered
@@ -92,13 +95,39 @@ interactive runs simply never see a keypress.
 
 ## Step 4 — Read the report
 
+Every scan writes **two** files, named after the scan so nothing is ever overwritten:
+
 ```bash
-cat output/scanme.nmap.org/report.txt
+ls output/scanme.nmap.org/
+# report_quickscan_scanme.nmap.org_151.txt
+# report_quickscan_scanme.nmap.org_151.pdf
+
+cat      output/scanme.nmap.org/report_quickscan_scanme.nmap.org_151.txt
+xdg-open output/scanme.nmap.org/report_quickscan_scanme.nmap.org_151.pdf
 ```
 
-The report has three sections: a header (target/profile/timestamp), a severity-count summary,
-and a detail block listing every finding (port, service, CVE if any, severity, remediation
-text where available).
+(The exact filename is printed in the `REPORT GENERATED` block at the end of the run — you don't
+have to guess the scan id.)
+
+The report reads in this order:
+1. **Header** — target, profile, timestamp, scan id.
+2. **Scope note**, on profiles that need one — `webaudit` says up front that it audits the web
+   layer and runs nuclei only for XSS, so you know what this report does *not* cover.
+3. **Severity summary** — counts per tier. In the PDF this is also a donut chart on the cover.
+4. **Top findings** — the worst ones first.
+5. **Injection & Scripting Vulnerabilities** — only when there are any. Confirmed SQL injection
+   (sqlmap) and reflected XSS (nuclei DAST) get their own section showing the exact payload sent,
+   the parameter/URL it was sent against, and a snippet of the response proving it worked.
+6. **Detail** — every finding: port, service, CVE if any, severity, and remediation.
+
+**A blank field always says why it's blank.** A field that can't apply to that kind of finding
+says so ("TLS configuration finding" under CVE), and one that should have been filled in names the
+tool that didn't fill it ("not determined by nuclei"). An empty cell on its own would mean both
+things at once, which is why you won't see one.
+
+**How many reports are kept:** 5 per profile per target. Past that, an interactive run asks you
+which to drop; a scripted run drops the oldest and logs it. The cap is per *profile* deliberately,
+so a pile of quickscans can't evict the one deepscan report of that host.
 
 ## Step 5 — Try the other profiles
 
@@ -108,10 +137,19 @@ the reports:
 ```bash
 python3 aegis.py scanme.nmap.org --profile quickscan      # DNS + fast port scan + service detect + a quick whatweb/nuclei check on the first web port
 python3 aegis.py scanme.nmap.org --profile stealthscan    # quiet -T2 scan of a curated ~20-port list, minimal footprint
-python3 aegis.py scanme.nmap.org --profile webaudit       # headers + Nikto + gobuster + dirb + whatweb (+sslyze on HTTPS) on web ports, bounded to 30 min
-python3 aegis.py scanme.nmap.org --profile deepscan       # everything (incl. nuclei, ZAP baseline, and conditional sqlmap/hydra/wpscan/enum4linux), produces report.txt + report.pdf
+python3 aegis.py scanme.nmap.org --profile webaudit       # headers + Nikto + gobuster + dirb + whatweb (+sslyze on HTTPS) + an XSS fuzzing pass, bounded to 30 min
+python3 aegis.py scanme.nmap.org --profile deepscan       # everything (incl. nuclei, the XSS pass, ZAP baseline, and conditional sqlmap/hydra/wpscan/enum4linux)
 python3 aegis.py scanme.nmap.org --profile compliance     # nmap TLS/header scripts + sslyze + whatweb, scored instead of discarded
 ```
+
+All five write both a `.txt` and a `.pdf` — that isn't a deepscan-only thing any more.
+
+**About the XSS pass** (`webaudit` and `deepscan`): after gobuster/dirb find paths, Aegis builds
+URLs with a query string from the script endpoints among them (`/search.php?q=1` and similar) and
+fuzzes those with nuclei in DAST mode. It needs a parameter to mutate — a site with no discovered
+script endpoints simply won't have anything to fuzz, and that's why you may see the XSS step do
+nothing on a static target. Confirmed hits show up in the report's Injection & Scripting section
+with the payload and the reflected response.
 
 `deepscan` in particular runs noticeably more tools than the others (nuclei and the ZAP
 baseline scan both take real time against a live target), so expect it to run longer than a
@@ -131,6 +169,19 @@ before it starts:
 ```bash
 python3 aegis.py scanme.nmap.org --profile deepscan -v
 ```
+
+Running from a script, a cron job, or anywhere without a terminal? Add `--non-interactive` so the
+report-retention step never waits on a prompt (it drops the oldest report and logs that it did).
+It's implied automatically when output isn't a terminal, so you rarely need to pass it by hand:
+
+```bash
+python3 aegis.py scanme.nmap.org --profile quickscan --non-interactive
+```
+
+> **Running through the venv:** use `venv/bin/python` (or activate the venv first) consistently.
+> A venv missing one dependency is invisible until a scan reports "tools failed: 1" — that exact
+> situation happened here with the ZAP client. `python3 setup.py` verifies every required package
+> imports, so run it if a tool starts dropping out for no obvious reason.
 
 ## Step 6 — Add or change your NVD API key later
 
@@ -157,6 +208,17 @@ Or scope it to one target:
 ```bash
 python3 -c "from database.db import get_scan_history; import json; print(json.dumps(get_scan_history('scanme.nmap.org'), indent=2))"
 ```
+
+Since scan 147, the database also records **which tools actually ran on each scan**, per port,
+with whether each one ran, was skipped, or failed:
+
+```bash
+python3 -c "from database.db import get_scan_tools_run; print(get_scan_tools_run(150))"
+```
+
+That's the honest answer to "did this scan really run nuclei?" — much better than inferring it
+from the profile. Scans older than that feature have no record and return `[]`; they were not
+backfilled with data that was never captured.
 
 ## Step 8 — Debugging a scan that seems to have skipped something
 
@@ -192,6 +254,21 @@ Common entries you'll see there and what they mean:
   per-port web loop hit its wall-clock budget (30 min / 1 hour) before finishing every open web
   port; whatever ports were already audited are still in the report, this just stops it from
   running unbounded on a target with many open web ports.
+
+Two more things worth knowing while debugging:
+
+- **Zero open ports on a host you know is up is usually the target, not Aegis.** Rate limiting is
+  by far the most common cause. `config.KNOWN_GOOD_TARGETS` lists hosts whose open ports are an
+  established fact, and the port scanner flags loudly when one of them comes back empty — check
+  for that flag and try a second target before assuming a scanner bug.
+- **Check your own work with the built-in audit.** It re-renders every scan in the database and
+  checks for crashes, ambiguous cells, duplicate lines, and findings credited to a tool that never
+  ran. It exits non-zero if anything fails:
+
+  ```bash
+  python3 tests/db_sweep.py          # every scan
+  python3 tests/db_sweep.py 150      # just one
+  ```
 
 ## Step 9 — Next steps
 
