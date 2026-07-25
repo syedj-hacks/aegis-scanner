@@ -309,7 +309,13 @@ def _finding_kind(finding: dict) -> str:
     `type` wins, otherwise the shape is inferred from the keys the
     scanning/web modules actually return.
     """
-    declared = str(finding.get("type") or "").strip().lower()
+    # `finding_type` is the column name db.py persists under, so a row read
+    # back from SQLite declares its kind under that key rather than `type`.
+    # Reading only `type` sent every stored row through the shape-sniffing
+    # below, which is guesswork applied to a finding that already knows what
+    # it is.
+    declared = str(finding.get("type") or finding.get("finding_type")
+                   or "").strip().lower()
     if declared:
         return declared
 
@@ -319,7 +325,12 @@ def _finding_kind(finding: dict) -> str:
         return "nmap_script"
     if finding.get("header") or finding.get("missing_header"):
         return "missing_security_header"
-    if finding.get("description") is not None and "reference" in finding:
+    # A truthy reference, not merely the key being present: rows read back
+    # from SQLite carry EVERY column, so `"reference" in finding` is true for
+    # all of them and this branch claimed any described finding as nikto's.
+    # A stealthscan open-port row was being told to "review this nikto
+    # finding" — naming a tool that never ran.
+    if finding.get("description") is not None and finding.get("reference"):
         return "nikto_finding"
     if finding.get("path"):
         return "discovered_path"
@@ -480,7 +491,16 @@ def get_remediation(finding: dict) -> dict:
         }
 
     enriched = dict(finding)
-    enriched["remediation"] = remediation_text(enriched)
+    # A remediation the TOOL supplied wins over this module's generic text.
+    # ZAP returns a per-rule `solution` written for that exact alert ("Ensure
+    # that the HttpOnly flag is set for all cookies"), which is strictly more
+    # useful than "review the ZAP baseline alert '<name>' against OWASP
+    # guidance" — and overwriting it discarded real tool output in favour of
+    # a sentence that tells the reader to go and look it up themselves.
+    # Only findings whose wrapper genuinely populated this field are
+    # affected; everything else still gets remediation_text() as before.
+    existing = str(finding.get("remediation") or "").strip()
+    enriched["remediation"] = existing or remediation_text(enriched)
     return enriched
 
 

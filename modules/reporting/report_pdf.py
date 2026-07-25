@@ -42,6 +42,7 @@ from modules.enrichment.severity import SEVERITY_LEVELS
 from modules.reporting.summary import (
     build_summary, injection_findings, INJECTION_FINDING_TYPES,
     field_display, service_display, cvss_display, distinct_identifiers,
+    profile_scope_note,
 )
 
 # Print-legible equivalents of display.SEVERITY_COLORS.
@@ -159,6 +160,16 @@ def _stylesheet() -> str:
     .swatch {
         display: inline-block; width: 9px; height: 9px;
         border-radius: 2px; vertical-align: middle;
+    }
+
+    .scope-note {
+        margin-top: 12px;
+        padding: 8px 10px;
+        border-left: 3px solid #9aa7b1;
+        background: #f4f6f8;
+        color: #3d4750;
+        font-size: 8.5pt;
+        line-height: 1.4;
     }
 
     h2.section {
@@ -382,7 +393,20 @@ def _cover_html(summary: dict) -> str:
         f'<td class="cb-meta"><table class="meta">{cells}</table></td>'
         f'<td class="cb-chart">{chart}</td>'
         "</tr></table>"
+        + _scope_note_html(metadata.get("profile"))
     )
+
+
+def _scope_note_html(profile) -> str:
+    """The profile's scope statement, worded identically to the text report.
+
+    Styled as a quiet note rather than a warning banner — it states what the
+    profile's scope is, which is not the same as saying something went wrong.
+    """
+    note = profile_scope_note(profile, labelled=True)
+    if not note:
+        return ""
+    return f'<div class="scope-note">{_esc(note)}</div>'
 
 
 def _summary_html(summary: dict) -> str:
@@ -553,6 +577,14 @@ def _details_html(summary: dict) -> str:
             f'Service {_esc(service_display(finding))} &nbsp;|&nbsp; '
             f'CVE {_esc(field_display(finding, "cve_id"))} &nbsp;|&nbsp; '
             f'CVSS {_esc(cvss_display(finding))}'
+            f"</div>"
+            # Same two cells the text report's detail card gained, through
+            # the same field_display(), so the two files cannot disagree
+            # about what a finding's endpoint or citation was.
+            f'<div class="facts">'
+            f'Endpoint {_esc(_truncate(field_display(finding, "endpoint")))} '
+            f'&nbsp;|&nbsp; '
+            f'Reference {_esc(_truncate(field_display(finding, "reference")))}'
             f"</div>"
             f'<div class="label">DESCRIPTION</div>'
             f'<p>{_esc(finding.get("description") or "No description available.")}</p>'

@@ -106,6 +106,12 @@ def _findings_from_nuclei(nuclei_result: dict) -> list:
             "service": nuclei_service(f),
             "template_id": f["template_id"], "severity": (f["severity"] or "medium").upper(),
             "reference": f["reference"], "cve_id": f.get("cve_id"),
+            # nuclei's own matched-at — the host:port (or URL) it actually
+            # matched on, which for a pivoting template is not the URL it
+            # was launched against. Parsed by nuclei_wrap since the
+            # matched-port fix and dropped at insert until findings gained
+            # an endpoint column.
+            "endpoint": f.get("matched_at") or None,
             # nuclei's own info.classification.cvss-score when the template
             # carries one; None otherwise, which leaves score_finding()'s
             # heuristic in charge exactly as before.

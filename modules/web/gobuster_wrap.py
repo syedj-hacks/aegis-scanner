@@ -46,7 +46,20 @@ _GOBUSTER_BASE_ARGS = ["-q", "--np", "-t", "30"]
 # Matches gobuster's result lines, e.g.
 #   admin                (Status: 301) [Size: 0] [--> /admin/]
 #   /index.html          (Status: 200) [Size: 55]
-_RESULT_LINE = re.compile(r"^(?P<path>\S+)\s+\(Status:\s*(?P<status>\d+)\)")
+#
+# Size and the redirect target are gobuster's own output and were previously
+# matched-but-discarded — the pattern stopped at the status code. Both are
+# real, tool-reported detail: the size distinguishes a 0-byte stub from a
+# real page, and the redirect target says where a 301/302 actually goes
+# (verified against live gobuster output — see smoke_test8.txt §3.1). Both
+# groups are optional: gobuster omits [--> ...] on non-redirects, and a
+# future/older build that omits [Size: ...] must still parse rather than
+# silently yielding zero paths.
+_RESULT_LINE = re.compile(
+    r"^(?P<path>\S+)\s+\(Status:\s*(?P<status>\d+)\)"
+    r"(?:\s*\[Size:\s*(?P<size>\d+)\])?"
+    r"(?:\s*\[-->\s*(?P<redirect>[^\]]+)\])?"
+)
 
 # Single-page apps and sites with a soft 404 answer *every* URL with the
 # same page, so gobuster refuses to start and exits 1. Its own error text
@@ -146,10 +159,20 @@ def _normalise_path(path: str) -> str:
     return path
 
 
-def _parse_gobuster_output(stdout: str) -> list:
+def _parse_gobuster_output(stdout: str, base_url: str = "") -> list:
     """
     Parse gobuster's result lines into a list of:
-        {path: str, status_code: int}
+        {path, status_code, size, redirect, url}
+
+    size is None when gobuster did not print a [Size: ...] block, and
+    redirect is None on anything that is not a redirect — in both cases the
+    tool genuinely said nothing, which the report renders as "not determined
+    by gobuster" rather than as a zero or a dash.
+
+    url is the absolute URL the path was found at. gobuster is launched
+    against a scheme-qualified base URL, so http-vs-https and the port are
+    known here for certain; recording the composed URL keeps that knowledge
+    instead of discarding it and leaving the report to guess a scheme.
 
     Non-matching lines (blank lines, stray progress output) are skipped.
     Duplicates are collapsed. Malformed/empty input yields [].
@@ -176,7 +199,16 @@ def _parse_gobuster_output(stdout: str) -> list:
             continue
         seen.add(path)
 
-        discovered.append({"path": path, "status_code": status_code})
+        size = match.group("size")
+        redirect = (match.group("redirect") or "").strip()
+
+        discovered.append({
+            "path": path,
+            "status_code": status_code,
+            "size": int(size) if size is not None else None,
+            "redirect": redirect or None,
+            "url": f"{base_url.rstrip('/')}{path}" if base_url else None,
+        })
 
     discovered.sort(key=lambda d: d["path"])
     return discovered
@@ -217,8 +249,13 @@ def run_gobuster(target: str, port: int = 80, use_https: bool = False,
     dict:
         target                 : str
         port                   : int
-        discovered_paths       : list[dict]  {path, status_code}
-                                             path always leading-slashed
+        base_url               : str         the scheme-qualified URL gobuster
+                                             was actually pointed at
+        discovered_paths       : list[dict]  {path, status_code, size,
+                                             redirect, url}
+                                             path always leading-slashed;
+                                             size/redirect are None where
+                                             gobuster reported neither
         wordpress_fingerprinted: bool        True when a /wp-* marker was
                                              found — this is the flag
                                              config.CONDITIONAL_TOOLS maps
@@ -238,6 +275,7 @@ def run_gobuster(target: str, port: int = 80, use_https: bool = False,
         "tool": "gobuster",
         "target": target,
         "port": port,
+        "base_url": "",
         "discovered_paths": [],
         "wordpress_fingerprinted": False,
         "raw_output": "",
@@ -253,6 +291,7 @@ def run_gobuster(target: str, port: int = 80, use_https: bool = False,
         return result
 
     url = _build_url(target, port, use_https)
+    result["base_url"] = url
     command = ["gobuster", "dir", "-u", url, "-w", resolved_wordlist] + _GOBUSTER_BASE_ARGS
     if use_https:
         command.append("-k")
@@ -291,7 +330,7 @@ def run_gobuster(target: str, port: int = 80, use_https: bool = False,
         print_error(f"[Gobuster] gobuster failed for {url} — {result['error']}")
         return result
 
-    discovered = _parse_gobuster_output(result["raw_output"])
+    discovered = _parse_gobuster_output(result["raw_output"], base_url=url)
 
     if _looks_like_wildcard_flood(len(discovered), resolved_wordlist):
         # New information beyond run_tool()'s own success/failure verdict
@@ -318,6 +357,9 @@ def run_gobuster(target: str, port: int = 80, use_https: bool = False,
                 "port": port,
                 "path": entry["path"],
                 "status_code": entry["status_code"],
+                "size": entry["size"],
+                "redirect": entry["redirect"],
+                "url": entry["url"],
             })
             print_success(f"[Gobuster] {entry['path']} ({entry['status_code']})")
         print_info(f"[Gobuster] {url} — {len(discovered)} path(s) discovered")

@@ -109,15 +109,15 @@ implementations, same data shape) — `compliance`, which passes `--script` dire
 | File | Entry point | Tool(s) | Returns |
 |---|---|---|---|
 | `header_check.py` | `check_headers(target, port=80, use_https=False)` | `requests` via `safe_call()` | `missing_headers[]`, `present_headers{}`, `server_banner`, `powered_by` |
-| `nikto_wrap.py` | `run_nikto(target, port=80, use_https=False)` | `nikto` | `{findings: [{description, reference}], error, skipped}` — nikto exits 0 even on connection failure, so failure is detected from report text |
-| `gobuster_wrap.py` | `run_gobuster(target, port=80, use_https=False, wordlist=None)` | `gobuster dir` | `{discovered_paths: [{path, status_code}], wordpress_fingerprinted: bool, error, skipped}`; auto-retries with `--exclude-length` on SPA wildcard responses |
-| `dirb_wrap.py` | `run_dirb(target, port=80, use_https=False, wordlist=None)` | `dirb -S -w -r` | `{discovered_paths: [{path, status_code}], raw_output, error, skipped}` — see below for the wordlist/failure-detection fix |
+| `nikto_wrap.py` | `run_nikto(target, port=80, use_https=False)` | `nikto` | `{findings: [{description, reference, test_id, path}], base_url, server, product, version, error, skipped}` — nikto exits 0 even on connection failure, so failure is detected from report text. `test_id`/`path` are nikto's own per-finding id and URI (both `""` on tests that print neither, e.g. `"Apache/2.4.25 appears to be outdated"` has no URI); `server`/`product`/`version` come from its `Server:` banner line, with `"No banner retrieved"` treated as no banner |
+| `gobuster_wrap.py` | `run_gobuster(target, port=80, use_https=False, wordlist=None)` | `gobuster dir` | `{discovered_paths: [{path, status_code, size, redirect, url}], base_url, wordpress_fingerprinted: bool, error, skipped}`; auto-retries with `--exclude-length` on SPA wildcard responses. `size`/`redirect` are gobuster's own `[Size: n]` / `[--> target]` and are `None` where it printed neither — a 0-byte page and an unreported size are different facts |
+| `dirb_wrap.py` | `run_dirb(target, port=80, use_https=False, wordlist=None)` | `dirb -S -w -r` | `{discovered_paths: [{path, status_code, size, redirect, url}], raw_output, error, skipped}` — see below for the wordlist/failure-detection fix. `size` is dirb's own `SIZE:` (captured by the regex since the module was written, previously discarded when the dict was built); `redirect` is always `None` — dirb does not report redirect targets |
 | `whatweb_wrap.py` | `run_whatweb(target, port=80, use_https=False)` | `whatweb -a 3` | `{technologies: [{name, value}], cms_detected: str\|None, raw_output, error, skipped}` — `cms_detected` still has no consumer (§5.6) |
 | `nuclei_wrap.py` | `run_nuclei(target, port=80, use_https=False, severity=None)` | `nuclei -jsonl -silent` | `{findings: [{template_id, name, severity, description, matched_at, reference, cve_id}], raw_output, error, skipped}` — `cve_id` (new) is comma-joined from `info.classification.cve-id`, threaded through by every profile that persists nuclei findings |
 | `sqlmap_wrap.py` | `run_sqlmap(target, url)` | `sqlmap --batch --level 1 --risk 1` | `{injectable: bool, findings: [{parameter, method, type, title}], raw_output, error, skipped}` |
 | `sslyze_wrap.py` | `run_sslyze(target, port=443)` | `sslyze --json_out=<tmpfile>` | `{findings: [{issue, detail}], raw_output, error, skipped}` |
 | `wpscan_wrap.py` | `run_wpscan(target, port=80, use_https=False, api_token=None)` | `wpscan --format json` | `{findings: [{component, title, reference}], raw_output, error, skipped}` |
-| `zap_wrap.py` | `run_zap_baseline(target, port=80, use_https=False)` | ZAP daemon + `zapv2` REST client (see below) | `{findings: [{rule_id, name, status, severity}], raw_output, error, skipped}` |
+| `zap_wrap.py` | `run_zap_baseline(target, port=80, use_https=False)` | ZAP daemon + `zapv2` REST client (see below) | `{findings: [{rule_id, name, status, severity, confidence, description, solution, reference, url, param, evidence, attack, method, cwe, url_count}], raw_output, error, skipped}` — all ZAP's own fields; `attack` is `""` on every alert of a passive baseline scan, `param`/`evidence` on the rules that report neither. `cwe` drops ZAP's `-1`/`0` "not applicable" sentinel rather than rendering `CWE--1`. ZAP emits one alert per matching URL, so alerts are collapsed per `(pluginId, alert)` with `url_count` recording how many URLs matched |
 
 **`dirb_wrap.py` — root-caused and fixed this pass (previously only guessed at).** dirb is
 single-threaded, one connection per request, and a full `common.txt` (4614 words) run reliably
@@ -205,11 +205,13 @@ SQLite at `database/aegis.db`. `findings` has four nullable columns beyond the o
 ```sql
 scans (id, target, timestamp, profile)
 findings (id, scan_id, port, service, version, cve_id, cvss, severity,
-          description, remediation, finding_type, product)
+          description, remediation, finding_type, product,
+          parameter, payload, evidence, endpoint, reference)
 ```
 
 `init_db()` runs an idempotent migration (`PRAGMA table_info(findings)` → `ALTER TABLE ... ADD
-COLUMN` for any of `description`/`remediation`/`finding_type`/`product` not already present) —
+COLUMN` for any of `description`/`remediation`/`finding_type`/`product`/`parameter`/`payload`/
+`evidence`/`endpoint`/`reference` not already present) —
 safe to call on every process start. `insert_finding()` derives `finding_type` from
 `finding.get("type") or finding.get("finding_type")`, defaulting to `"cve"` when a `cve_id` is
 present and no type was given.

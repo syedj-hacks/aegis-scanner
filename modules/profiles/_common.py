@@ -172,16 +172,24 @@ def web_param_candidates(gobuster_results, dirb_results,
 # Folding the name into the front of the description puts the distinguishing
 # text where it survives the database round-trip, using a column that
 # already exists. Nothing is invented — both halves are nuclei's own output.
-def nuclei_description(finding: dict) -> str:
+def named_description(name, description) -> str:
     """
-    "<template name> — <template description>" for one nuclei match.
+    "<name> — <description>", the project's standard way of keeping a tool's
+    short label and its long prose in the single description column.
 
-    Falls back to whichever half is present, and does not prepend a name
-    the description already opens with (some templates set the two to the
-    same string, and "X — X" helps nobody).
+    db.py has no column for a finding's name, so a name passed through the
+    mappers is dropped at insert. Folding it onto the front of the
+    description is what makes it survive the round-trip — and it is what
+    keeps findings that share a long boilerplate description (the four Redis
+    Lua CVEs; ZAP's per-rule prose) distinguishable in a report that
+    truncates. See smoke_test7 §2.3 for what happens without it.
+
+    Falls back to whichever half is present, and does not prepend a name the
+    description already opens with (some templates and ZAP rules set the two
+    to the same string, and "X — X" helps nobody).
     """
-    name = str(finding.get("name") or "").strip()
-    description = str(finding.get("description") or "").strip()
+    name = str(name or "").strip()
+    description = str(description or "").strip()
 
     if not name:
         return description
@@ -190,6 +198,11 @@ def nuclei_description(finding: dict) -> str:
     if description.lower().startswith(name.lower()):
         return description
     return f"{name} — {description}"
+
+
+def nuclei_description(finding: dict) -> str:
+    """"<template name> — <template description>" for one nuclei match."""
+    return named_description(finding.get("name"), finding.get("description"))
 
 
 # nuclei's `type` field is a protocol classification, not a service name.

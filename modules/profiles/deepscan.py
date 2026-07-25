@@ -53,7 +53,7 @@ from modules.utils.logger import log_scan_start, log_scan_end, log_tool_failure,
 from modules.profiles._common import (
     warn_unavailable_tools, GLOBAL_AVAILABLE_TOOLS,
     count_and_report_tool_failures, web_param_candidates, finalise_reports,
-    nuclei_description, nuclei_port, nuclei_service,
+    nuclei_description, nuclei_port, nuclei_service, named_description,
 )
 from modules.recon.dns import resolve_dns
 from modules.recon.subdomain import enumerate_subdomains
@@ -199,12 +199,56 @@ def _findings_from_headers(header_result: dict) -> list:
 
 
 def _findings_from_nikto(nikto_result: dict) -> list:
+    """nikto's own per-finding detail, not just its description text.
+
+    endpoint  — the scheme-qualified URL of the URI nikto flagged. nikto is
+                given the scheme as an argument, so http-vs-https is known
+                here for certain rather than assumed downstream. Findings
+                nikto reported without a URI (e.g. "Apache/2.4.25 appears to
+                be outdated") get the base URL, which is still true of them.
+    reference — nikto's "See: <url>" citation. Parsed since the wrapper was
+                written and dropped at insert until findings gained a
+                reference column.
+    product/version — nikto's reported Server banner, split on "/". The
+                whole scan shares one banner because it is one server.
+    """
     port = nikto_result.get("port")
-    return [
-        {"type": "nikto_finding", "port": port,
-         "description": f["description"], "reference": f["reference"]}
-        for f in nikto_result.get("findings") or []
-    ]
+    base_url = (nikto_result.get("base_url") or "").rstrip("/")
+    product = nikto_result.get("product") or None
+    version = nikto_result.get("version") or None
+
+    findings = []
+    for f in nikto_result.get("findings") or []:
+        path = f.get("path") or ""
+        endpoint = f"{base_url}{path}" if base_url else (path or None)
+        findings.append({
+            "type": "nikto_finding", "port": port,
+            "description": f["description"],
+            "reference": f.get("reference") or None,
+            "endpoint": endpoint or None,
+            "product": product,
+            "version": version,
+        })
+    return findings
+
+
+def _path_description(entry: dict, source: str = None) -> str:
+    """"Discovered path /admin (HTTP 301, 312 bytes) -> /admin/".
+
+    Size and redirect target are gobuster's/dirb's own output. They are
+    appended only when the tool actually reported them: a 0-byte page and a
+    page whose size the tool never printed are different facts, and writing
+    "0 bytes" for the second would state something the scan did not observe.
+    """
+    bits = [f"HTTP {entry.get('status_code')}"]
+    if entry.get("size") is not None:
+        bits.append(f"{entry['size']} bytes")
+    if source:
+        bits.append(f"via {source}")
+    text = f"Discovered path {entry.get('path')} ({', '.join(bits)})"
+    if entry.get("redirect"):
+        text += f" -> {entry['redirect']}"
+    return text
 
 
 def _findings_from_gobuster(gobuster_result: dict) -> list:
@@ -213,7 +257,8 @@ def _findings_from_gobuster(gobuster_result: dict) -> list:
         {
             "type": "discovered_path", "port": port,
             "path": entry["path"], "status_code": entry["status_code"],
-            "description": f"Discovered path {entry['path']} (HTTP {entry['status_code']})",
+            "description": _path_description(entry),
+            "endpoint": entry.get("url"),
         }
         for entry in gobuster_result.get("discovered_paths") or []
     ]
@@ -231,7 +276,8 @@ def _findings_from_dirb(dirb_result: dict) -> list:
         {
             "type": "discovered_path", "port": port,
             "path": entry["path"], "status_code": entry["status_code"],
-            "description": f"Discovered path {entry['path']} (HTTP {entry['status_code']}, via dirb)",
+            "description": _path_description(entry, source="dirb"),
+            "endpoint": entry.get("url"),
         }
         for entry in dirb_result.get("discovered_paths") or []
     ]
@@ -301,6 +347,12 @@ def _findings_from_nuclei(nuclei_result: dict, seen: set = None) -> list:
             "service": nuclei_service(f),
             "template_id": f["template_id"], "severity": (f["severity"] or "medium").upper(),
             "reference": f["reference"], "cve_id": f.get("cve_id"),
+            # nuclei's own matched-at — the host:port (or URL) it actually
+            # matched on, which for a pivoting template is not the URL it
+            # was launched against. Parsed by nuclei_wrap since the
+            # matched-port fix and dropped at insert until findings gained
+            # an endpoint column.
+            "endpoint": f.get("matched_at") or None,
             # See _common.nuclei_description() / nuclei_port(); the two
             # profiles' nuclei mappers are kept identical on purpose.
             "cvss": f.get("cvss"),
@@ -311,15 +363,45 @@ def _findings_from_nuclei(nuclei_result: dict, seen: set = None) -> list:
 
 
 def _findings_from_zap(zap_result: dict) -> list:
+    """ZAP reports far more per alert than its name and risk.
+
+    Every field below is ZAP's own output, verified against a real 25-alert
+    run (smoke_test8 §3.1). The wrapper previously kept four of them and the
+    mapper synthesised a description ("ZAP WARN alert: X") while discarding
+    ZAP's actual prose, its remediation advice, the URL it matched at, the
+    evidence string, and the parameter involved — all of which have had
+    columns on the findings table for some time.
+
+    The description keeps the established "<name> — <prose>" form so the
+    rule name survives the round-trip (findings has no name column) and so
+    two rules that share boilerplate prose stay distinguishable when the
+    report truncates.
+
+    Fields ZAP left empty stay None. For a passive baseline scan `attack` is
+    empty on every alert by nature, and param/evidence are populated on only
+    some rules; None renders as "not determined by zaproxy" rather than as a
+    fabricated value.
+    """
     port = zap_result.get("port")
-    return [
-        {
+    findings = []
+    for f in zap_result.get("findings") or []:
+        description = named_description(f.get("name"), f.get("description"))
+        # ZAP collapses to one row per rule; say how many URLs matched so the
+        # collapse does not understate the finding's reach.
+        count = f.get("url_count") or 0
+        if count > 1:
+            description = f"{description} (matched at {count} URLs)"
+        findings.append({
             "type": "zap_finding", "port": port,
             "name": f["name"], "severity": f["severity"],
-            "description": f"ZAP {f['status']} alert: {f['name']}",
-        }
-        for f in zap_result.get("findings") or []
-    ]
+            "description": description,
+            "remediation": f.get("solution") or None,
+            "endpoint": f.get("url") or None,
+            "evidence": f.get("evidence") or None,
+            "parameter": f.get("param") or None,
+            "reference": f.get("reference") or None,
+        })
+    return findings
 
 
 def _findings_from_wpscan(wpscan_result: dict, port) -> list:

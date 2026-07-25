@@ -9,3 +9,6 @@ __pycache__/
 .DS_Store
 modules/utils/config.py
 venv/
+*.pre-backfill.*
+!tests/fixtures/*.json
+hydra.restore

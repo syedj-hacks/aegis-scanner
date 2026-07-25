@@ -194,6 +194,7 @@ FINDING_TYPE_TOOL = {
     "technology_fingerprint": "whatweb",
     "weak_credentials": "hydra",
     "wordpress_fingerprinted": "wpscan",
+    "wpscan_finding": "wpscan",
     "xss_finding": "nuclei DAST",
     "zap_finding": "zaproxy",
 }
@@ -249,6 +250,36 @@ _NOT_APPLICABLE = {
         "open_port": "port observation",
         "smb_share": "host-level finding",
         "smb_user": "host-level finding",
+    },
+    # endpoint is the URL a finding concerns. Host- and port-level findings
+    # are not about a URL at all, so an empty cell there is correct rather
+    # than a gap in what the scan learned.
+    "endpoint": {
+        "banner": "port-level observation",
+        "cve": "service-level finding",
+        "nmap_script": "host/service finding",
+        "open_port": "port observation",
+        "service_version": "port-level observation",
+        "smb_share": "host-level finding",
+        "smb_user": "host-level finding",
+        "weak_credentials": "credential finding",
+    },
+    # reference is a citation the tool itself supplied. Tools that report
+    # observations rather than catalogued issues publish none, and never
+    # would.
+    "reference": {
+        "banner": "banner observation",
+        "discovered_path": "path discovery",
+        "fingerprint_header": "fingerprint",
+        "missing_security_header": "config finding",
+        "nmap_script": "script output",
+        "open_port": "port observation",
+        "service_version": "service observation",
+        "smb_share": "share enumeration",
+        "smb_user": "user enumeration",
+        "technology_fingerprint": "fingerprint",
+        "weak_credentials": "credential finding",
+        "wordpress_fingerprinted": "fingerprint",
     },
 }
 
@@ -643,6 +674,47 @@ def summary_stats(summary: dict) -> dict:
         "tools_run": 0,
         "tools_failed": 0,
     }
+
+
+# Profiles whose designed scope leaves out a class of finding another
+# profile would surface. This is not a defect list — each profile is doing
+# what it is meant to. It exists because a report that is silent about its
+# own scope reads as a statement about the host rather than about the scan:
+# webaudit on pentest-ground.com reported 6 MEDIUM / 24 LOW while a quickscan
+# of the same host found 2 CRITICAL (smoke_test7 §9.8), and nothing in the
+# webaudit report said why.
+#
+# Kept factual and short on purpose. It is a scope statement, not a warning.
+# The text carries no "Scope:" prefix of its own — each surface supplies its
+# own label (the CLI banner has a bold one, the report blocks prepend it), and
+# a self-prefixing string produced "Scope: Scope: this profile ..." in the
+# banner.
+_PROFILE_SCOPE_NOTES = {
+    "webaudit": (
+        "this profile audits the web application layer. It runs "
+        "nuclei only in DAST mode for reflected XSS, not the severity "
+        "template pass that quickscan and deepscan run against the host's "
+        "other exposed services — so CVE-class findings on non-web ports "
+        "are outside what this report covers. A quickscan or deepscan of "
+        "the same host may surface findings this report does not."
+    ),
+}
+
+SCOPE_NOTE_LABEL = "Scope"
+
+
+def profile_scope_note(profile, labelled: bool = False) -> str:
+    """The scope statement for a profile, or "" if it has none.
+
+    One implementation shared by the text report, the PDF and the end-of-run
+    CLI banner, so the three cannot drift into describing the same profile's
+    scope differently. `labelled` prepends "Scope: " for the surfaces that do
+    not draw their own label.
+    """
+    note = _PROFILE_SCOPE_NOTES.get(str(profile or "").strip().lower(), "")
+    if note and labelled:
+        return f"{SCOPE_NOTE_LABEL}: {note}"
+    return note
 
 
 def build_summary(scan_id, top_n: int = _DEFAULT_TOP_N, quiet: bool = False) -> dict:

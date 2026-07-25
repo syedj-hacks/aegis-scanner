@@ -719,6 +719,13 @@ started. It has now run twice.
     behaviour, not introduced here, and not changed.
 
 
+Worth your attention
+Historical DB rows are not rewritten. Their reports now render unambiguously via render-time repair, but stored cve_id/port are unchanged. Deliberate — silently rewriting recorded scan results is the evidence loss Phase 4 exists to prevent. A backfill should be an explicit, separate decision if you want it.
+Service stays "not determined by nuclei" for the Redis findings. nuclei reports a protocol class (javascript/tcp), not a service name; inferring "redis" from port 6379 is a convention, not an observation.
+The commit also lands your previously-uncommitted smoke_test5/6 work (wrappers, port_scanner, zap_wrap, Docker fixtures) that was already in the tree — noted explicitly in the commit body so it isn't misattributed to this pass.
+Repeat coverage is uneven: quickscan ×3 and deepscan ×2 on pentest-ground.com, single runs elsewhere. Full limitations in §9 of smoke_test7.txt.
+
+
 10. FINAL VERDICT
 ================================================================================
 The reported bug did not exist. Four rows that looked identical were four

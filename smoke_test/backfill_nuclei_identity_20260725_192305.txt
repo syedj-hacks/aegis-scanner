@@ -1,0 +1,758 @@
+==============================================================================
+AEGIS — nuclei identity backfill: before/after row dump
+==============================================================================
+Generated      : 2026-07-25T19:23:05
+Database       : /home/jafar/aegis-scanner/database/aegis.db
+Mode           : APPLIED
+Rows to change : 30
+
+CAVEATS
+  - port is NOT modified by this migration, by explicit decision. See the module docstring: 6379/22 was never recorded for these runs.
+  - cvss values are read from the nuclei templates as they exist on disk TODAY, not from the output of the run being corrected. Where a post-fix scan of the same template exists the two agree (exposed-redis 7.2), but for configuration-listing (5.3) and CVE-2023-48795 (5.9) there is no post-fix run to corroborate against, and an upstream template edit since the scan would not be detectable here.
+  - cve_id values are recovered from template ids logged at scan time and are corroborated by two independent derivations; they are not inferred.
+
+------------------------------------------------------------------------------
+BEFORE / AFTER
+------------------------------------------------------------------------------
+  row 4820  scan 68   pentest-ground.com   port 80    HIGH    
+        template  : CVE-2025-46819  (evidence: both)
+        desc      : Redis is an open source, in-memory database that persists on disk. Ver
+        cve_id    : None -> 'CVE-2025-46819'
+        port      : 80 -> unchanged (by decision)
+  row 4821  scan 68   pentest-ground.com   port 80    HIGH    
+        template  : CVE-2025-46818  (evidence: both)
+        desc      : Redis is an open source, in-memory database that persists on disk. Ver
+        cve_id    : None -> 'CVE-2025-46818'
+        port      : 80 -> unchanged (by decision)
+  row 4822  scan 68   pentest-ground.com   port 80    CRITICAL
+        template  : CVE-2025-49844  (evidence: both)
+        desc      : Redis is an open source, in-memory database that persists on disk. Ver
+        cve_id    : None -> 'CVE-2025-49844'
+        port      : 80 -> unchanged (by decision)
+  row 4823  scan 68   pentest-ground.com   port 80    CRITICAL
+        template  : CVE-2025-46817  (evidence: both)
+        desc      : Redis is an open source, in-memory database that persists on disk. Ver
+        cve_id    : None -> 'CVE-2025-46817'
+        port      : 80 -> unchanged (by decision)
+  row 4825  scan 68   pentest-ground.com   port 80    HIGH    
+        template  : exposed-redis  (evidence: both)
+        desc      : Redis server without any required authentication was discovered.
+        cvss      : None -> 7.2
+        port      : 80 -> unchanged (by decision)
+  row 4879  scan 71   pentest-ground.com   port 80    CRITICAL
+        template  : CVE-2025-46817  (evidence: textual)
+        desc      : Redis is an open source, in-memory database that persists on disk. Ver
+        cve_id    : None -> 'CVE-2025-46817'
+        port      : 80 -> unchanged (by decision)
+  row 4880  scan 71   pentest-ground.com   port 80    CRITICAL
+        template  : CVE-2025-49844  (evidence: textual)
+        desc      : Redis is an open source, in-memory database that persists on disk. Ver
+        cve_id    : None -> 'CVE-2025-49844'
+        port      : 80 -> unchanged (by decision)
+  row 4881  scan 71   pentest-ground.com   port 80    HIGH    
+        template  : CVE-2025-46818  (evidence: textual)
+        desc      : Redis is an open source, in-memory database that persists on disk. Ver
+        cve_id    : None -> 'CVE-2025-46818'
+        port      : 80 -> unchanged (by decision)
+  row 4882  scan 71   pentest-ground.com   port 80    HIGH    
+        template  : CVE-2025-46819  (evidence: textual)
+        desc      : Redis is an open source, in-memory database that persists on disk. Ver
+        cve_id    : None -> 'CVE-2025-46819'
+        port      : 80 -> unchanged (by decision)
+  row 4884  scan 71   pentest-ground.com   port 80    HIGH    
+        template  : exposed-redis  (evidence: textual)
+        desc      : Redis server without any required authentication was discovered.
+        cvss      : None -> 7.2
+        port      : 80 -> unchanged (by decision)
+  row 4901  scan 71   pentest-ground.com   port 443   CRITICAL
+        template  : CVE-2025-49844  (evidence: textual)
+        desc      : Redis is an open source, in-memory database that persists on disk. Ver
+        cve_id    : None -> 'CVE-2025-49844'
+        port      : 443 -> unchanged (by decision)
+  row 4902  scan 71   pentest-ground.com   port 443   HIGH    
+        template  : CVE-2025-46818  (evidence: textual)
+        desc      : Redis is an open source, in-memory database that persists on disk. Ver
+        cve_id    : None -> 'CVE-2025-46818'
+        port      : 443 -> unchanged (by decision)
+  row 4903  scan 71   pentest-ground.com   port 443   CRITICAL
+        template  : CVE-2025-46817  (evidence: textual)
+        desc      : Redis is an open source, in-memory database that persists on disk. Ver
+        cve_id    : None -> 'CVE-2025-46817'
+        port      : 443 -> unchanged (by decision)
+  row 4904  scan 71   pentest-ground.com   port 443   HIGH    
+        template  : CVE-2025-46819  (evidence: textual)
+        desc      : Redis is an open source, in-memory database that persists on disk. Ver
+        cve_id    : None -> 'CVE-2025-46819'
+        port      : 443 -> unchanged (by decision)
+  row 4932  scan 82   pentest-ground.com   port 80    HIGH    
+        template  : exposed-redis  (evidence: both)
+        desc      : Redis server without any required authentication was discovered.
+        cvss      : None -> 7.2
+        port      : 80 -> unchanged (by decision)
+  row 4942  scan 86   pentest-ground.com   port 80    HIGH    
+        template  : exposed-redis  (evidence: both)
+        desc      : Redis server without any required authentication was discovered.
+        cvss      : None -> 7.2
+        port      : 80 -> unchanged (by decision)
+  row 4981  scan 85   scanme.nmap.org      port 80    MEDIUM  
+        template  : CVE-2023-48795  (evidence: positional)
+        desc      : The SSH transport protocol with certain OpenSSH extensions, found in O
+        cve_id    : 'cve-2023-48795' -> 'CVE-2023-48795'
+        cvss      : None -> 5.9
+        port      : 80 -> unchanged (by decision)
+  row 5156  scan 90   172.28.0.20          port 80    MEDIUM  
+        template  : configuration-listing  (evidence: positional)
+        desc      : Listing of sensitive configuration files containing items such as user
+        cvss      : None -> 5.3
+        port      : 80 -> unchanged (by decision)
+  row 5261  scan 111  pentest-ground.com   port 80    HIGH    
+        template  : CVE-2025-46819  (evidence: both)
+        desc      : Redis is an open source, in-memory database that persists on disk. Ver
+        cve_id    : None -> 'CVE-2025-46819'
+        port      : 80 -> unchanged (by decision)
+  row 5262  scan 111  pentest-ground.com   port 80    CRITICAL
+        template  : CVE-2025-49844  (evidence: both)
+        desc      : Redis is an open source, in-memory database that persists on disk. Ver
+        cve_id    : None -> 'CVE-2025-49844'
+        port      : 80 -> unchanged (by decision)
+  row 5263  scan 111  pentest-ground.com   port 80    HIGH    
+        template  : CVE-2025-46818  (evidence: both)
+        desc      : Redis is an open source, in-memory database that persists on disk. Ver
+        cve_id    : None -> 'CVE-2025-46818'
+        port      : 80 -> unchanged (by decision)
+  row 5264  scan 111  pentest-ground.com   port 80    CRITICAL
+        template  : CVE-2025-46817  (evidence: both)
+        desc      : Redis is an open source, in-memory database that persists on disk. Ver
+        cve_id    : None -> 'CVE-2025-46817'
+        port      : 80 -> unchanged (by decision)
+  row 5266  scan 111  pentest-ground.com   port 80    HIGH    
+        template  : exposed-redis  (evidence: both)
+        desc      : Redis server without any required authentication was discovered.
+        cvss      : None -> 7.2
+        port      : 80 -> unchanged (by decision)
+  row 5310  scan 112  172.28.0.20          port 80    MEDIUM  
+        template  : configuration-listing  (evidence: positional)
+        desc      : Listing of sensitive configuration files containing items such as user
+        cvss      : None -> 5.3
+        port      : 80 -> unchanged (by decision)
+  row 5396  scan 115  scanme.nmap.org      port 80    MEDIUM  
+        template  : CVE-2023-48795  (evidence: positional)
+        desc      : The SSH transport protocol with certain OpenSSH extensions, found in O
+        cve_id    : 'cve-2023-48795' -> 'CVE-2023-48795'
+        cvss      : None -> 5.9
+        port      : 80 -> unchanged (by decision)
+  row 5408  scan 117  pentest-ground.com   port 80    CRITICAL
+        template  : CVE-2025-46817  (evidence: both)
+        desc      : Redis is an open source, in-memory database that persists on disk. Ver
+        cve_id    : None -> 'CVE-2025-46817'
+        port      : 80 -> unchanged (by decision)
+  row 5409  scan 117  pentest-ground.com   port 80    CRITICAL
+        template  : CVE-2025-49844  (evidence: both)
+        desc      : Redis is an open source, in-memory database that persists on disk. Ver
+        cve_id    : None -> 'CVE-2025-49844'
+        port      : 80 -> unchanged (by decision)
+  row 5410  scan 117  pentest-ground.com   port 80    HIGH    
+        template  : CVE-2025-46818  (evidence: both)
+        desc      : Redis is an open source, in-memory database that persists on disk. Ver
+        cve_id    : None -> 'CVE-2025-46818'
+        port      : 80 -> unchanged (by decision)
+  row 5411  scan 117  pentest-ground.com   port 80    HIGH    
+        template  : CVE-2025-46819  (evidence: both)
+        desc      : Redis is an open source, in-memory database that persists on disk. Ver
+        cve_id    : None -> 'CVE-2025-46819'
+        port      : 80 -> unchanged (by decision)
+  row 5413  scan 117  pentest-ground.com   port 80    HIGH    
+        template  : exposed-redis  (evidence: both)
+        desc      : Redis server without any required authentication was discovered.
+        cvss      : None -> 7.2
+        port      : 80 -> unchanged (by decision)
+
+------------------------------------------------------------------------------
+SKIPPED ROWS (2) — left exactly as recorded
+------------------------------------------------------------------------------
+  row 5106  scan 89   template id not derivable from logs
+  row 5107  scan 89   template id not derivable from logs
+
+------------------------------------------------------------------------------
+SCANS NOT POSITIONALLY PAIRED (2)
+------------------------------------------------------------------------------
+  scan 71   11 row(s) vs 0 log event(s) in window — not paired
+  scan 89   2 row(s) vs 0 log event(s) in window — not paired
+
+--- MACHINE-READABLE REVERT DATA (JSON) ---
+{
+  "database": "/home/jafar/aegis-scanner/database/aegis.db",
+  "generated": "2026-07-25T19:23:05",
+  "changes": [
+    {
+      "row_id": 4820,
+      "scan_id": 68,
+      "target": "pentest-ground.com",
+      "profile": "quickscan",
+      "port": 80,
+      "severity": "HIGH",
+      "template_id": "CVE-2025-46819",
+      "evidence": "both",
+      "description_head": "Redis is an open source, in-memory database that persists on disk. Ver",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2025-46819",
+        "cvss": null
+      }
+    },
+    {
+      "row_id": 4821,
+      "scan_id": 68,
+      "target": "pentest-ground.com",
+      "profile": "quickscan",
+      "port": 80,
+      "severity": "HIGH",
+      "template_id": "CVE-2025-46818",
+      "evidence": "both",
+      "description_head": "Redis is an open source, in-memory database that persists on disk. Ver",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2025-46818",
+        "cvss": null
+      }
+    },
+    {
+      "row_id": 4822,
+      "scan_id": 68,
+      "target": "pentest-ground.com",
+      "profile": "quickscan",
+      "port": 80,
+      "severity": "CRITICAL",
+      "template_id": "CVE-2025-49844",
+      "evidence": "both",
+      "description_head": "Redis is an open source, in-memory database that persists on disk. Ver",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2025-49844",
+        "cvss": null
+      }
+    },
+    {
+      "row_id": 4823,
+      "scan_id": 68,
+      "target": "pentest-ground.com",
+      "profile": "quickscan",
+      "port": 80,
+      "severity": "CRITICAL",
+      "template_id": "CVE-2025-46817",
+      "evidence": "both",
+      "description_head": "Redis is an open source, in-memory database that persists on disk. Ver",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2025-46817",
+        "cvss": null
+      }
+    },
+    {
+      "row_id": 4825,
+      "scan_id": 68,
+      "target": "pentest-ground.com",
+      "profile": "quickscan",
+      "port": 80,
+      "severity": "HIGH",
+      "template_id": "exposed-redis",
+      "evidence": "both",
+      "description_head": "Redis server without any required authentication was discovered.",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": null,
+        "cvss": 7.2
+      }
+    },
+    {
+      "row_id": 4879,
+      "scan_id": 71,
+      "target": "pentest-ground.com",
+      "profile": "deepscan",
+      "port": 80,
+      "severity": "CRITICAL",
+      "template_id": "CVE-2025-46817",
+      "evidence": "textual",
+      "description_head": "Redis is an open source, in-memory database that persists on disk. Ver",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2025-46817",
+        "cvss": null
+      }
+    },
+    {
+      "row_id": 4880,
+      "scan_id": 71,
+      "target": "pentest-ground.com",
+      "profile": "deepscan",
+      "port": 80,
+      "severity": "CRITICAL",
+      "template_id": "CVE-2025-49844",
+      "evidence": "textual",
+      "description_head": "Redis is an open source, in-memory database that persists on disk. Ver",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2025-49844",
+        "cvss": null
+      }
+    },
+    {
+      "row_id": 4881,
+      "scan_id": 71,
+      "target": "pentest-ground.com",
+      "profile": "deepscan",
+      "port": 80,
+      "severity": "HIGH",
+      "template_id": "CVE-2025-46818",
+      "evidence": "textual",
+      "description_head": "Redis is an open source, in-memory database that persists on disk. Ver",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2025-46818",
+        "cvss": null
+      }
+    },
+    {
+      "row_id": 4882,
+      "scan_id": 71,
+      "target": "pentest-ground.com",
+      "profile": "deepscan",
+      "port": 80,
+      "severity": "HIGH",
+      "template_id": "CVE-2025-46819",
+      "evidence": "textual",
+      "description_head": "Redis is an open source, in-memory database that persists on disk. Ver",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2025-46819",
+        "cvss": null
+      }
+    },
+    {
+      "row_id": 4884,
+      "scan_id": 71,
+      "target": "pentest-ground.com",
+      "profile": "deepscan",
+      "port": 80,
+      "severity": "HIGH",
+      "template_id": "exposed-redis",
+      "evidence": "textual",
+      "description_head": "Redis server without any required authentication was discovered.",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": null,
+        "cvss": 7.2
+      }
+    },
+    {
+      "row_id": 4901,
+      "scan_id": 71,
+      "target": "pentest-ground.com",
+      "profile": "deepscan",
+      "port": 443,
+      "severity": "CRITICAL",
+      "template_id": "CVE-2025-49844",
+      "evidence": "textual",
+      "description_head": "Redis is an open source, in-memory database that persists on disk. Ver",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2025-49844",
+        "cvss": null
+      }
+    },
+    {
+      "row_id": 4902,
+      "scan_id": 71,
+      "target": "pentest-ground.com",
+      "profile": "deepscan",
+      "port": 443,
+      "severity": "HIGH",
+      "template_id": "CVE-2025-46818",
+      "evidence": "textual",
+      "description_head": "Redis is an open source, in-memory database that persists on disk. Ver",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2025-46818",
+        "cvss": null
+      }
+    },
+    {
+      "row_id": 4903,
+      "scan_id": 71,
+      "target": "pentest-ground.com",
+      "profile": "deepscan",
+      "port": 443,
+      "severity": "CRITICAL",
+      "template_id": "CVE-2025-46817",
+      "evidence": "textual",
+      "description_head": "Redis is an open source, in-memory database that persists on disk. Ver",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2025-46817",
+        "cvss": null
+      }
+    },
+    {
+      "row_id": 4904,
+      "scan_id": 71,
+      "target": "pentest-ground.com",
+      "profile": "deepscan",
+      "port": 443,
+      "severity": "HIGH",
+      "template_id": "CVE-2025-46819",
+      "evidence": "textual",
+      "description_head": "Redis is an open source, in-memory database that persists on disk. Ver",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2025-46819",
+        "cvss": null
+      }
+    },
+    {
+      "row_id": 4932,
+      "scan_id": 82,
+      "target": "pentest-ground.com",
+      "profile": "quickscan",
+      "port": 80,
+      "severity": "HIGH",
+      "template_id": "exposed-redis",
+      "evidence": "both",
+      "description_head": "Redis server without any required authentication was discovered.",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": null,
+        "cvss": 7.2
+      }
+    },
+    {
+      "row_id": 4942,
+      "scan_id": 86,
+      "target": "pentest-ground.com",
+      "profile": "quickscan",
+      "port": 80,
+      "severity": "HIGH",
+      "template_id": "exposed-redis",
+      "evidence": "both",
+      "description_head": "Redis server without any required authentication was discovered.",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": null,
+        "cvss": 7.2
+      }
+    },
+    {
+      "row_id": 4981,
+      "scan_id": 85,
+      "target": "scanme.nmap.org",
+      "profile": "deepscan",
+      "port": 80,
+      "severity": "MEDIUM",
+      "template_id": "CVE-2023-48795",
+      "evidence": "positional",
+      "description_head": "The SSH transport protocol with certain OpenSSH extensions, found in O",
+      "before": {
+        "cve_id": "cve-2023-48795",
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2023-48795",
+        "cvss": 5.9
+      }
+    },
+    {
+      "row_id": 5156,
+      "scan_id": 90,
+      "target": "172.28.0.20",
+      "profile": "deepscan",
+      "port": 80,
+      "severity": "MEDIUM",
+      "template_id": "configuration-listing",
+      "evidence": "positional",
+      "description_head": "Listing of sensitive configuration files containing items such as user",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": null,
+        "cvss": 5.3
+      }
+    },
+    {
+      "row_id": 5261,
+      "scan_id": 111,
+      "target": "pentest-ground.com",
+      "profile": "quickscan",
+      "port": 80,
+      "severity": "HIGH",
+      "template_id": "CVE-2025-46819",
+      "evidence": "both",
+      "description_head": "Redis is an open source, in-memory database that persists on disk. Ver",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2025-46819",
+        "cvss": null
+      }
+    },
+    {
+      "row_id": 5262,
+      "scan_id": 111,
+      "target": "pentest-ground.com",
+      "profile": "quickscan",
+      "port": 80,
+      "severity": "CRITICAL",
+      "template_id": "CVE-2025-49844",
+      "evidence": "both",
+      "description_head": "Redis is an open source, in-memory database that persists on disk. Ver",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2025-49844",
+        "cvss": null
+      }
+    },
+    {
+      "row_id": 5263,
+      "scan_id": 111,
+      "target": "pentest-ground.com",
+      "profile": "quickscan",
+      "port": 80,
+      "severity": "HIGH",
+      "template_id": "CVE-2025-46818",
+      "evidence": "both",
+      "description_head": "Redis is an open source, in-memory database that persists on disk. Ver",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2025-46818",
+        "cvss": null
+      }
+    },
+    {
+      "row_id": 5264,
+      "scan_id": 111,
+      "target": "pentest-ground.com",
+      "profile": "quickscan",
+      "port": 80,
+      "severity": "CRITICAL",
+      "template_id": "CVE-2025-46817",
+      "evidence": "both",
+      "description_head": "Redis is an open source, in-memory database that persists on disk. Ver",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2025-46817",
+        "cvss": null
+      }
+    },
+    {
+      "row_id": 5266,
+      "scan_id": 111,
+      "target": "pentest-ground.com",
+      "profile": "quickscan",
+      "port": 80,
+      "severity": "HIGH",
+      "template_id": "exposed-redis",
+      "evidence": "both",
+      "description_head": "Redis server without any required authentication was discovered.",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": null,
+        "cvss": 7.2
+      }
+    },
+    {
+      "row_id": 5310,
+      "scan_id": 112,
+      "target": "172.28.0.20",
+      "profile": "deepscan",
+      "port": 80,
+      "severity": "MEDIUM",
+      "template_id": "configuration-listing",
+      "evidence": "positional",
+      "description_head": "Listing of sensitive configuration files containing items such as user",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": null,
+        "cvss": 5.3
+      }
+    },
+    {
+      "row_id": 5396,
+      "scan_id": 115,
+      "target": "scanme.nmap.org",
+      "profile": "deepscan",
+      "port": 80,
+      "severity": "MEDIUM",
+      "template_id": "CVE-2023-48795",
+      "evidence": "positional",
+      "description_head": "The SSH transport protocol with certain OpenSSH extensions, found in O",
+      "before": {
+        "cve_id": "cve-2023-48795",
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2023-48795",
+        "cvss": 5.9
+      }
+    },
+    {
+      "row_id": 5408,
+      "scan_id": 117,
+      "target": "pentest-ground.com",
+      "profile": "quickscan",
+      "port": 80,
+      "severity": "CRITICAL",
+      "template_id": "CVE-2025-46817",
+      "evidence": "both",
+      "description_head": "Redis is an open source, in-memory database that persists on disk. Ver",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2025-46817",
+        "cvss": null
+      }
+    },
+    {
+      "row_id": 5409,
+      "scan_id": 117,
+      "target": "pentest-ground.com",
+      "profile": "quickscan",
+      "port": 80,
+      "severity": "CRITICAL",
+      "template_id": "CVE-2025-49844",
+      "evidence": "both",
+      "description_head": "Redis is an open source, in-memory database that persists on disk. Ver",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2025-49844",
+        "cvss": null
+      }
+    },
+    {
+      "row_id": 5410,
+      "scan_id": 117,
+      "target": "pentest-ground.com",
+      "profile": "quickscan",
+      "port": 80,
+      "severity": "HIGH",
+      "template_id": "CVE-2025-46818",
+      "evidence": "both",
+      "description_head": "Redis is an open source, in-memory database that persists on disk. Ver",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2025-46818",
+        "cvss": null
+      }
+    },
+    {
+      "row_id": 5411,
+      "scan_id": 117,
+      "target": "pentest-ground.com",
+      "profile": "quickscan",
+      "port": 80,
+      "severity": "HIGH",
+      "template_id": "CVE-2025-46819",
+      "evidence": "both",
+      "description_head": "Redis is an open source, in-memory database that persists on disk. Ver",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": "CVE-2025-46819",
+        "cvss": null
+      }
+    },
+    {
+      "row_id": 5413,
+      "scan_id": 117,
+      "target": "pentest-ground.com",
+      "profile": "quickscan",
+      "port": 80,
+      "severity": "HIGH",
+      "template_id": "exposed-redis",
+      "evidence": "both",
+      "description_head": "Redis server without any required authentication was discovered.",
+      "before": {
+        "cve_id": null,
+        "cvss": null
+      },
+      "after": {
+        "cve_id": null,
+        "cvss": 7.2
+      }
+    }
+  ]
+}

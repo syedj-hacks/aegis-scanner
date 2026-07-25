@@ -37,6 +37,7 @@ from urllib.parse import quote
 from modules.utils.display import print_panel, print_warning
 from modules.utils.logger import get_logger
 from modules.enrichment.severity import SEVERITY_LEVELS
+from modules.reporting.summary import profile_scope_note
 
 _FALLBACK_TARGET = "reporting"
 
@@ -244,6 +245,14 @@ def print_report_summary(target: str, profile: str, scan_id, summary: dict,
                 lines.append(f"[bold]{label}:[/bold] {file_link(path)}")
             else:
                 lines.append(f"[bold]{label}:[/bold] [red]not generated — see errors above[/red]")
+
+        # The same scope statement the report itself carries, from the same
+        # source. The operator reading this panel has usually not opened the
+        # report yet, and this is the moment where "6 MEDIUM, 24 LOW" could
+        # otherwise be read as the whole story for the host.
+        scope_note = profile_scope_note(profile)
+        if scope_note:
+            lines.append(f"[bold]Scope:[/bold] {scope_note}")
 
         # A bordered panel rather than loose lines: this block has to be
         # findable in a scrollback holding hundreds of tool-output lines,

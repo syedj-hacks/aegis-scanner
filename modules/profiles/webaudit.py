@@ -115,12 +115,56 @@ def _findings_from_headers(header_result: dict) -> list:
 
 
 def _findings_from_nikto(nikto_result: dict) -> list:
+    """nikto's own per-finding detail, not just its description text.
+
+    endpoint  — the scheme-qualified URL of the URI nikto flagged. nikto is
+                given the scheme as an argument, so http-vs-https is known
+                here for certain rather than assumed downstream. Findings
+                nikto reported without a URI (e.g. "Apache/2.4.25 appears to
+                be outdated") get the base URL, which is still true of them.
+    reference — nikto's "See: <url>" citation. Parsed since the wrapper was
+                written and dropped at insert until findings gained a
+                reference column.
+    product/version — nikto's reported Server banner, split on "/". The
+                whole scan shares one banner because it is one server.
+    """
     port = nikto_result.get("port")
-    return [
-        {"type": "nikto_finding", "port": port,
-         "description": f["description"], "reference": f["reference"]}
-        for f in nikto_result.get("findings") or []
-    ]
+    base_url = (nikto_result.get("base_url") or "").rstrip("/")
+    product = nikto_result.get("product") or None
+    version = nikto_result.get("version") or None
+
+    findings = []
+    for f in nikto_result.get("findings") or []:
+        path = f.get("path") or ""
+        endpoint = f"{base_url}{path}" if base_url else (path or None)
+        findings.append({
+            "type": "nikto_finding", "port": port,
+            "description": f["description"],
+            "reference": f.get("reference") or None,
+            "endpoint": endpoint or None,
+            "product": product,
+            "version": version,
+        })
+    return findings
+
+
+def _path_description(entry: dict, source: str = None) -> str:
+    """"Discovered path /admin (HTTP 301, 312 bytes) -> /admin/".
+
+    Size and redirect target are gobuster's/dirb's own output. They are
+    appended only when the tool actually reported them: a 0-byte page and a
+    page whose size the tool never printed are different facts, and writing
+    "0 bytes" for the second would state something the scan did not observe.
+    """
+    bits = [f"HTTP {entry.get('status_code')}"]
+    if entry.get("size") is not None:
+        bits.append(f"{entry['size']} bytes")
+    if source:
+        bits.append(f"via {source}")
+    text = f"Discovered path {entry.get('path')} ({', '.join(bits)})"
+    if entry.get("redirect"):
+        text += f" -> {entry['redirect']}"
+    return text
 
 
 def _findings_from_gobuster(gobuster_result: dict) -> list:
@@ -129,7 +173,8 @@ def _findings_from_gobuster(gobuster_result: dict) -> list:
         {
             "type": "discovered_path", "port": port,
             "path": entry["path"], "status_code": entry["status_code"],
-            "description": f"Discovered path {entry['path']} (HTTP {entry['status_code']})",
+            "description": _path_description(entry),
+            "endpoint": entry.get("url"),
         }
         for entry in gobuster_result.get("discovered_paths") or []
     ]
@@ -147,7 +192,8 @@ def _findings_from_dirb(dirb_result: dict) -> list:
         {
             "type": "discovered_path", "port": port,
             "path": entry["path"], "status_code": entry["status_code"],
-            "description": f"Discovered path {entry['path']} (HTTP {entry['status_code']}, via dirb)",
+            "description": _path_description(entry, source="dirb"),
+            "endpoint": entry.get("url"),
         }
         for entry in dirb_result.get("discovered_paths") or []
     ]

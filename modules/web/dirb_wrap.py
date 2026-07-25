@@ -126,12 +126,17 @@ def _path_from_url(url: str, base_url: str) -> str:
 def _parse_dirb_output(stdout: str, base_url: str) -> list:
     """
     Parse dirb's result lines into a list of:
-        {path: str, status_code: int}
+        {path, status_code, size, url}
 
     Directory hits (which dirb reports without a status code) are recorded
     with status_code 301, matching how gobuster reports a bare directory
     redirect — this keeps severity heuristics (which look at the path, not
-    the code) consistent across both sources.
+    the code) consistent across both sources. Those lines carry no SIZE
+    either, so size stays None for them rather than being invented as 0.
+
+    dirb prints SIZE on every "+ <url> (CODE:n|SIZE:n)" hit and _FOUND_LINE
+    has always captured it; it was simply dropped when the dict was built.
+    url is dirb's own absolute URL, which carries the scheme and port.
     """
     discovered = []
     seen = set()
@@ -143,22 +148,35 @@ def _parse_dirb_output(stdout: str, base_url: str) -> list:
 
         match = _FOUND_LINE.match(line)
         if match:
-            path = _path_from_url(match.group("url"), base_url)
+            found_url = match.group("url")
+            path = _path_from_url(found_url, base_url)
             try:
                 status_code = int(match.group("code"))
             except (TypeError, ValueError):
                 continue
+            try:
+                size = int(match.group("size"))
+            except (TypeError, ValueError):
+                size = None
         else:
             dir_match = _DIR_LINE.match(line)
             if not dir_match:
                 continue
-            path = _path_from_url(dir_match.group("url"), base_url)
+            found_url = dir_match.group("url")
+            path = _path_from_url(found_url, base_url)
             status_code = 301
+            size = None
 
         if path in seen:
             continue
         seen.add(path)
-        discovered.append({"path": path, "status_code": status_code})
+        discovered.append({
+            "path": path,
+            "status_code": status_code,
+            "size": size,
+            "redirect": None,   # dirb never reports a redirect target
+            "url": found_url or None,
+        })
 
     discovered.sort(key=lambda d: d["path"])
     return discovered
@@ -184,7 +202,12 @@ def run_dirb(target: str, port: int = 80, use_https: bool = False,
     dict:
         target            : str
         port              : int
-        discovered_paths  : list[dict]  {path, status_code}
+        discovered_paths  : list[dict]  {path, status_code, size, redirect,
+                                        url}  size is None on directory
+                                        hits, which dirb reports without
+                                        one; redirect is always None —
+                                        dirb does not report redirect
+                                        targets at all
         raw_output        : str         dirb's stdout
         error             : str | None  human-readable failure reason
 
@@ -250,6 +273,8 @@ def run_dirb(target: str, port: int = 80, use_https: bool = False,
                 "port": port,
                 "path": entry["path"],
                 "status_code": entry["status_code"],
+                "size": entry["size"],
+                "url": entry["url"],
                 "source": "dirb",
             })
             print_success(f"[Dirb] {entry['path']} ({entry['status_code']})")

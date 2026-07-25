@@ -75,6 +75,26 @@ _FAILURE_MARKERS = (
 # Splits "description. See: https://..." into its two halves.
 _REFERENCE_SPLIT = re.compile(r"\s+See:\s+", re.IGNORECASE)
 
+# nikto prefixes each finding with its own test id, and (for most tests) the
+# URI the finding concerns. Verified against real nikto 2.6.0 output — see
+# smoke_test8.txt §3.1:
+#     + [013587] /: Suggested security header missing: referrer-policy. See: ...
+#     + [750500] /config/: Directory indexing found.
+#     + [600050] Apache/2.4.25 appears to be outdated (current is at least ...)
+#     + [95] /: Cookie PHPSESSID created without the httponly flag. See: ...
+# Both are real, tool-reported detail that was previously left buried in the
+# description string. The id width varies (95 vs 013587), and the third
+# example shows the path is genuinely absent on some tests — so the path
+# group only matches a leading "/", and stays empty rather than
+# misattributing "Apache/2.4.25 appears to be outdated" as a URI.
+_TEST_ID_PREFIX = re.compile(r"^\[(?P<test_id>\d+)\]\s*")
+_PATH_PREFIX = re.compile(r"^(?P<path>/\S*):\s+")
+
+# "+ Server: Apache/2.4.25 (Debian)" is filtered out of the findings list as
+# metadata, but it is nikto's own observation of the server banner and the
+# only place in this wrapper's output where the product/version appears.
+_SERVER_LINE = re.compile(r"^Server:\s*(?P<server>.+?)\s*$")
+
 
 def _strip_scheme(target: str) -> str:
     """
@@ -103,10 +123,52 @@ def _is_metadata(text: str) -> bool:
     return any(pattern.match(text) for pattern in _METADATA_PATTERNS)
 
 
+def _server_banner(stdout: str) -> str:
+    """nikto's reported server banner, or "" if it printed none.
+
+    Some targets return no Server header at all, and nikto then prints
+    "Server: No banner retrieved" — which is nikto telling us it did not
+    determine one, not a product called "No banner retrieved".
+    """
+    for raw_line in (stdout or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("+ "):
+            continue
+        match = _SERVER_LINE.match(line[2:].strip())
+        if match:
+            banner = match.group("server").strip()
+            if banner.lower().startswith("no banner"):
+                return ""
+            return banner
+    return ""
+
+
+def _split_server_banner(banner: str) -> tuple:
+    """"Apache/2.4.25 (Debian)" -> ("Apache", "2.4.25 (Debian)").
+
+    Only splits on the "product/version" form nikto actually emits. A banner
+    with no slash is reported as the product with no version, rather than
+    being sliced at a guess.
+    """
+    if not banner:
+        return "", ""
+    if "/" not in banner:
+        return banner, ""
+    product, _, version = banner.partition("/")
+    return product.strip(), version.strip()
+
+
 def _parse_nikto_output(stdout: str) -> list:
     """
     Parse nikto's plain-text report into a list of:
-        {description: str, reference: str}
+        {description, reference, test_id, path}
+
+    test_id and path are nikto's own, pulled off the front of the finding
+    line; both are "" when nikto printed neither. `description` deliberately
+    keeps the whole original text, id and path included: it is what
+    summary.finding_identifier() and the dedup key are built from, and
+    rewriting it would silently change the identity of every historical
+    nikto finding.
 
     Nikto marks every reported item with a leading "+ ". Finding lines look
     like:
@@ -140,9 +202,19 @@ def _parse_nikto_output(stdout: str) -> list:
             continue
         seen.add(description)
 
+        remainder = description
+        id_match = _TEST_ID_PREFIX.match(remainder)
+        test_id = id_match.group("test_id") if id_match else ""
+        if id_match:
+            remainder = remainder[id_match.end():]
+        path_match = _PATH_PREFIX.match(remainder)
+        path = path_match.group("path") if path_match else ""
+
         findings.append({
             "description": description,
             "reference": reference,
+            "test_id": test_id,
+            "path": path,
         })
 
     return findings
@@ -176,8 +248,14 @@ def run_nikto(target: str, port: int = 80, use_https: bool = False) -> dict:
     dict:
         target     : str
         port       : int
-        findings   : list[dict]  {description, reference}
-                                 reference is "" when nikto cited no URL
+        base_url   : str         scheme://host:port nikto was pointed at
+        server     : str         nikto's reported server banner, "" if none
+        product    : str         banner split at "/", "" if no banner
+        version    : str         ditto; "" when the banner carried no version
+        findings   : list[dict]  {description, reference, test_id, path}
+                                 reference is "" when nikto cited no URL;
+                                 test_id/path are "" when nikto printed
+                                 neither (some tests carry no URI)
         raw_output : str         nikto's full stdout, for the report appendix
         error      : str | None  human-readable failure reason, if any
 
@@ -188,6 +266,10 @@ def run_nikto(target: str, port: int = 80, use_https: bool = False) -> dict:
         "tool": "nikto",
         "target": target,
         "port": port,
+        "base_url": "",
+        "server": "",
+        "product": "",
+        "version": "",
         "findings": [],
         "raw_output": "",
         "error": None,
@@ -212,6 +294,7 @@ def run_nikto(target: str, port: int = 80, use_https: bool = False) -> dict:
         command.append("-ssl")
 
     scheme = "https" if use_https else "http"
+    result["base_url"] = f"{scheme}://{host}:{port}"
     print_info(f"[Nikto] Scanning {scheme}://{host}:{port} (maxtime {maxtime}s)")
 
     # run_tool() applies config.get_timeout('nikto') itself — no timeout
@@ -239,6 +322,11 @@ def run_nikto(target: str, port: int = 80, use_https: bool = False) -> dict:
     findings = _parse_nikto_output(result["raw_output"])
     result["findings"] = findings
 
+    result["server"] = _server_banner(result["raw_output"])
+    result["product"], result["version"] = _split_server_banner(result["server"])
+    if result["server"]:
+        print_info(f"[Nikto] {host}:{port} — server banner: {result['server']}")
+
     if findings:
         for f in findings:
             log_finding(target, {
@@ -246,6 +334,8 @@ def run_nikto(target: str, port: int = 80, use_https: bool = False) -> dict:
                 "port": port,
                 "description": f["description"],
                 "reference": f["reference"],
+                "test_id": f["test_id"],
+                "path": f["path"],
             })
             print_success(f"[Nikto] {f['description']}")
         print_info(f"[Nikto] {host}:{port} — {len(findings)} finding(s)")

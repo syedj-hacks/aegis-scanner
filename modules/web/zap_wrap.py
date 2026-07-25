@@ -70,23 +70,93 @@ def _build_url(target: str, port: int, use_https: bool) -> str:
     return f"{scheme}://{host}"
 
 
+def _clean(value) -> str:
+    """ZAP returns "" for fields it has nothing for; normalise to a stripped
+    string so the caller can test one way.
+
+    Internal newlines are collapsed to single spaces. ZAP's `reference` is a
+    newline-separated LIST of URLs, and its descriptions wrap across lines;
+    left as-is those newlines land in the middle of a report's field layout
+    and break the finding card apart. Nothing is dropped — the URLs are
+    joined, not truncated.
+    """
+    if value is None:
+        return ""
+    return " ".join(str(value).split())
+
+
+def _cwe_id(alert: dict) -> str:
+    """ZAP's cweid, or "" when it does not apply.
+
+    ZAP uses -1 (and occasionally 0) as its own "not applicable" sentinel —
+    verified against real alerts, where Session Management Response
+    Identified carries cweid -1. Rendering that as "CWE -1" would invent a
+    weakness class that does not exist, so the sentinel is dropped and the
+    field reports as undetermined instead.
+    """
+    raw = _clean(alert.get("cweid"))
+    if not raw:
+        return ""
+    try:
+        if int(raw) <= 0:
+            return ""
+    except ValueError:
+        return ""
+    return f"CWE-{raw}"
+
+
 def _dedupe_alerts(alerts: list) -> list:
+    """Collapse ZAP's per-URL alerts to one row per (rule, name).
+
+    ZAP reports the same rule once per matching URL, so a 25-alert response
+    is commonly 8 distinct issues. The first occurrence's URL/evidence/param
+    are kept as the exemplar and the number of affected URLs is recorded, so
+    collapsing does not hide the breadth of a finding.
+
+    Everything carried here is ZAP's own output. Fields ZAP left empty stay
+    empty rather than being filled with a plausible-looking default: for a
+    passive baseline scan `attack` is empty on every alert (there are no
+    attack payloads to report), and `param`/`evidence` are populated on only
+    some rules — verified against a real 25-alert run, see smoke_test8 §3.1.
+    """
     findings = []
-    seen = set()
+    seen = {}
     for a in alerts:
         risk = a.get("risk", "Informational")
         rule_id = str(a.get("pluginId", "0"))
         name = (a.get("alert") or "unknown").strip()
         key = (rule_id, name)
         if key in seen:
+            entry = seen[key]
+            url = _clean(a.get("url"))
+            if url and url not in entry["_urls"]:
+                entry["_urls"].append(url)
+                entry["url_count"] = len(entry["_urls"])
             continue
-        seen.add(key)
-        findings.append({
+        url = _clean(a.get("url"))
+        entry = {
             "rule_id": rule_id,
             "name": name,
             "status": _RISK_STATUS.get(risk, "INFO"),
             "severity": _RISK_SEVERITY.get(risk, "LOW"),
-        })
+            "confidence": _clean(a.get("confidence")),
+            "description": _clean(a.get("description")),
+            "solution": _clean(a.get("solution")),
+            "reference": _clean(a.get("reference")),
+            "url": url,
+            "param": _clean(a.get("param")),
+            "evidence": _clean(a.get("evidence")),
+            "attack": _clean(a.get("attack")),
+            "method": _clean(a.get("method")),
+            "cwe": _cwe_id(a),
+            "url_count": 1 if url else 0,
+            "_urls": [url] if url else [],
+        }
+        seen[key] = entry
+        findings.append(entry)
+
+    for entry in findings:
+        entry.pop("_urls", None)
     return findings
 
 
@@ -106,7 +176,14 @@ def run_zap_baseline(target: str, port: int = 80, use_https: bool = False) -> di
     dict:
         target      : str
         port        : int
-        findings    : list[dict]  {rule_id, name, status, severity}
+        findings    : list[dict]  {rule_id, name, status, severity,
+                                  confidence, description, solution,
+                                  reference, url, param, evidence, attack,
+                                  method, cwe, url_count}
+                                  Every one of these is ZAP's own output.
+                                  Fields ZAP supplied nothing for are ""
+                                  and are reported as undetermined rather
+                                  than guessed.
         raw_output  : str         short human-readable summary
         error       : str | None  human-readable failure reason, if any
 
@@ -206,6 +283,8 @@ def run_zap_baseline(target: str, port: int = 80, use_https: bool = False) -> di
                 log_finding(target, {
                     "type": "zap_finding", "port": port,
                     "rule_id": f["rule_id"], "name": f["name"], "status": f["status"],
+                    "url": f["url"], "param": f["param"], "cwe": f["cwe"],
+                    "url_count": f["url_count"],
                 })
                 print_success(f"[ZAP] [{f['status']}] {f['name']} ({f['rule_id']})")
             print_info(f"[ZAP] {url} — {len(findings)} alert(s)")

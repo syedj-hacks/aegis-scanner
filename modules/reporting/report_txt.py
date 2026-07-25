@@ -35,6 +35,7 @@ from modules.enrichment.severity import SEVERITY_LEVELS
 from modules.reporting.summary import (
     build_summary, summary_stats, injection_findings, INJECTION_FINDING_TYPES,
     field_display, service_display, cvss_display, distinct_identifiers,
+    profile_scope_note,
 )
 
 # Report width. 78 keeps the whole report inside an 80-column terminal when
@@ -92,6 +93,28 @@ def _wrap(text: str, indent: int) -> list:
 
 def _field(label: str, value) -> str:
     return f"    {label:<{_LABEL_WIDTH}}: {value}"
+
+
+# 4 spaces of indent + the label column + ": " — what _field() spends before
+# the value starts, and therefore how much of the 78-column width is left.
+_FIELD_VALUE_WIDTH = _WIDTH - (4 + _LABEL_WIDTH + 2)
+
+
+def _fit(value) -> str:
+    """One-line field value that cannot overflow the report width.
+
+    Endpoint and Reference carry URLs, which are long, and ZAP's reference is
+    several URLs at once. Wrapping them onto continuation lines would break
+    the aligned label/value layout of the finding card, so they are elided in
+    the middle: the host and the tail of the path both survive, which is what
+    makes a truncated URL still recognisable.
+    """
+    text = " ".join(str(value or "").split())
+    if len(text) <= _FIELD_VALUE_WIDTH:
+        return text
+    keep = _FIELD_VALUE_WIDTH - 3
+    head = keep // 2
+    return f"{text[:head]}...{text[len(text) - (keep - head):]}"
 
 
 # Terminal table cells are narrow, so the console gets an abbreviated form
@@ -152,7 +175,20 @@ def _header_block(summary: dict) -> list:
         _field("Scan run", _format_timestamp(metadata.get("timestamp"))),
         _field("Report built", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         "",
-    ]
+    ] + _scope_note_block(metadata.get("profile"))
+
+
+def _scope_note_block(profile) -> list:
+    """The profile's scope statement, if it has one.
+
+    Placed directly under the header rather than at the end: a reader who
+    stops after the severity summary is exactly the reader who most needs to
+    know what the profile did not look at.
+    """
+    note = profile_scope_note(profile, labelled=True)
+    if not note:
+        return []
+    return _wrap(note, 2) + [""]
 
 
 def _summary_block(summary: dict) -> list:
@@ -299,6 +335,13 @@ def _detail_block(summary: dict) -> list:
             _field("CVE", field_display(finding, "cve_id")),
             _field("CVSS", cvss_display(finding)),
             _field("Severity", severity),
+            # Endpoint and Reference are populated at the source by the web
+            # wrappers (gobuster/dirb URL, nikto URI + "See:" citation, ZAP
+            # url + reference). They go through field_display() like every
+            # other cell, so a host-level finding says "N/A (host-level
+            # finding)" rather than showing a blank where a URL would be.
+            _field("Endpoint", _fit(field_display(finding, "endpoint"))),
+            _field("Reference", _fit(field_display(finding, "reference"))),
             "",
             f"    {'Description':<{_LABEL_WIDTH}}:",
         ]

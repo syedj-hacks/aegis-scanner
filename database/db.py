@@ -59,10 +59,18 @@ def init_db():
     # exploitation. Every other finding shape leaves these NULL — they are
     # only read by the report's dedicated injection section, which filters
     # on finding_type.
+    # reference was added last, for the web wrappers' field-population pass:
+    # nikto prints "... See: <url>", ZAP returns a `reference` field on every
+    # alert, and wpscan cites an advisory URL. All three were parsed by their
+    # wrappers and then silently dropped at insert, because there was no
+    # column to put them in. They are citations for a finding rather than
+    # evidence of it, so they get their own column instead of being folded
+    # into evidence/remediation.
     cur.execute("PRAGMA table_info(findings)")
     existing_columns = {row[1] for row in cur.fetchall()}
     for column in ("description", "remediation", "finding_type", "product",
-                   "parameter", "payload", "evidence", "endpoint"):
+                   "parameter", "payload", "evidence", "endpoint",
+                   "reference"):
         if column not in existing_columns:
             cur.execute(f"ALTER TABLE findings ADD COLUMN {column} TEXT")
 
@@ -107,8 +115,8 @@ def insert_finding(scan_id: int, finding: dict):
         """INSERT INTO findings
            (scan_id, port, service, version, cve_id, cvss, severity,
             description, remediation, finding_type, product,
-            parameter, payload, evidence, endpoint)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            parameter, payload, evidence, endpoint, reference)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             scan_id,
             finding.get("port"),
@@ -125,6 +133,7 @@ def insert_finding(scan_id: int, finding: dict):
             finding.get("payload"),
             finding.get("evidence"),
             finding.get("endpoint"),
+            finding.get("reference"),
         ),
     )
     conn.commit()

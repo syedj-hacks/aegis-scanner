@@ -334,7 +334,13 @@ def _finding_type(finding: dict) -> str:
     log_finding) wins; otherwise the shape is sniffed from the keys those
     modules actually return.
     """
-    declared = str(finding.get("type") or "").strip().lower()
+    # Also honours `finding_type`, the column db.py persists under, so a row
+    # read back from SQLite is not put through shape-sniffing when it
+    # already declares its kind. Kept identical to
+    # remediation._finding_kind() on purpose — the two contracts are
+    # documented as the same.
+    declared = str(finding.get("type") or finding.get("finding_type")
+                   or "").strip().lower()
     if declared:
         return declared
 
@@ -344,7 +350,9 @@ def _finding_type(finding: dict) -> str:
         return "nmap_script"          # {port, script_id, output}
     if finding.get("header") or finding.get("missing_header"):
         return "missing_security_header"
-    if finding.get("description") is not None and "reference" in finding:
+    # Truthy reference, not just the key existing — see the same guard in
+    # remediation._finding_kind(): every SQLite row carries every column.
+    if finding.get("description") is not None and finding.get("reference"):
         return "nikto_finding"          # {description, reference}
     if finding.get("path"):
         return "discovered_path"        # {path, status_code}
