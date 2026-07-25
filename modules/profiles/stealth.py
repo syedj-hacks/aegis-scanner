@@ -29,7 +29,8 @@ from modules.recon.dns import resolve_dns
 from modules.scanning.port_scanner import scan_ports
 from database.db import insert_scan, insert_findings_bulk
 from modules.profiles._common import (
-    warn_unavailable_tools, count_and_report_tool_failures, finalise_reports,
+    warn_unavailable_tools, count_and_report_tool_failures, persist_tool_run,
+    finalise_reports,
 )
 
 PROFILE_NAME = "stealthscan"
@@ -94,6 +95,7 @@ def run_stealthscan(target: str, non_interactive: bool = False):
         "tools_failed": count_and_report_tool_failures(target, tool_results),
         "tools_skipped": sum(1 for r in tool_results if r.get("skipped")),
     }
+    persist_tool_run(scan_id, tool_results)
     log_scan_end(target, stats)
 
     # Writes both reports, prunes the capped history and prints the

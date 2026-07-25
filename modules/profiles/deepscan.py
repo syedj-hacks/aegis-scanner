@@ -52,7 +52,8 @@ from modules.utils.display import (
 from modules.utils.logger import log_scan_start, log_scan_end, log_tool_failure, get_logger
 from modules.profiles._common import (
     warn_unavailable_tools, GLOBAL_AVAILABLE_TOOLS,
-    count_and_report_tool_failures, web_param_candidates, finalise_reports,
+    count_and_report_tool_failures, persist_tool_run, web_param_candidates,
+    finalise_reports,
     nuclei_description, nuclei_port, nuclei_service, named_description,
 )
 from modules.recon.dns import resolve_dns
@@ -907,6 +908,10 @@ def run_deepscan(target: str, non_interactive: bool = False):
         "tools_failed": count_and_report_tool_failures(target, tool_results),
         "tools_skipped": sum(1 for r in tool_results if r.get("skipped")),
     }
+    # Persist the same tool_results the stats above summarise, so the
+    # attribution check can later ask "did this tool actually run on THIS
+    # scan" instead of only "does this profile wire it in".
+    persist_tool_run(scan_id, tool_results)
     log_scan_end(target, stats)
 
     # --- Reporting -------------------------------------------------

@@ -1,0 +1,328 @@
+================================================================================
+AEGIS SCANNER — SMOKE TEST REPORT #10
+The venv ZAP dependency, installed and verified through the project's own
+interpreter; and the attribution check taught to ask what actually ran on a
+scan, not merely what the profile wires in
+================================================================================
+
+1. RUN METADATA
+--------------------------------------------------------------------------------
+Date                    : 2026-07-26 (PKT)
+Target                  : 172.28.0.20   (local DVWA Docker fixture — the same
+                                         host smoke_test9 used for scan 146)
+Profiles run            : deepscan (x3, all through venv/), quickscan (x1,
+                                         through venv/)
+Invocation form         : venv/bin/python aegis.py 172.28.0.20 --profile
+                          <profile> -v [--non-interactive]
+Scans produced          : 147-150   (database now holds 148 scans total)
+Interpreter under test  : venv/bin/python  (Python 3.13.12) — the project's own
+                          virtualenv, the interpreter smoke_test9 §8 item 7
+                          flagged as running one tool short
+
+Both items in this pass were carried in from smoke_test9 §8 as OPEN, not found
+blind:
+
+  - item 7: requirements.txt lists python-owasp-zap-v2.4; the system Python
+    had it, venv/ did not. Every deepscan/webaudit run through venv/bin/python
+    silently lost ZAP and reported "tools failed: 1" — the normal invocation
+    path for anyone using the project's own virtualenv.
+
+  - item 1: attribution's TOOL PLAUSIBILITY check cross-referenced a finding
+    against the tools its PROFILE runs, because the schema stored no record of
+    which tools actually ran on a given scan. A finding credited to a tool the
+    profile wires in but that was skipped, failed, or never reached on that
+    specific run passed the check anyway.
+
+Both are now closed with live evidence: real environment checks, real scans
+through venv/, and real database rows — no mocked or assumed state. Each phase
+below was verified before the next was started.
+
+
+2. PHASE 1 — THE MISSING ZAP DEPENDENCY IN venv/
+================================================================================
+
+2.1 Confirming the state first
+--------------------------------------------------------------------------------
+  - venv/ and the system interpreter are the SAME Python: 3.13.12. So this was
+    never a version-mismatch problem; venv/ simply never had the package.
+  - `venv/bin/python -c "import zapv2"` -> ModuleNotFoundError.
+    `/usr/bin/python3 -c "import zapv2"` -> OK
+    (/usr/lib/python3/dist-packages/zapv2/__init__.py, the Debian
+    python3-zapv2 package, version 0.0.20).
+  - `venv/bin/pip list` confirmed: no zapv2, no zaproxy, no
+    python-owasp-zap-v2.4.
+  - Timeline that explains it: venv/ was built 2026-05-28; requirements.txt
+    gained the python-owasp-zap-v2.4 line 2026-07-25. install.sh's pip step
+    was simply never re-run against the existing venv after that line landed.
+
+2.2 The compatibility check the brief asked for — and what it turned up
+--------------------------------------------------------------------------------
+requirements.txt pins no version, so a fresh `pip install -r requirements.txt`
+resolves python-owasp-zap-v2.4 to its newest PyPI release, 0.1.0. Before
+installing blind, both candidate wheels were inspected:
+
+  - 0.1.0 is a 5.4 kB shim containing NO code at all. Its METADATA says
+    "python-owasp-zap-v2.4 is now zaproxy" and it carries a single
+    Requires-Dist: zaproxy. The package was renamed.
+  - The real code now lives in `zaproxy` (0.6.0, 74 kB, 45 modules). It still
+    ships the `zapv2` package and the `ZAPv2` class, and — checked module by
+    module against every call modules/web/zap_wrap.py makes — keeps the exact
+    surface the wrapper uses: ZAPv2(proxies=, apikey=), core.version,
+    core.alerts(baseurl=), core.shutdown, spider.scan/status,
+    pscan.records_to_scan. Requires-Python >=3.9,<4.0, satisfied by 3.13.12.
+
+So the honest end state is: installing python-owasp-zap-v2.4 pulls in the shim
+which pulls in `zaproxy`, and `zaproxy` is what provides the importable
+`zapv2`. That is why the setup.py verification (§2.4) imports `zapv2` rather
+than trusting the shim's presence.
+
+2.3 Installing into venv/ (venv/ only — system Python untouched)
+--------------------------------------------------------------------------------
+`venv/bin/pip install -r requirements.txt` installed, as predicted:
+    python-owasp-zap-v2.4-0.1.0  zaproxy-0.6.0  six-1.17.0
+into venv/lib/python3.13/site-packages only. The system interpreter's
+/usr/lib/python3/dist-packages was not touched. Post-install:
+    venv/bin/python -c "import zapv2; from zapv2 import ZAPv2" -> OK
+and every attribute the wrapper calls verified present on a constructed client.
+
+2.4 The documented-setup gap (Phase 1 step 4)
+--------------------------------------------------------------------------------
+install.sh is correct: its pip step installs requirements.txt into the venv,
+which now resolves ZAP properly. The recurrence risk was elsewhere and is the
+more interesting finding:
+
+  setup.py's post-install verifier — REQUIRED_MODULES, the check whose entire
+  job is to catch a dependency that did not install — omitted zapv2. So a venv
+  missing the ZAP client passed verification cleanly while every deepscan lost
+  ZAP. The one check meant to catch this could not see it.
+
+Fixed: zapv2 -> python-owasp-zap-v2.4 added to REQUIRED_MODULES (setup.py). It
+imports `zapv2` (the real importable end state, past the shim). Verified both
+directions:
+    - fixed venv: check_dependencies() -> True, "All Python dependencies
+      importable".
+    - zapv2 forced unimportable: -> False, "Missing Python dependencies:
+      python-owasp-zap-v2.4 — Run: pip install -r requirements.txt".
+This is the reinforcement of an EXISTING setup step, not invented new docs.
+
+2.5 Live verification: a deepscan through venv/ (scan 147)
+--------------------------------------------------------------------------------
+`venv/bin/python aegis.py 172.28.0.20 --profile deepscan -v`, exit 0:
+
+    ZAP daemon started, spidered + passive-scanned http://172.28.0.20,
+    produced 9 real alerts (CSP not set, anti-clickjacking, cookie flags,
+    server version leak, etc.), all 9 stored as zap_finding rows.
+    Panel: Tools run: 19 | Tools failed: 0 | Tools skipped by user: 0
+    Findings: 57  (1 CRITICAL, 2 HIGH, 10 MEDIUM, 44 LOW)
+
+This matches smoke_test9's scan 146 (the system-python run) exactly: 19 tools,
+0 failures, 57 findings, same severity split, 9 ZAP alerts, one row per CVE.
+The venv/ and system-python runs are now indistinguishable — item 7 closed.
+
+Note: scan 147 predates the Phase 2 code (Phase 1 was verified before Phase 2
+was written), so it carries no tools-run record. That is correct — no
+backfill — and it is why the Phase 2 record first appears on scan 148.
+
+
+3. PHASE 2 — A PER-SCAN TOOLS-RUN RECORD
+================================================================================
+
+3.1 Schema choice, and why
+--------------------------------------------------------------------------------
+A new table, scan_tools_run(scan_id, tool_name, port, outcome), NOT a JSON
+column on scans. Rationale, from this schema's own conventions: findings
+already hang off scans by scan_id rather than being folded into a blob, and a
+tool that runs per-port (nikto, gobuster on several web ports) emits one row
+per (tool, port) — a shape a relational table holds naturally and a JSON
+summary would flatten. `outcome` is one of 'ran' / 'skipped' / 'failed'.
+
+3.2 One classifier, so the record cannot drift from the panel
+--------------------------------------------------------------------------------
+The summary panel's "Tools failed/skipped" numbers and the persisted outcome
+now go through a single predicate, _common.classify_tool_outcome():
+    skipped flag set              -> 'skipped'
+    error present and not skipped  -> 'failed'
+    otherwise                      -> 'ran'
+count_and_report_tool_failures() was refactored to call it, so the on-screen
+count and the database record are two views of one fact rather than two
+computations that can disagree. _common.persist_tool_run(scan_id, tool_results)
+feeds the SAME tool_results the stats panel is built from; it is called by all
+five profiles immediately after they compute that stats dict. It never raises
+— a persistence hiccup falls back to the profile-level check, it does not turn
+a finished scan into a failed one.
+
+3.3 db.py
+--------------------------------------------------------------------------------
+  - init_db() creates scan_tools_run (idempotent, like the findings ALTERs).
+  - record_scan_tools(scan_id, records) bulk-inserts pre-classified rows.
+  - get_scan_tools_run(scan_id) returns the record or [] — and is defensive
+    against the table being absent (a database file that predates the
+    migration), so a caller cannot tell "no record" from "no table": both mean
+    "fall back to the profile check".
+
+3.4 attribution.py — per-scan basis, with an explicit fallback
+--------------------------------------------------------------------------------
+check_scan() now loads the scan's record. When one exists it builds the set of
+producers that actually RAN (ran_producer_set()) and checks each finding
+against that; when it does not, it passes None and the check falls back to the
+profile's tool set — exactly the old behaviour, for every scan written before
+the table existed. Every tool_never_ran issue is stamped with basis:
+"per-scan" or "profile", and its detail text says which question was asked and,
+for per-scan, lists the tools that did run. check_finding() gained an optional
+ran_tools argument; called with two arguments (every existing call site and
+test) it is byte-for-byte the old profile-level check.
+
+Two normalisation details, both necessary for correctness, both verified live:
+  - nmap runs as two recorded steps ("nmap" port scan and
+    "nmap_service_detect"); the XSS DAST pass runs nuclei as "nuclei-xss".
+    _PRODUCER_ALIASES maps both back to their producer so an nmap_script or
+    xss_finding is credited correctly whichever step ran.
+  - nvd (the NVD CVE lookup) is an in-process REST call, never a subprocess in
+    tool_results, so it can never be recorded as "ran". UNTRACKED_PRODUCERS
+    grants it per-scan whenever the scan's profile does CVE enrichment —
+    without this, every stored `cve` row would be falsely flagged the moment
+    its scan gained a record. (Confirmed: scans 148-150 introduced zero such
+    false positives.)
+
+3.5 No backfill
+--------------------------------------------------------------------------------
+Historical scans get no invented record — same principle as the cve_id/port
+and finding_type passes. They use the profile fallback, which is the correct
+answer for them, not a gap. The two KNOWN_HISTORICAL rows (scans 1 and 3) still
+flag, still on a profile basis, still excluded from the gate.
+
+3.6 Unit tests (tests/t_phase10.py — 41 assertions, 0 failed)
+--------------------------------------------------------------------------------
+Covers the three cases the brief named, and the machinery around them:
+  A  classify_tool_outcome — the single ran/skipped/failed predicate, incl.
+     skip-wins-over-error (the zap_wrap skip-flag contract).
+  B  db layer round-trip; the empty-record and absent-table fallbacks.
+  C  ran_producer_set — skipped/failed tools excluded; the nmap and nuclei-xss
+     aliases; the nvd grant present for deepscan, absent for stealthscan.
+  D  the gap itself: a zap_finding whose ZAP RAN passes; the identical finding
+     whose ZAP was SKIPPED now FAILS (per-scan basis) — while it still PASSES
+     the profile-level check (deepscan wires ZAP in), which is the blind spot;
+     the same for a FAILED sqlmap; the nvd-grant and alias paths pass.
+  E  check_scan end to end through a real temp database: flagged on the
+     skipped-ZAP scan, clean on the scan where ZAP ran, and — the historical
+     case — no crash and a profile-level fallback on a scan with no record.
+  F  a 2-argument call is unchanged from the old behaviour.
+
+3.7 Live verification: a real skip, recorded, and the check firing
+--------------------------------------------------------------------------------
+scan 150 — `venv/bin/python aegis.py 172.28.0.20 --profile quickscan -v
+--non-interactive`, driven through a real PTY, with the skip key ('s') pressed
+once nuclei started (the deterministic skip-key path run_tool() polls). Panel:
+    Tools run: 5 | Tools failed: 0 | Tools skipped by user: 1
+The stored record matches the panel exactly:
+    nslookup ran | nmap ran | nmap_service_detect ran | whatweb ran |
+    nuclei :80 SKIPPED
+So the record correctly reflects the skip (Phase 2 step 7, first half).
+
+The scan's only real finding is a service_version row (nmap, which ran) — it
+passes, no false positive. nuclei being skipped naturally produced no finding
+attributable only to it, so — as the brief anticipates — a minimal REAL case
+was run against scan 150's ACTUAL database record (not a fixture):
+    a nuclei_finding credited to scan 150, whose sole producer (nuclei) was
+    skipped on this exact scan ->
+        issue : tool_never_ran
+        basis : per-scan
+        detail: credited to nuclei, but none of ['nuclei'] ran on this scan —
+                tools that ran: ['nmap', 'nslookup', 'whatweb']
+The SAME finding passes the profile-level check (quickscan wires nuclei in).
+That contrast is the entire point of Phase 2: the per-scan basis catches what
+the profile basis structurally cannot.
+
+3.8 Whole-database sweep (Phase 2 step 8)
+--------------------------------------------------------------------------------
+`venv/bin/python tests/db_sweep.py`, exit 0:
+    scans rendered      : 148/148
+    crashes             : 0
+    ambiguous cells     : 0
+    dup top-find scans  : 0
+    attribution issues  : 0
+      of which historical: 2 (scans 1 and 3 — the known cve/quickscan rows)
+148, not 144, because this pass added four real verification scans (147-150).
+The two known historical exclusions are unchanged, and the schema/check change
+introduced zero new false positives.
+
+
+4. PHASE 3 — FULL VERIFICATION
+================================================================================
+
+4.1 The complete test suite — 416 assertions, 0 failures
+--------------------------------------------------------------------------------
+    t_phase2   36     t_phase8   183
+    t_phase3   47     t_phase9    58
+    t_phase4   40     t_phase10   41   (new)
+    t_pty      11
+    -----------------------------------
+    total     416     failures     0
+All run under venv/bin/python.
+
+4.2 The two fixes together (Phase 3 step 2)
+--------------------------------------------------------------------------------
+scans 148 and 149 are deepscans through venv/ under the Phase 2 code: ZAP ran
+(Phase 1) and its run was recorded (Phase 2) in the same scan. Scan 149's
+record: 19 tools, all 'ran', zaproxy included; 9 zap_finding rows stored;
+per-scan attribution over its real rows -> 0 issues (the 9 ZAP findings pass
+BECAUSE zaproxy is recorded as having run). The venv fix and the schema
+addition do not interact badly; they compose.
+
+
+5. WHAT CHANGED
+================================================================================
+    database/db.py                   scan_tools_run table; record_scan_tools(),
+                                     get_scan_tools_run() (§3.3)
+    modules/profiles/_common.py      classify_tool_outcome(), persist_tool_run();
+                                     count_and_report_tool_failures() refactored
+                                     onto the shared classifier (§3.2)
+    modules/profiles/{deepscan,quickscan,stealth,compliance,webaudit}.py
+                                     persist_tool_run(scan_id, tool_results)
+                                     called after the stats block
+    modules/reporting/attribution.py per-scan basis, ran_producer_set(),
+                                     _PRODUCER_ALIASES, UNTRACKED_PRODUCERS,
+                                     check_finding(..., ran_tools=), basis
+                                     stamping (§3.4)
+    setup.py                         zapv2 added to REQUIRED_MODULES (§2.4)
+    tests/t_phase10.py               41 assertions (§3.6)
+    (venv/ itself is git-ignored; the ZAP install is an environment change,
+     not a committed one.)
+
+
+6. WHAT REMAINS OPEN / LIMITATIONS
+================================================================================
+ 1. The live skip in §3.7 was performed on nuclei via the skip key, not on ZAP
+    via Ctrl+C. Two earlier attempts to skip ZAP mid-scan by delivering SIGINT
+    to the running process (scan 148, out-of-band kill -INT; scan 149, a real
+    Ctrl+C written to the PTY) did NOT skip it — ZAP completed with 9 alerts
+    both times. The reason was not conclusively pinned down; ZAP's ~7-minute
+    phase is dominated by daemon startup/shutdown and the DVWA spider is quick,
+    so a single interrupt may simply have landed outside zap_wrap's poll loop.
+    This is a property of how interruptible ZAP is, NOT anything Phase 1 or
+    Phase 2 changed, and it does not affect the requirement: §3.7 is a real
+    scan with a real, recorded skip and the check firing against a real record.
+    zap_wrap's skip-flag handling itself remains covered by unit test
+    (classify_tool_outcome on a skipped ZAP result -> 'skipped').
+
+ 2. Live coverage of the record is deepscan and quickscan only. stealthscan,
+    compliance and webaudit were verified to import persist_tool_run and to
+    parse/compile cleanly, but were not run live this pass. The wiring is
+    identical across all five profiles (the same one line after the same stats
+    block), so the risk is low, but it is not the same as a live run.
+
+ 3. The per-scan check can only see producers that flow through tool_results.
+    That set is every subprocess tool plus header_check and banner_grab; the
+    one producer it cannot (nvd) is handled by the UNTRACKED_PRODUCERS grant
+    (§3.4). If a future finding type is ever produced by another in-process,
+    non-tool_results producer, it will need the same treatment — noted so the
+    next such addition is deliberate.
+
+ 4. All live scans this pass ran against the single local DVWA fixture
+    (172.28.0.20). No public target and no WordPress/SMB/SSH fixture was
+    scanned, so conditional-tool records (wpscan/hydra/enum4linux) and a
+    'skipped'/'failed' outcome for anything other than nuclei were not
+    exercised live — only in unit tests.
+
+Nothing in this pass is left in a broken or half-applied state. Both
+smoke_test9 open items are closed with the live evidence above.

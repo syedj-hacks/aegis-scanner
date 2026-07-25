@@ -74,6 +74,34 @@ def init_db():
         if column not in existing_columns:
             cur.execute(f"ALTER TABLE findings ADD COLUMN {column} TEXT")
 
+    # Per-scan tools-run record. Separate table (not a JSON column on scans)
+    # to match this schema's convention: findings already hang off scans by
+    # scan_id rather than being folded into a blob, and a tool that runs
+    # per-port emits one row per (tool, port) — a shape a relational table
+    # holds naturally and a JSON summary would flatten.
+    #
+    # outcome is one of 'ran' / 'skipped' / 'failed', classified from the
+    # exact same tool_results dict the summary panel counts (see
+    # modules/profiles/_common.classify_tool_outcome), so the persisted
+    # record cannot drift from "Tools failed/skipped" on screen.
+    #
+    # This is collected going forward only: scans that predate the table
+    # (every row already in the shipped database) simply have no rows here,
+    # and modules/reporting/attribution.py falls back to the profile-level
+    # check for those. No historical backfill — same principle as the
+    # cve_id/port/finding_type passes: the data was never captured, so it is
+    # not invented.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS scan_tools_run (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_id INTEGER NOT NULL,
+            tool_name TEXT NOT NULL,
+            port INTEGER,
+            outcome TEXT NOT NULL,
+            FOREIGN KEY (scan_id) REFERENCES scans(id)
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -143,6 +171,59 @@ def insert_finding(scan_id: int, finding: dict):
 def insert_findings_bulk(scan_id: int, findings: list):
     for f in findings:
         insert_finding(scan_id, f)
+
+
+def record_scan_tools(scan_id: int, records: list):
+    """
+    Persist which tools ran on one scan.
+
+    `records` is a list of {tool_name, port, outcome} dicts, already
+    classified by the caller (modules/profiles/_common.persist_tool_run)
+    from the same tool_results the summary panel counts. outcome must be one
+    of 'ran' / 'skipped' / 'failed'. A tool that ran per-port produces one
+    record per port; the attribution check collapses them.
+    """
+    rows = [
+        (scan_id, r["tool_name"], r.get("port"), r["outcome"])
+        for r in (records or [])
+        if r.get("tool_name") and r.get("outcome")
+    ]
+    if not rows:
+        return
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.executemany(
+        "INSERT INTO scan_tools_run (scan_id, tool_name, port, outcome) "
+        "VALUES (?, ?, ?, ?)",
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_scan_tools_run(scan_id: int) -> list:
+    """
+    The tools-run record for one scan as a list of {tool_name, port, outcome}
+    dicts, or [] when the scan has none — which is the case for every scan
+    written before this table existed. Defensive against the table itself
+    being absent (a database file that predates the migration and has not had
+    init_db() run against it yet) so callers can treat "no record" and "no
+    table" identically as "fall back to the profile-level check".
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT tool_name, port, outcome FROM scan_tools_run "
+            "WHERE scan_id = ?",
+            (scan_id,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+    return rows
 
 
 def get_scan_history(target: str = None) -> list:

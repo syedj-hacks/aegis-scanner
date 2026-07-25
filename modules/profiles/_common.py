@@ -24,6 +24,7 @@ from modules.reporting.report_pdf import generate_pdf_report
 from modules.reporting.retention import retain_reports
 from modules.reporting.completion import print_report_summary
 from modules.reporting.summary import build_summary
+from database.db import record_scan_tools
 
 # Every tool with a real wrapper module somewhere in this codebase today,
 # regardless of which profile(s) actually call it.
@@ -363,7 +364,7 @@ def count_and_report_tool_failures(target: str, tool_results: list) -> int:
     """
     failures = [
         r for r in (tool_results or [])
-        if isinstance(r, dict) and r.get("error") and not r.get("skipped")
+        if isinstance(r, dict) and classify_tool_outcome(r) == "failed"
     ]
 
     for r in failures:
@@ -379,3 +380,55 @@ def count_and_report_tool_failures(target: str, tool_results: list) -> int:
         )
 
     return len(failures)
+
+
+def classify_tool_outcome(result: dict) -> str:
+    """
+    The single source of truth for "what happened to this tool" — one of
+    'ran' / 'skipped' / 'failed'.
+
+    This is the exact predicate the summary panel's failed/skipped counts use
+    (a skip carries result['skipped']; a failure carries result['error'] and
+    is not a skip; everything else ran). count_and_report_tool_failures()
+    above and persist_tool_run() below both go through here so the persisted
+    scan_tools_run record cannot drift from the "Tools failed/skipped" numbers
+    the same scan prints and reports.
+    """
+    if result.get("skipped"):
+        return "skipped"
+    if result.get("error"):
+        return "failed"
+    return "ran"
+
+
+def persist_tool_run(scan_id, tool_results: list) -> None:
+    """
+    Write the per-scan tools-run record: one row per tool result, carrying
+    the tool name, its port (if any) and its classified outcome.
+
+    Fed the SAME tool_results the stats panel is built from, so the database
+    record and the on-screen "Tools run/failed/skipped" are two views of one
+    fact rather than two computations that can disagree. Called by every
+    profile immediately after it computes that stats dict.
+
+    Never raises: a scan is complete and persisted by the time this runs, and
+    a persistence hiccup must not turn a finished scan into a failed one — the
+    attribution check simply falls back to the profile level for a scan whose
+    record never landed.
+    """
+    try:
+        rows = []
+        for r in (tool_results or []):
+            if not isinstance(r, dict):
+                continue
+            tool = r.get("tool") or r.get("tool_name") or r.get("name")
+            if not tool:
+                continue
+            rows.append({
+                "tool_name": tool,
+                "port": r.get("port"),
+                "outcome": classify_tool_outcome(r),
+            })
+        record_scan_tools(scan_id, rows)
+    except Exception as exc:
+        print_warning(f"could not persist the tools-run record for scan {scan_id}: {exc}")

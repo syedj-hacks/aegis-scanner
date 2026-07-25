@@ -40,20 +40,40 @@ row in the database, mechanically:
 
 What check 1 can and cannot prove
 ---------------------------------
-The database stores scans and findings — it does NOT store which tools ran
-for a given scan (tool_results lives in memory for the duration of a run and
-reaches the reports, not the schema). So the cross-reference is against the
-set of tools the scan's PROFILE runs, which is the honest strongest
-available answer to "could this tool have produced this row". It catches the
-whole class the smoke_test8 §4.2 bug belongs to — a tool that does not run
-in this profile at all — and it does not catch a tool that is wired into the
-profile but was skipped, failed, or never reached on that particular run.
-Stated here so no reader over-reads a clean sweep.
+Two bases, in order of strength:
+
+  PER-SCAN (preferred).  As of the scan_tools_run table, a scan records which
+  tools actually ran on it (ran / skipped / failed), classified from the same
+  tool_results the summary panel counts. When that record exists, check 1
+  cross-references a finding's producer against the tools that actually RAN on
+  that specific scan — so a finding credited to a tool the profile wires in
+  but that was skipped, failed, or never reached on this run is now caught,
+  which the profile basis below cannot see.
+
+  PROFILE (fallback).  Scans written before the table existed carry no record.
+  For those, the cross-reference falls back to the set of tools the scan's
+  PROFILE runs — the honest strongest answer available for a historical scan.
+  It catches the whole class the smoke_test8 §4.2 bug belongs to (a tool that
+  does not run in this profile at all) but not the skipped/failed/never-reached
+  case above.
+
+Every issue this module raises carries a `basis` of "per-scan" or "profile" so
+a reader knows which question was actually asked of a given row. No historical
+scan is backfilled with a record it never captured — the fallback is the
+correct answer for those, not a gap.
+
+One producer is deliberately never per-scan-verified: `nvd`, the NVD CVE
+lookup (modules/enrichment/cve_lookup.py), is an in-process REST call, not a
+subprocess tool, so it never appears in tool_results and cannot be recorded as
+ran/skipped/failed. A `cve` finding is therefore checked per-scan against the
+tools that ran PLUS nvd-if-the-profile-does-CVE-enrichment (see
+UNTRACKED_PRODUCERS), rather than being falsely flagged on every scan.
 """
 
 from modules.enrichment.remediation import finding_kind as remediation_kind
 from modules.enrichment.severity import finding_kind as severity_kind
 from modules.reporting.summary import FINDING_TYPE_TOOL, _NOT_APPLICABLE, _enrich
+from database.db import get_scan_tools_run
 
 # --- Who can produce what -------------------------------------------------
 # finding_type -> the tool(s) that can actually raise it. Tool names are the
@@ -125,6 +145,30 @@ PROFILE_PRODUCERS = {
 # _WIRED_TOOLS against PROFILE_PRODUCERS above.
 NON_FINDING_TOOLS = {"nslookup", "subfinder", "amass", "theharvester"}
 
+# tool_results records a tool under the name its wrapper stamps, which is not
+# always the producer name FINDING_TYPE_PRODUCERS uses:
+#   - nmap runs as two distinct steps, the port scan ("nmap") and
+#     service/script detection ("nmap_service_detect"), both producer "nmap".
+#   - the XSS DAST pass drives nuclei under the name "nuclei-xss" and is what
+#     raises an xss_finding (producer "nuclei"); aliasing it means an
+#     xss_finding is credited correctly even on a scan where only the DAST
+#     nuclei invocation ran.
+# Normalised when building a scan's ran-set so those findings are credited to
+# the right producer whichever wrapper-named step actually ran.
+_PRODUCER_ALIASES = {
+    "nmap_service_detect": "nmap",
+    "nuclei-xss": "nuclei",
+}
+
+# Producers that never flow through tool_results and so can never be recorded
+# in scan_tools_run: nvd is an in-process NVD REST call, not a subprocess the
+# profiles time and count. A per-scan check therefore cannot see nvd as "ran";
+# it is instead allowed whenever the scan's profile does CVE enrichment at all
+# (profile_producers includes "nvd"), which is the honest per-scan answer for
+# an in-process producer. Without this, every stored `cve` row would be
+# falsely flagged the moment its scan gained a tools-run record.
+UNTRACKED_PRODUCERS = {"nvd"}
+
 # A finding type's own identity column — the one that, missing, means the row
 # cannot really be of that type. Only listed where the answer is certain:
 # every `cve` row is a CVE lookup result and has a cve_id, and every
@@ -167,18 +211,50 @@ def profile_producers(profile) -> set:
     return set(producers) if producers is not None else None
 
 
-def check_finding(finding: dict, profile: str) -> list:
+def ran_producer_set(records: list, profile: str) -> set:
+    """
+    The set of PRODUCERS that actually ran on a scan, derived from its
+    scan_tools_run records ([{tool_name, port, outcome}, ...]).
+
+    A producer counts as "ran" only when at least one of its records has
+    outcome 'ran' (a tool that only ever failed or was skipped cannot have
+    produced a finding). Wrapper tool names are normalised to producer names
+    via _PRODUCER_ALIASES, and the in-process producers that never appear in
+    tool_results (UNTRACKED_PRODUCERS, i.e. nvd) are added when the scan's
+    profile does that enrichment — see the module docstring.
+    """
+    ran = {
+        _PRODUCER_ALIASES.get(r["tool_name"], r["tool_name"])
+        for r in (records or [])
+        if r.get("outcome") == "ran"
+    }
+    prof = profile_producers(profile) or set()
+    ran |= (prof & UNTRACKED_PRODUCERS)
+    return ran
+
+
+def check_finding(finding: dict, profile: str, ran_tools: set = None) -> list:
     """
     Run all three checks against one finding row as a report would see it.
 
     `finding` is a findings row (or an enriched copy of one — summary._enrich
-    only adds fields, so either works). Returns a list of issue dicts:
+    only adds fields, so either works).
 
-        {issue, finding_type, effective_type, detail}
+    `ran_tools` is the per-scan basis for check 1: the set of producers that
+    actually ran on this scan (from ran_producer_set()). Pass it to check a
+    finding against what ran on its specific scan; leave it None to fall back
+    to the profile-level check (the only option for a scan with no tools-run
+    record). check_scan() supplies it automatically.
+
+    Returns a list of issue dicts:
+
+        {issue, finding_type, effective_type, detail, [basis]}
 
     where `issue` is one of:
-        tool_never_ran      the tool credited with this finding is not one
-                            the profile runs
+        tool_never_ran      the tool credited with this finding did not run —
+                            per-scan basis: it was skipped/failed/never reached
+                            on this scan; profile basis: this profile never
+                            runs it. The issue carries `basis` saying which.
         classifier_disagree severity.py and remediation.py classify this row
                             differently
         unmapped_type       a declared finding_type with no producer mapping
@@ -211,7 +287,15 @@ def check_finding(finding: dict, profile: str) -> list:
                        f"'{other}' — the two are documented as one contract"),
         })
 
-    allowed = profile_producers(profile)
+    # Check 1 basis: prefer the per-scan ran-set when the caller supplied one
+    # (the scan has a tools-run record), else fall back to the profile's tool
+    # set. A historical scan with no record is checked exactly as before.
+    if ran_tools is not None:
+        allowed = ran_tools
+        basis = "per-scan"
+    else:
+        allowed = profile_producers(profile)
+        basis = "profile"
     producers = producers_for(effective)
 
     if not producers:
@@ -225,13 +309,20 @@ def check_finding(finding: dict, profile: str) -> list:
             })
     elif allowed is not None and not (producers & allowed):
         tool = FINDING_TYPE_TOOL.get(effective, effective)
+        if basis == "per-scan":
+            detail = (f"rendered as a '{effective}' finding (credited to {tool}), "
+                      f"but none of {sorted(producers)} ran on this scan — tools "
+                      f"that ran: {sorted(allowed)} (per-scan tools-run record)")
+        else:
+            detail = (f"rendered as a '{effective}' finding (credited to {tool}), "
+                      f"but the '{profile}' profile runs none of "
+                      f"{sorted(producers)}")
         issues.append({
             "issue": "tool_never_ran",
             "finding_type": declared or None,
             "effective_type": effective,
-            "detail": (f"rendered as a '{effective}' finding (credited to {tool}), "
-                       f"but the '{profile}' profile runs none of "
-                       f"{sorted(producers)}"),
+            "basis": basis,
+            "detail": detail,
         })
 
     # Signature checks apply to a row's DECLARED type only: an untyped row
@@ -263,10 +354,18 @@ def check_scan(scan_id: int, profile: str, findings: list) -> list:
     """
     Attribution issues for one scan's findings, each stamped with the
     scan_id and the finding's row id so a sweep can point at the row.
+
+    Loads the scan's tools-run record and checks check 1 against what
+    actually ran on this scan when a record exists (per-scan basis), falling
+    back to the profile-level check when it does not — the case for every
+    scan written before scan_tools_run existed. The two are never mixed for a
+    single scan: an empty record list means "no record", not "nothing ran".
     """
+    records = get_scan_tools_run(scan_id)
+    ran_tools = ran_producer_set(records, profile) if records else None
     out = []
     for finding in findings or []:
-        for issue in check_finding(finding, profile):
+        for issue in check_finding(finding, profile, ran_tools=ran_tools):
             out.append(dict(issue, scan_id=scan_id, finding_id=finding.get("id"),
                             profile=profile))
     return out
