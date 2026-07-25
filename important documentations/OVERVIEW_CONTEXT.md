@@ -1,8 +1,10 @@
-# Aegis Scanner — Context Reference (attach this file to any Claude session)
+# Aegis Scanner — Context Reference (attach this file to any AI coding session)
 
-Purpose: give Claude full structural knowledge of this repo without pasting source. Attach
+Purpose: give an assistant full structural knowledge of this repo without pasting source. Attach
 this alone before asking for a change. Everything below reflects the actual code, not
 aspirational design — if this file and the code disagree, trust the code and flag the drift.
+
+(Formerly `CLAUDE_CONTEXT.md`; renamed because it is a repo overview, not a tool-specific file.)
 
 Project: Kali Linux modular vulnerability-assessment CLI. Target in → recon → port scan → web
 audit → injection & scripting checks (sqlmap SQLi, nuclei-DAST XSS) → conditional exploitation

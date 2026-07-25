@@ -692,7 +692,7 @@ first run (never overwrites an existing file).
   before any write.
 - Wiring a tool into `PROFILES[...]['tools']` does **not** make it run — you must also add it to
   that profile orchestrator's own `_WIRED_TOOLS` set (or `deepscan`'s alias of
-  `GLOBAL_AVAILABLE_TOOLS`) and call its wrapper. See §5.2/§3.1 of CLAUDE_CONTEXT.md.
+  `GLOBAL_AVAILABLE_TOOLS`) and call its wrapper. See §6.2/§3.1 of OVERVIEW_CONTEXT.md.
 - A long-running or interruptible operation belongs behind `run_tool()`/`safe_call()`, which
   already implement timeout, skip-keybind, and Ctrl+C double-tap handling (§7) — don't hand-roll
   a second interrupt path (`zap_wrap.py`'s hand-rolled version exists only because it isn't a
