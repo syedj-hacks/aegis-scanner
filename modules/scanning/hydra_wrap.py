@@ -19,9 +19,7 @@ import os
 import re
 
 from modules.utils.error_handler import run_tool
-from modules.utils.logger import (
-    log_tool_start, log_tool_success, log_tool_failure, log_finding,
-)
+from modules.utils.logger import log_finding
 from modules.utils.display import (
     print_info, print_success, print_warning, print_error,
 )
@@ -45,8 +43,15 @@ _HYDRA_BASE_ARGS = ["-t", "4", "-f"]
 
 # Matches hydra's success lines, e.g.:
 #   [22][ssh] host: 10.0.0.5   login: admin   password: admin123
+# Some services/hydra versions (confirmed live: hydra 9.6 against ssh)
+# insert an extra "misc: <text>" field between host and login, e.g.:
+#   [2222][ssh] host: 10.0.0.5   misc: (null)   login: admin   password: admin
+# — that optional segment used to break this match entirely (every real
+# credential silently came back as "no valid credentials found"), so it's
+# matched and discarded here rather than assumed absent.
 _SUCCESS_LINE = re.compile(
     r"^\[(?P<port>\d+)\]\[(?P<service>\S+)\]\s+host:\s+(?P<host>\S+)\s+"
+    r"(?:misc:\s+.*?\s+)?"
     r"login:\s+(?P<login>\S+)\s+password:\s+(?P<password>\S*)"
 )
 
@@ -120,28 +125,26 @@ def run_hydra(target: str, service: str, port: int = None,
     Never raises. A missing hydra binary, missing wordlists, or an
     unreachable target all come back as error set + credentials_found empty.
     """
-    log_tool_start(target, "hydra")
-
     result = {
+        "tool": "hydra",
         "target": target,
         "service": service,
         "port": port,
         "credentials_found": [],
         "raw_output": "",
         "error": None,
+        "skipped": False,
     }
 
     resolved_users, user_error = _resolve_list(_DEFAULT_USERLISTS, userlist)
     if user_error:
         result["error"] = user_error
-        log_tool_failure(target, "hydra", user_error)
         print_error(f"[Hydra] {target}: {user_error}")
         return result
 
     resolved_passwords, pass_error = _resolve_list(_DEFAULT_PASSLISTS, passlist)
     if pass_error:
         result["error"] = pass_error
-        log_tool_failure(target, "hydra", pass_error)
         print_error(f"[Hydra] {target}: {pass_error}")
         return result
 
@@ -155,20 +158,19 @@ def run_hydra(target: str, service: str, port: int = None,
 
     print_info(f"[Hydra] Testing {service} on {target}" + (f":{port}" if port else ""))
 
+    # run_tool() already logs this call's start/success/failure under the
+    # "hydra" tool name — no need to log it again here.
     tool_result = run_tool(target, "hydra", command)
     result["raw_output"] = tool_result.get("stdout", "") or ""
+    result["skipped"] = tool_result.get("skipped", False)
 
     if not tool_result.get("success") and not result["raw_output"].strip():
-        err = tool_result.get("error") or tool_result.get("stderr") or "hydra failed"
-        result["error"] = err
-        log_tool_failure(target, "hydra", err)
-        print_error(f"[Hydra] hydra failed for {target}/{service} — {err}")
+        result["error"] = tool_result.get("error") or tool_result.get("stderr") or "hydra failed"
+        print_error(f"[Hydra] hydra failed for {target}/{service} — {result['error']}")
         return result
 
     credentials = _parse_hydra_output(result["raw_output"])
     result["credentials_found"] = credentials
-
-    log_tool_success(target, "hydra", tool_result.get("duration"))
 
     if credentials:
         for cred in credentials:

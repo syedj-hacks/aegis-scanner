@@ -17,11 +17,11 @@ python3 aegis.py <target> [--profile PROFILE] [-v]
 
 | Profile | Description |
 |---|---|
-| `quickscan` (default) | Fast overview — DNS, top-port nmap scan, service detection. |
-| `stealthscan` | Slow-timing, full-port sweep — minimal footprint, no service probing. |
-| `webaudit` | Web-focused audit — headers, Nikto, gobuster + CVE enrichment on web ports. |
+| `quickscan` (default) | Fast overview — DNS, top-port nmap scan, service detection, quick whatweb + high-severity nuclei check. |
+| `stealthscan` | Quiet -T2 scan of common ports — minimal footprint, no service probing. |
+| `webaudit` | Web-focused audit — headers, Nikto, gobuster/dirb, whatweb, sslyze + CVE enrichment on web ports. |
 | `deepscan` | Full assessment — recon, all ports, web audit, CVE/severity/remediation, TXT+PDF reports. |
-| `compliance` | TLS cipher + HTTP header nmap scripts for a compliance-oriented baseline. |
+| `compliance` | TLS cipher + HTTP header nmap scripts, sslyze and whatweb on TLS ports for a compliance-oriented baseline. |
 
 Example:
 ```bash

@@ -51,6 +51,34 @@ from database.db import get_scan_history, get_findings_for_scan
 # the reports render in full immediately afterwards.
 _DEFAULT_TOP_N = 10
 
+# Finding types the report's dedicated "Injection & Scripting
+# Vulnerabilities" section renders in full — with the exact payload, the
+# parameter/endpoint it was sent against, and a response snippet proving
+# exploitation. Deliberately just these two vulnerability classes (confirmed
+# SQL injection via sqlmap, reflected XSS via nuclei DAST); the section does
+# not restructure the rest of the report. The value is the human label the
+# reports show for each class.
+INJECTION_FINDING_TYPES = {
+    "sqlmap_finding": "SQL Injection (sqlmap)",
+    "xss_finding": "Reflected XSS (nuclei DAST)",
+}
+
+
+def injection_findings(summary: dict) -> list:
+    """
+    Return just the SQLi/XSS findings from a built summary, worst-first
+    (summary['findings'] is already sorted).
+
+    Reads the persisted `finding_type` column (db.py), so it works on a
+    scan read back from SQLite exactly as it does on a fresh one. Both
+    report writers call this so the two never disagree on what counts as an
+    injection finding.
+    """
+    return [
+        f for f in (summary.get("findings") or [])
+        if str(f.get("finding_type") or "").lower() in INJECTION_FINDING_TYPES
+    ]
+
 # Target used to route log lines when the scan_id has no target to name
 # (an unknown scan_id, or a scans row with a NULL target).
 _FALLBACK_TARGET = "reporting"
@@ -92,11 +120,21 @@ def _describe(finding: dict) -> str:
     """
     port = finding.get("port")
     service = (finding.get("service") or "").strip()
+    product = (finding.get("product") or "").strip()
     version = (finding.get("version") or "").strip()
     cve_id = (finding.get("cve_id") or "").strip()
 
     where = f"port {port}" if port is not None else "an unspecified port"
-    what = " ".join(part for part in (service, version) if part) or "an unidentified service"
+    # product (e.g. "nginx") is the most useful part of a quickscan/
+    # stealthscan row — service alone is often just "http", which tells an
+    # analyst nothing a port number didn't already. Shown ahead of the bare
+    # service name, with service still included when it differs.
+    label_parts = [p for p in (product, version) if p]
+    if not label_parts:
+        label_parts = [p for p in (service, version) if p]
+    elif service and service.lower() != product.lower():
+        label_parts.insert(0, service)
+    what = " ".join(label_parts) or "an unidentified service"
 
     if cve_id:
         return f"{cve_id} affects {what} exposed on {where}."
@@ -121,6 +159,417 @@ def _enrich(finding: dict) -> dict:
     enriched["description"] = finding.get("description") or _describe(finding)
     enriched["remediation"] = finding.get("remediation") or remediation_text(enriched)
     return enriched
+
+
+# --- Honest field labelling ----------------------------------------------
+# Every report used to render an unpopulated Service / Version / CVE / CVSS
+# cell as a bare "-", which collapses two completely different facts into
+# one character:
+#
+#   "this field cannot apply to this kind of finding"  — a missing security
+#       header has no CVE and never will; a dash there is not a gap.
+#   "this field could apply but nothing determined it" — a nuclei match on
+#       an unidentified service; a dash there IS a gap, and hides it.
+#
+# A reader cannot tell those apart, so the first makes the report look
+# incomplete and the second makes an unknown look like a non-issue. Both are
+# now labelled in words.
+#
+# Which tool produced each finding type. Used for the "not determined by X"
+# wording, so the reader knows who to blame for the gap.
+FINDING_TYPE_TOOL = {
+    "banner": "banner grab",
+    "cve": "NVD lookup",
+    "discovered_path": "gobuster/dirb",
+    "fingerprint_header": "header check",
+    "missing_security_header": "header check",
+    "nikto_finding": "nikto",
+    "nmap_script": "nmap NSE",
+    "nuclei_finding": "nuclei",
+    "open_port": "nmap",
+    "service_version": "nmap -sV",
+    "smb_share": "enum4linux",
+    "smb_user": "enum4linux",
+    "sqlmap_finding": "sqlmap",
+    "technology_fingerprint": "whatweb",
+    "weak_credentials": "hydra",
+    "wordpress_fingerprinted": "wpscan",
+    "xss_finding": "nuclei DAST",
+    "zap_finding": "zaproxy",
+}
+
+# Finding types for which a given field is not applicable *by nature*, with
+# the short qualifier the report prints. Anything not listed here is treated
+# as applicable-but-unpopulated and reported as a genuine gap.
+#
+# The judgement in each case is "could this tool, run correctly, ever fill
+# this in?" — not "did it this time".
+_NOT_APPLICABLE = {
+    "cve_id": {
+        "banner": "banner observation",
+        "discovered_path": "path discovery",
+        "fingerprint_header": "fingerprint",
+        "missing_security_header": "config finding",
+        "open_port": "port observation",
+        "service_version": "service observation",
+        "smb_share": "share enumeration",
+        "smb_user": "user enumeration",
+        "sqlmap_finding": "injection class, not a CVE",
+        "technology_fingerprint": "fingerprint",
+        "weak_credentials": "credential finding",
+        "wordpress_fingerprinted": "fingerprint",
+        "xss_finding": "injection class, not a CVE",
+    },
+    "cvss": {
+        # CVSS is a score *of a CVE*; where a CVE cannot apply, neither can
+        # a published score. Findings that carry a CVE keep CVSS
+        # applicable, and severity.py's heuristic grade is reported
+        # separately as the Severity field.
+        "banner": "no CVE to score",
+        "discovered_path": "no CVE to score",
+        "fingerprint_header": "no CVE to score",
+        "missing_security_header": "no CVE to score",
+        "open_port": "no CVE to score",
+        "service_version": "no CVE to score",
+        "smb_share": "no CVE to score",
+        "smb_user": "no CVE to score",
+        "technology_fingerprint": "no CVE to score",
+        "weak_credentials": "no CVE to score",
+        "wordpress_fingerprinted": "no CVE to score",
+    },
+    "service": {
+        # enum4linux findings are about SMB accounts and shares rather than
+        # a port-bound service, so there is no service cell to fill.
+        "smb_share": "host-level finding",
+        "smb_user": "host-level finding",
+    },
+    "version": {
+        "discovered_path": "path discovery",
+        "missing_security_header": "config finding",
+        "open_port": "port observation",
+        "smb_share": "host-level finding",
+        "smb_user": "host-level finding",
+    },
+}
+
+
+def field_display(finding: dict, field: str) -> str:
+    """
+    Render one finding field as text that is always explicit about itself.
+
+    Returns, in order of preference:
+      - the value, when the field is populated
+      - "N/A (<why>)"  when the field cannot apply to this finding type
+      - "not determined by <tool>"  when it could have applied but nothing
+        filled it in
+
+    Never returns a bare "-". The point of this function is that no cell in
+    any report is ever ambiguous about whether it represents a
+    non-applicable field or a real gap in what the scan learned.
+    """
+    value = finding.get(field)
+    if value is not None and str(value).strip() not in ("", "None"):
+        return str(value).strip()
+
+    finding_type = str(finding.get("finding_type") or "").strip().lower()
+
+    reason = _NOT_APPLICABLE.get(field, {}).get(finding_type)
+    if reason:
+        return f"N/A ({reason})"
+
+    tool = FINDING_TYPE_TOOL.get(finding_type)
+    if tool:
+        return f"not determined by {tool}"
+    return "not determined"
+
+
+def service_display(finding: dict) -> str:
+    """
+    Service and version as one cell — "http 1.31.3", or an honest label.
+
+    Both populated is the common case and reads as one phrase. When only
+    one is known the other is not silently dropped: "nginx (version not
+    determined by nmap -sV)" says more than "nginx" does.
+    """
+    service = str(finding.get("service") or "").strip()
+    version = str(finding.get("version") or "").strip()
+
+    if service and version:
+        return f"{service} {version}"
+    if service:
+        return f"{service} (version {field_display(finding, 'version')})"
+    if version:
+        return f"{field_display(finding, 'service')} (version {version})"
+    return field_display(finding, "service")
+
+
+# How much of a description may stand in as a finding's identifier. Long
+# enough to be recognisable in a one-line list, short enough to fit beside
+# a severity badge and a port.
+FINDING_IDENTIFIER_MAXLEN = 60
+
+
+def finding_identifier(finding: dict) -> str:
+    """
+    The short label that names a finding in a list or a card heading.
+
+    Order: CVE id, then service/version, then a truncated description.
+
+    Lives here rather than in either report writer because the two used to
+    disagree — the PDF fell straight through to a service label and titled
+    every nuclei match "unknown", while the text report had a description
+    fallback. Same finding, two different names, depending on which file
+    you opened.
+
+    The description fallback is a last resort by design. A truncated
+    description is a weak identifier: whole families of nuclei templates
+    open with the same sentence, which is how four distinct Redis CVEs came
+    to render as four identical-looking rows on scan 117. The fix for that
+    is upstream — populating cve_id, and prefixing the template name onto
+    the description — so that this fallback is reached with text that
+    actually differs. It is kept because a finding with no better label
+    still needs *a* label.
+    """
+    cve_id = str(finding.get("cve_id") or "").strip()
+    if cve_id:
+        return cve_id
+
+    if str(finding.get("service") or "").strip():
+        service = str(finding.get("service")).strip()
+        version = str(finding.get("version") or "").strip()
+        return f"{service} {version}".strip()
+
+    description = str(finding.get("description") or "").strip()
+    if description:
+        if len(description) > FINDING_IDENTIFIER_MAXLEN:
+            return description[: FINDING_IDENTIFIER_MAXLEN - 3].rstrip() + "..."
+        return description
+
+    finding_type = str(finding.get("finding_type") or "").strip()
+    return finding_type or "unknown"
+
+
+# How much of the *divergent* part of a description to show when several
+# findings share a long opening. Enough to tell "integer overflow" from
+# "use after free"; short enough to keep the line scannable.
+_IDENTIFIER_DISTINGUISHER_MAXLEN = 45
+
+
+def _longest_common_prefix(values) -> int:
+    """Length of the longest prefix every string in `values` shares."""
+    if not values:
+        return 0
+    shortest = min(len(v) for v in values)
+    for index in range(shortest):
+        column = {v[index] for v in values}
+        if len(column) > 1:
+            return index
+    return shortest
+
+
+def distinct_identifiers(findings: list) -> list:
+    """
+    finding_identifier() for a list, with collisions resolved.
+
+    Returns one label per finding, positionally aligned with the input.
+
+    Why this exists
+    ---------------
+    finding_identifier() falls back to a truncated description when a
+    finding has no CVE id and no service. Truncation is not injective:
+    nuclei ships whole families of templates whose descriptions share a
+    long opening sentence, so several genuinely different findings can
+    truncate to the same 60 characters. That is exactly what was reported
+    against scan 117 — four distinct Redis RCE/DoS CVEs rendered as four
+    identical-looking rows.
+
+    The upstream fix (populating cve_id from the template id, and
+    prefixing the template name onto the description) means new scans do
+    not reach this path. It cannot help rows already in the database,
+    though: their cve_id is NULL and their description is the bare
+    upstream prose, so re-rendering an old scan still produced
+    identical-looking rows.
+
+    So collisions are also resolved here, at render time, in bounded steps
+    that add information rather than removing any:
+
+      1. append the part of each description where the group actually
+         diverges. Simply showing *more* of the description does not work:
+         the four Redis templates share their first ~160 characters, so a
+         wider window is still four identical strings, just longer. What
+         distinguishes them ("cause an integer overflow", "use after
+         free") lives immediately past the common prefix, so that is what
+         gets appended.
+      2. if the descriptions are byte-identical, fall back to the columns
+         that differ — port and finding type
+      3. and if even those match, a positional marker, so the guarantee
+         that no two labels are equal holds unconditionally
+
+    Nothing is dropped, merged or invented. A reader always sees as many
+    rows as there are findings, each with a label that distinguishes it
+    from its neighbours.
+    """
+    findings = list(findings or [])
+    labels = [finding_identifier(f) for f in findings]
+
+    groups = {}
+    for index, label in enumerate(labels):
+        groups.setdefault(label, []).append(index)
+
+    for label, indices in groups.items():
+        if len(indices) < 2:
+            continue
+
+        # Only labels that came from the truncated-description fallback can
+        # be repaired by showing more description. A group sharing a
+        # service label ("http 1.31.3" on ports 80, 81 and 443) is a
+        # different situation: those findings are already told apart by the
+        # port the report prints beside the label, and appending the tail
+        # of their description to each would add "…80." / "…81." — noise
+        # restating the column next to it.
+        if any(
+            str(findings[i].get("cve_id") or "").strip()
+            or str(findings[i].get("service") or "").strip()
+            for i in indices
+        ):
+            continue
+
+        descriptions = {
+            index: str(findings[index].get("description") or "").strip()
+            for index in indices
+        }
+
+        # Step 1: show where the descriptions actually diverge.
+        split_at = _longest_common_prefix(list(descriptions.values()))
+        if split_at < max(len(d) for d in descriptions.values()):
+            for index, description in descriptions.items():
+                tail = description[split_at:].strip()
+                if len(tail) > _IDENTIFIER_DISTINGUISHER_MAXLEN:
+                    tail = tail[: _IDENTIFIER_DISTINGUISHER_MAXLEN - 3].rstrip() + "..."
+                labels[index] = f"{label} …{tail}" if tail else label
+
+        # Step 2: identical text — distinguish by the columns that differ.
+        if len({labels[i] for i in indices}) != len(indices):
+            for index in indices:
+                finding = findings[index]
+                labels[index] = (
+                    f"{labels[index]} "
+                    f"[{finding.get('finding_type') or 'finding'} "
+                    f"on port {finding.get('port')}]"
+                )
+
+        # Step 3: unconditional guarantee. Two findings can legitimately be
+        # identical on every column the report shows (the same header
+        # missing on the same port, recorded twice by different tools);
+        # dedup only collapses rows that match on the full key, so a pair
+        # like that survives to here and still must not render as one.
+        if len({labels[i] for i in indices}) != len(indices):
+            for ordinal, index in enumerate(indices, start=1):
+                labels[index] = f"{labels[index]} ({ordinal} of {len(indices)})"
+
+    return labels
+
+
+def cvss_display(finding: dict) -> str:
+    """
+    CVSS cell, including where the grade came from when there is a score.
+
+    An unscored finding is not a mystery — severity.py graded it
+    heuristically — so the label says which of the two happened rather than
+    leaving the reader to wonder whether scoring failed.
+    """
+    cvss = finding.get("cvss")
+    if cvss is None:
+        return field_display(finding, "cvss")
+    return f"{cvss} (source: {finding.get('severity_source', 'heuristic')})"
+
+
+# --- Defensive de-duplication --------------------------------------------
+# Identity of a finding for de-duplication purposes.
+#
+# Deliberately built from the FULL description, never a truncated or
+# rendered one. That distinction is the whole point of this key: the report
+# bug that prompted it (scan 117) showed four Redis CVEs as four identical
+# rows, and they were identical only *after* the renderer cut the
+# description to 60 characters. Keying on rendered text would have
+# "resolved" that symptom by permanently discarding three real
+# remote-code-execution findings.
+#
+# cve_id and severity are in the key alongside (finding_type, port,
+# description) so the pass stays conservative: two rows have to agree on
+# every one of them before either is dropped. The same CVE on two different
+# ports differs on port; two different CVEs sharing a description differ on
+# cve_id. Both stay separate, which is required behaviour.
+_DEDUP_KEY_COLUMNS = ("finding_type", "port", "cve_id", "severity", "description")
+
+
+def _dedup_key(finding: dict) -> tuple:
+    return tuple(
+        str(finding.get(column)) if finding.get(column) is not None else None
+        for column in _DEDUP_KEY_COLUMNS
+    )
+
+
+def deduplicate_findings(findings: list, target: str = _FALLBACK_TARGET,
+                         scan_id=None, quiet: bool = False) -> list:
+    """
+    Collapse rows that are identical on every column in _DEDUP_KEY_COLUMNS,
+    keeping the first occurrence (the list is already worst-first, so the
+    survivor is the best-ranked copy).
+
+    This is a guard, not a fix for any known producer. Nothing in the
+    codebase is currently known to double-insert a finding; the pass exists
+    so that if something ever starts to, the reports absorb it instead of
+    printing the same row twice.
+
+    A collapse is never silent. Every distinct group that loses rows is
+    logged and printed with its identity and the number dropped, because a
+    de-duplicator that quietly deletes findings from a security report is a
+    worse defect than the duplication it is guarding against.
+
+    Returns a new list; the input and its dicts are not mutated.
+    """
+    kept = []
+    seen = {}
+    dropped = {}
+
+    for finding in findings or []:
+        key = _dedup_key(finding)
+        if key in seen:
+            dropped[key] = dropped.get(key, 0) + 1
+            continue
+        seen[key] = finding
+        kept.append(finding)
+
+    if not dropped:
+        return kept
+
+    logger = get_logger(target)
+    total = sum(dropped.values())
+    scan_label = f"scan {scan_id}" if scan_id is not None else "scan"
+    logger.warning(
+        f"[Summary] {scan_label} ({target}): de-duplication collapsed "
+        f"{total} duplicate finding row(s) across {len(dropped)} group(s)"
+    )
+    if not quiet:
+        print_warning(
+            f"[Summary] collapsed {total} duplicate finding row(s) — "
+            f"{len(dropped)} finding(s) had identical copies"
+        )
+
+    for key, count in dropped.items():
+        finding_type, port, cve_id, severity, description = key
+        identity = cve_id or (description or "")[:80] or finding_type or "unknown"
+        detail = (
+            f"[Summary] duplicate collapsed: {identity} "
+            f"(type={finding_type}, port={port}, severity={severity}) "
+            f"— {count} extra copy(ies) dropped, 1 kept"
+        )
+        logger.warning(detail)
+        if not quiet:
+            print_warning(detail)
+
+    return kept
 
 
 def _empty_summary(scan_id, error: str) -> dict:
@@ -196,13 +645,19 @@ def summary_stats(summary: dict) -> dict:
     }
 
 
-def build_summary(scan_id, top_n: int = _DEFAULT_TOP_N) -> dict:
+def build_summary(scan_id, top_n: int = _DEFAULT_TOP_N, quiet: bool = False) -> dict:
     """
     Assemble everything the report writers need for one persisted scan.
 
     Parameters
     ----------
     scan_id : int   id of a row in the scans table
+    quiet   : bool  suppress the console line only (logging is unchanged).
+                    Set by callers that build a summary purely to read from
+                    — the end-of-scan banner does, and one scan should not
+                    print three identical "[Summary] scan N" lines just
+                    because the txt writer, the pdf writer and the banner
+                    each needed the same data.
     top_n   : int   how many findings top_findings carries (worst-first)
 
     Returns
@@ -256,6 +711,13 @@ def build_summary(scan_id, top_n: int = _DEFAULT_TOP_N) -> dict:
         return summary
 
     findings = sorted((_enrich(row) for row in rows), key=_sort_key)
+    # Sorted first so the copy that survives a collapse is the best-ranked
+    # one, and so both report writers see the same de-duplicated set —
+    # running this here rather than in a renderer keeps txt and PDF from
+    # ever disagreeing on how many findings a scan had.
+    findings = deduplicate_findings(
+        findings, target=target, scan_id=metadata["id"], quiet=quiet
+    )
     by_severity = count_by_severity(findings)
 
     try:
@@ -277,17 +739,19 @@ def build_summary(scan_id, top_n: int = _DEFAULT_TOP_N) -> dict:
         # Not an error: a scan that genuinely found nothing is a valid
         # result and still deserves a report saying so.
         logger.info(f"[Summary] scan {metadata['id']} ({target}) has no findings")
-        print_warning(f"[Summary] scan {metadata['id']} ({target}) has no findings recorded")
+        if not quiet:
+            print_warning(f"[Summary] scan {metadata['id']} ({target}) has no findings recorded")
         return summary
 
     logger.info(
         f"[Summary] scan {metadata['id']} ({target}): "
         f"{len(findings)} finding(s) {by_severity}"
     )
-    print_info(
-        f"[Summary] scan {metadata['id']} ({target}): {len(findings)} finding(s) — "
-        + ", ".join(f"{level} {by_severity[level]}" for level in SEVERITY_LEVELS)
-    )
+    if not quiet:
+        print_info(
+            f"[Summary] scan {metadata['id']} ({target}): {len(findings)} finding(s) — "
+            + ", ".join(f"{level} {by_severity[level]}" for level in SEVERITY_LEVELS)
+        )
     return summary
 
 

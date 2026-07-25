@@ -23,9 +23,7 @@ import re
 
 from modules.utils.error_handler import run_tool
 from modules.utils.config import get_timeout
-from modules.utils.logger import (
-    log_tool_start, log_tool_success, log_tool_failure, log_finding,
-)
+from modules.utils.logger import log_tool_failure, log_finding
 from modules.utils.display import (
     print_info, print_success, print_warning, print_error,
 )
@@ -186,14 +184,14 @@ def run_nikto(target: str, port: int = 80, use_https: bool = False) -> dict:
     Never raises. A missing nikto binary, a timeout, or an unreachable
     target all come back as error set + findings empty.
     """
-    log_tool_start(target, "nikto")
-
     result = {
+        "tool": "nikto",
         "target": target,
         "port": port,
         "findings": [],
         "raw_output": "",
         "error": None,
+        "skipped": False,
     }
 
     host = _strip_scheme(target)
@@ -217,18 +215,20 @@ def run_nikto(target: str, port: int = 80, use_https: bool = False) -> dict:
     print_info(f"[Nikto] Scanning {scheme}://{host}:{port} (maxtime {maxtime}s)")
 
     # run_tool() applies config.get_timeout('nikto') itself — no timeout
-    # argument is passed or accepted here.
+    # argument is passed or accepted here. It also already logs this call's
+    # start/success/failure under the "nikto" tool name.
     tool_result = run_tool(target, "nikto", command)
     result["raw_output"] = tool_result.get("stdout", "") or ""
+    result["skipped"] = tool_result.get("skipped", False)
 
     if not tool_result.get("success"):
-        err = tool_result.get("error") or tool_result.get("stderr") or "nikto failed"
-        result["error"] = err
-        log_tool_failure(target, "nikto", err)
-        print_error(f"[Nikto] nikto failed for {target}:{port} — {err}")
+        result["error"] = tool_result.get("error") or tool_result.get("stderr") or "nikto failed"
+        print_error(f"[Nikto] nikto failed for {target}:{port} — {result['error']}")
         return result
 
     # Exit code 0 is not proof the scan happened — check nikto's own text.
+    # This is new information run_tool() couldn't have logged (it saw a
+    # clean exit), so it still gets its own failure line.
     failure_reason = _detect_failure(result["raw_output"])
     if failure_reason:
         result["error"] = failure_reason
@@ -238,8 +238,6 @@ def run_nikto(target: str, port: int = 80, use_https: bool = False) -> dict:
 
     findings = _parse_nikto_output(result["raw_output"])
     result["findings"] = findings
-
-    log_tool_success(target, "nikto", tool_result.get("duration"))
 
     if findings:
         for f in findings:

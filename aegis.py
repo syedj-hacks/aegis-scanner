@@ -18,7 +18,7 @@ import time
 
 from rich.prompt import Prompt
 
-from modules.utils.config import PROFILES, get_profile
+from modules.utils.config import PROFILES, get_profile, SKIP_KEY
 from modules.utils.display import (
     print_banner, print_panel, print_info, print_success,
     print_warning, print_error, print_summary,
@@ -37,11 +37,11 @@ __version__ = "1.0.0"
 # One-line description per profile, shown in --help. Kept here rather than
 # in config.py's PROFILES dict, which this phase does not own.
 PROFILE_DESCRIPTIONS = {
-    "quickscan": "Fast overview — DNS, top-port nmap scan, service detection.",
-    "stealthscan": "Slow-timing, full-port sweep — minimal footprint, no service probing.",
-    "webaudit": "Web-focused audit — headers, Nikto, gobuster + CVE enrichment on web ports.",
+    "quickscan": "Fast overview — DNS, top-port nmap scan, service detection, quick whatweb + high-severity nuclei check.",
+    "stealthscan": "Quiet -T2 scan of common ports — minimal footprint, no service probing.",
+    "webaudit": "Web-focused audit — headers, Nikto, gobuster/dirb, whatweb, sslyze + CVE enrichment on web ports.",
     "deepscan": "Full assessment — recon, all ports, web audit, CVE/severity/remediation, TXT+PDF reports.",
-    "compliance": "TLS cipher + HTTP header nmap scripts for a compliance-oriented baseline.",
+    "compliance": "TLS cipher + HTTP header nmap scripts, sslyze and whatweb on TLS ports for a compliance-oriented baseline.",
 }
 
 PROFILE_DISPATCH = {
@@ -107,6 +107,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="print extra pre-flight and timing detail",
     )
     parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="never prompt; when the stored-report cap is reached, delete "
+             "the oldest report automatically instead of asking. Implied "
+             "when stdin/stdout is not a terminal.",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"Aegis Scanner {__version__}",
@@ -116,14 +123,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _normalize_result(result):
     """
-    Profile functions return (scan_id, report_path) or, for deepscan,
-    (scan_id, txt_path, pdf_path). Flatten either shape to
-    (scan_id, [report_path, ...]) with None paths dropped.
+    Profile functions return (scan_id, report_path, stats) or, for deepscan,
+    (scan_id, txt_path, pdf_path, stats) — every profile now appends a
+    tools_run/tools_failed/tools_skipped dict as the last tuple element so
+    the final summary panel can report what actually happened instead of
+    always showing zero (build_summary()/summary_stats() only know severity
+    counts from the database, not which tools ran). Flattens either shape to
+    (scan_id, [report_path, ...], stats) with None paths dropped.
     """
     if not isinstance(result, tuple) or not result:
-        return None, []
-    scan_id, *paths = result
-    return scan_id, [p for p in paths if p]
+        return None, [], {}
+    *head, maybe_stats = result
+    if isinstance(maybe_stats, dict):
+        scan_id, *paths = head
+        stats = maybe_stats
+    else:
+        scan_id, *paths = result
+        stats = {}
+    return scan_id, [p for p in paths if p], stats
 
 
 def _prompt_target() -> str:
@@ -209,7 +226,11 @@ def main() -> int:
 
     print_panel(
         f"[bold]Target:[/bold]  {args.target}\n"
-        f"[bold]Profile:[/bold] {args.profile}",
+        f"[bold]Profile:[/bold] {args.profile}\n\n"
+        "[dim]Ctrl+C skips the tool currently running; press it twice quickly "
+        "to abort the whole scan.\n"
+        f"\\[{SKIP_KEY}] skips the current tool and moves to the next one "
+        "(ignored for compulsory tools like nmap/DNS resolution).[/dim]",
         title="Scan Configuration",
         style="cyan",
     )
@@ -231,7 +252,7 @@ def main() -> int:
     start = time.time()
 
     try:
-        result = dispatch(args.target)
+        result = dispatch(args.target, non_interactive=args.non_interactive)
     except KeyboardInterrupt:
         print_warning("Scan interrupted by user.")
         return 130
@@ -240,7 +261,7 @@ def main() -> int:
         return 1
 
     elapsed = time.time() - start
-    scan_id, report_paths = _normalize_result(result)
+    scan_id, report_paths, profile_stats = _normalize_result(result)
 
     if scan_id is None:
         print_error("Scan did not complete — no scan record was created.")
@@ -248,16 +269,22 @@ def main() -> int:
 
     summary = build_summary(scan_id)
     stats = summary_stats(summary)
+    # summary_stats() only knows severity counts from the database — it
+    # can't know which tools ran (that's not persisted). The profile
+    # orchestrator already counted that in real time, so its stats
+    # override the always-zero tools_run/tools_failed placeholders.
+    stats.update(profile_stats)
 
+    # Report paths, severity breakdown and notable finding types are all
+    # covered by the REPORT GENERATED panel the profile prints (see
+    # modules/reporting/completion.py), so they are not repeated here —
+    # this panel is now just the run-level facts that panel does not carry.
     completion_lines = [
         f"[bold]Scan ID:[/bold]  {scan_id}",
         f"[bold]Profile:[/bold] {args.profile}",
         f"[bold]Elapsed:[/bold] {elapsed:.1f}s",
     ]
-    if report_paths:
-        for path in report_paths:
-            completion_lines.append(f"[bold]Report:[/bold]   {path}")
-    else:
+    if not report_paths:
         completion_lines.append("[bold]Report:[/bold]   none generated")
     print_panel("\n".join(completion_lines), title="SCAN COMPLETE", style="green")
 

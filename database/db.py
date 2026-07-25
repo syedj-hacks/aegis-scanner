@@ -51,9 +51,18 @@ def init_db():
     # in it) stay valid with those fields simply NULL. ALTER TABLE ADD
     # COLUMN is safe to re-run every process start: skipped once the column
     # already exists.
+    #
+    # parameter/payload/evidence/endpoint were added later still, for the
+    # injection & scripting reporting section: SQLi (sqlmap) and XSS
+    # (nuclei DAST) findings carry the exact payload sent, the parameter/URL
+    # it was sent against, and a truncated response snippet proving
+    # exploitation. Every other finding shape leaves these NULL — they are
+    # only read by the report's dedicated injection section, which filters
+    # on finding_type.
     cur.execute("PRAGMA table_info(findings)")
     existing_columns = {row[1] for row in cur.fetchall()}
-    for column in ("description", "remediation", "finding_type"):
+    for column in ("description", "remediation", "finding_type", "product",
+                   "parameter", "payload", "evidence", "endpoint"):
         if column not in existing_columns:
             cur.execute(f"ALTER TABLE findings ADD COLUMN {column} TEXT")
 
@@ -77,13 +86,16 @@ def insert_scan(target: str, profile: str) -> int:
 
 def insert_finding(scan_id: int, finding: dict):
     """
-    finding: {port, service, version, cve_id, cvss, severity, description,
-              remediation, type/finding_type}
+    finding: {port, service, version, product, cve_id, cvss, severity,
+              description, remediation, type/finding_type,
+              parameter, payload, evidence, endpoint}
 
-    description/remediation/finding_type are nullable — callers that still
-    hand over the old CVE-shaped dict (no description/remediation/type key)
-    insert cleanly with those columns left NULL, same as any pre-migration
-    row.
+    description/remediation/finding_type/product/parameter/payload/evidence/
+    endpoint are all nullable — callers that still hand over the old
+    CVE-shaped dict (none of those keys) insert cleanly with those columns
+    left NULL, same as any pre-migration row. parameter/payload/evidence/
+    endpoint are only populated by the injection findings (sqlmap SQLi,
+    nuclei-DAST XSS) the report's injection section reads.
     """
     finding_type = finding.get("type") or finding.get("finding_type")
     if not finding_type and finding.get("cve_id"):
@@ -94,8 +106,9 @@ def insert_finding(scan_id: int, finding: dict):
     cur.execute(
         """INSERT INTO findings
            (scan_id, port, service, version, cve_id, cvss, severity,
-            description, remediation, finding_type)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            description, remediation, finding_type, product,
+            parameter, payload, evidence, endpoint)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             scan_id,
             finding.get("port"),
@@ -107,6 +120,11 @@ def insert_finding(scan_id: int, finding: dict):
             finding.get("description"),
             finding.get("remediation"),
             finding_type,
+            finding.get("product"),
+            finding.get("parameter"),
+            finding.get("payload"),
+            finding.get("evidence"),
+            finding.get("endpoint"),
         ),
     )
     conn.commit()

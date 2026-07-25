@@ -18,9 +18,7 @@ format varies across versions and target OSes, so parsing degrades to
 import re
 
 from modules.utils.error_handler import run_tool
-from modules.utils.logger import (
-    log_tool_start, log_tool_success, log_tool_failure, log_finding,
-)
+from modules.utils.logger import log_finding
 from modules.utils.display import (
     print_info, print_success, print_warning, print_error,
 )
@@ -114,36 +112,35 @@ def run_enum4linux(target: str) -> dict:
     empty, but without `error` set — that's a valid (if uninformative)
     result, not a failure.
     """
-    log_tool_start(target, "enum4linux")
-
     result = {
+        "tool": "enum4linux",
         "target": target,
         "shares": [],
         "users": [],
         "os_info": None,
         "raw_output": "",
         "error": None,
+        "skipped": False,
     }
 
     command = ["enum4linux"] + _ENUM4LINUX_BASE_ARGS + [target]
     print_info(f"[Enum4linux] Enumerating SMB/NetBIOS on {target}")
 
+    # run_tool() already logs this call's start/success/failure under the
+    # "enum4linux" tool name — no need to log it again here.
     tool_result = run_tool(target, "enum4linux", command)
     result["raw_output"] = tool_result.get("stdout", "") or ""
+    result["skipped"] = tool_result.get("skipped", False)
 
     if not tool_result.get("success") and not result["raw_output"].strip():
-        err = tool_result.get("error") or tool_result.get("stderr") or "enum4linux failed"
-        result["error"] = err
-        log_tool_failure(target, "enum4linux", err)
-        print_error(f"[Enum4linux] enum4linux failed for {target} — {err}")
+        result["error"] = tool_result.get("error") or tool_result.get("stderr") or "enum4linux failed"
+        print_error(f"[Enum4linux] enum4linux failed for {target} — {result['error']}")
         return result
 
     shares, users, os_info = _parse_enum4linux_output(result["raw_output"])
     result["shares"] = shares
     result["users"] = users
     result["os_info"] = os_info
-
-    log_tool_success(target, "enum4linux", tool_result.get("duration"))
 
     for share in shares:
         log_finding(target, {

@@ -20,9 +20,7 @@ import os
 import tempfile
 
 from modules.utils.error_handler import run_tool
-from modules.utils.logger import (
-    log_tool_start, log_tool_success, log_tool_failure, log_finding,
-)
+from modules.utils.logger import log_finding
 from modules.utils.display import (
     print_info, print_success, print_warning, print_error,
 )
@@ -121,14 +119,14 @@ def run_sslyze(target: str, port: int = 443) -> dict:
     report file that couldn't be written/read all come back as error set +
     findings empty.
     """
-    log_tool_start(target, "sslyze")
-
     result = {
+        "tool": "sslyze",
         "target": target,
         "port": port,
         "findings": [],
         "raw_output": "",
         "error": None,
+        "skipped": False,
     }
 
     host_port = f"{target}:{port}"
@@ -140,7 +138,10 @@ def run_sslyze(target: str, port: int = 443) -> dict:
         command = ["sslyze", f"--json_out={json_path}", host_port]
         print_info(f"[Sslyze] Auditing TLS on {host_port}")
 
+        # run_tool() already logs this call's start/success/failure under
+        # the "sslyze" tool name — no need to log it again here.
         tool_result = run_tool(target, "sslyze", command)
+        result["skipped"] = tool_result.get("skipped", False)
 
         try:
             with open(json_path, "r", encoding="utf-8") as fh:
@@ -151,16 +152,12 @@ def run_sslyze(target: str, port: int = 443) -> dict:
         result["raw_output"] = raw_json
 
         if not tool_result.get("success") and not raw_json.strip():
-            err = tool_result.get("error") or tool_result.get("stderr") or "sslyze failed"
-            result["error"] = err
-            log_tool_failure(target, "sslyze", err)
-            print_error(f"[Sslyze] sslyze failed for {host_port} — {err}")
+            result["error"] = tool_result.get("error") or tool_result.get("stderr") or "sslyze failed"
+            print_error(f"[Sslyze] sslyze failed for {host_port} — {result['error']}")
             return result
 
         findings = _parse_sslyze_json(raw_json)
         result["findings"] = findings
-
-        log_tool_success(target, "sslyze", tool_result.get("duration"))
 
         if findings:
             for f in findings:

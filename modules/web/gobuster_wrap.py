@@ -22,9 +22,7 @@ import os
 import re
 
 from modules.utils.error_handler import run_tool
-from modules.utils.logger import (
-    log_tool_start, log_tool_success, log_tool_failure, log_finding,
-)
+from modules.utils.logger import log_tool_failure, log_finding
 from modules.utils.display import (
     print_info, print_success, print_warning, print_error,
 )
@@ -65,6 +63,28 @@ _WORDPRESS_MARKERS = (
     "/wp-includes",
     "/xmlrpc.php",
 )
+
+# Some SPAs / edge-CDN setups answer *every* path with 200 and a body that
+# varies just enough (a per-request token, a timestamp) to defeat gobuster's
+# own wildcard auto-detection (which only fires when the response is
+# byte-for-byte identical). Left unchecked this "discovers" nearly the whole
+# wordlist as real content — e.g. 4606 of 4614 common.txt entries on one
+# real-world target — flooding the findings table with noise. If a
+# suspiciously large fraction of the wordlist "hit", treat the whole run as
+# a soft-404 wildcard the tool missed rather than real content.
+_FLOOD_MIN_COUNT = 200
+_FLOOD_RATIO = 0.5
+
+
+def _looks_like_wildcard_flood(discovered_count: int, wordlist_path: str) -> bool:
+    if discovered_count < _FLOOD_MIN_COUNT:
+        return False
+    try:
+        with open(wordlist_path, "r", encoding="utf-8", errors="ignore") as fh:
+            wordlist_size = sum(1 for line in fh if line.strip())
+    except OSError:
+        return False
+    return bool(wordlist_size) and (discovered_count / wordlist_size) >= _FLOOD_RATIO
 
 
 def _build_url(target: str, port: int, use_https: bool) -> str:
@@ -214,15 +234,15 @@ def run_gobuster(target: str, port: int = 80, use_https: bool = False,
     gobuster refuse to run; that one case is retried automatically with the
     wildcard page's length excluded, so such targets still return results.
     """
-    log_tool_start(target, "gobuster")
-
     result = {
+        "tool": "gobuster",
         "target": target,
         "port": port,
         "discovered_paths": [],
         "wordpress_fingerprinted": False,
         "raw_output": "",
         "error": None,
+        "skipped": False,
     }
 
     resolved_wordlist, wordlist_error = _resolve_wordlist(wordlist)
@@ -243,6 +263,7 @@ def run_gobuster(target: str, port: int = 80, use_https: bool = False,
     # argument is passed or accepted here.
     tool_result = run_tool(target, "gobuster", command)
     result["raw_output"] = tool_result.get("stdout", "") or ""
+    result["skipped"] = tool_result.get("skipped", False)
 
     # A wildcard-response refusal isn't a real failure — retry once with the
     # offending page length excluded, otherwise SPA targets always yield
@@ -259,25 +280,36 @@ def run_gobuster(target: str, port: int = 80, use_https: bool = False,
                 command + ["--exclude-length", retry_length],
             )
             result["raw_output"] = tool_result.get("stdout", "") or ""
+            result["skipped"] = tool_result.get("skipped", False)
 
     if not tool_result.get("success"):
         # gobuster writes the real reason (connection refused, bad
         # wordlist) to stderr and exits non-zero, so prefer stderr text
         # over run_tool's generic "non-zero exit code" wording.
         stderr = (tool_result.get("stderr") or "").strip()
-        err = stderr or tool_result.get("error") or "gobuster failed"
-        result["error"] = err
-        log_tool_failure(target, "gobuster", err)
-        print_error(f"[Gobuster] gobuster failed for {url} — {err}")
+        result["error"] = stderr or tool_result.get("error") or "gobuster failed"
+        print_error(f"[Gobuster] gobuster failed for {url} — {result['error']}")
         return result
 
     discovered = _parse_gobuster_output(result["raw_output"])
+
+    if _looks_like_wildcard_flood(len(discovered), resolved_wordlist):
+        # New information beyond run_tool()'s own success/failure verdict
+        # (the process succeeded; the *data* is being discarded as noise),
+        # so this one keeps its own log line.
+        msg = (
+            f"{url} answered {len(discovered)} of the wordlist's entries — "
+            "that's almost certainly a soft-404/wildcard response gobuster's "
+            "own detection missed, not real content; discarding these results"
+        )
+        log_tool_failure(target, "gobuster", msg)
+        print_warning(f"[Gobuster] {msg}")
+        return result
+
     result["discovered_paths"] = discovered
 
     wordpress_hits = _detect_wordpress(discovered)
     result["wordpress_fingerprinted"] = bool(wordpress_hits)
-
-    log_tool_success(target, "gobuster", tool_result.get("duration"))
 
     if discovered:
         for entry in discovered:

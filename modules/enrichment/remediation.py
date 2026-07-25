@@ -409,6 +409,14 @@ def remediation_text(finding: dict) -> str:
             "injection; deploy a WAF rule as an interim mitigation."
         )
 
+    if kind == "xss_finding":
+        return (
+            f"Contextually encode the '{finding.get('parameter') or 'reflected'}' "
+            "parameter on output (HTML/attribute/JS encoding as appropriate) and "
+            "validate input, to eliminate this confirmed reflected XSS; deploy a "
+            "Content-Security-Policy as defence in depth."
+        )
+
     if kind == "weak_credentials":
         return (
             "Change this credential immediately, enforce a strong password "

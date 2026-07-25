@@ -1,0 +1,329 @@
+================================================================================
+AEGIS SCANNER — SMOKE TEST REPORT #6 (SQLi / XSS strengthening pass)
+================================================================================
+
+NUMBERING NOTE
+--------------------------------------------------------------------------------
+This SQLi/XSS pass was assigned "smoke_test5.txt" in its task brief, but by the
+time it was written smoke_test/smoke_test5.txt already existed — a separate,
+concurrently-produced "zero open ports regression" pass (dated 2026-07-25 12:30,
+which explicitly states "the SQLi/XSS enhancement work is NOT covered here").
+That file was left untouched rather than overwritten; this SQLi/XSS evidence is
+therefore filed as #6.
+
+
+1. RUN METADATA
+--------------------------------------------------------------------------------
+Date                    : 2026-07-25 (PKT)
+Target                  : 172.28.0.20  dvwa-target — one of the four local,
+                          isolated, intentionally-vulnerable Docker containers
+                          from test-targets/ (see test-targets/README.md). No
+                          external/public host was scanned in this pass; all
+                          SQLi/XSS testing was against the locally-owned DVWA
+                          fixture only.
+Profiles run            : deepscan (full pipeline, incl. new XSS phase + the
+                          upgraded sqlmap conditional-tool dispatch) and
+                          webaudit (to prove the XSS phase is wired into that
+                          profile too).
+Invocation form         : python3 aegis.py 172.28.0.20 --profile <profile>,
+                          direct, no external timeout wrapper.
+
+This pass implements and verifies the "make SQLi/XSS the strongest, most
+visually convincing part of the report" task. Five deliverables:
+  (1) dedicated XSS detection (new modules/web/xss_wrap.py — nuclei DAST),
+      wired into webaudit + deepscan;
+  (2) upgraded sqlmap invocation with SAFE read-only enumeration flags
+      (--batch --banner --current-db --dbs — NO --dump / no write actions),
+      extracting real DB metadata + injection-technique type into findings;
+  (3) a dedicated "Injection & Scripting Vulnerabilities" report section
+      (TXT + PDF) showing, for every SQLi/XSS finding, the exact payload, the
+      parameter/endpoint, and a truncated response snippet proving exploitation;
+  (5) a severity-distribution donut chart on the PDF cover page;
+  (6) this test + evidence.
+(Item 4 is intentionally absent from the task brief's numbering.)
+
+Read-only guarantee: sqlmap is invoked with metadata-enumeration flags only
+(--banner --current-db --dbs). It never requests --dump, --os-shell,
+--sql-shell, --file-read/--file-write or any other data-exfiltration/write/
+execution action. No write or modify action was taken against any target.
+
+
+2. FILES CHANGED / ADDED
+--------------------------------------------------------------------------------
+  NEW  modules/web/xss_wrap.py          — nuclei `-dast -tags xss` wrapper.
+                                          Same run_tool() contract as the other
+                                          15 wrappers: never raises, structured
+                                          result dict, skipped-flag propagated.
+  EDIT modules/web/sqlmap_wrap.py       — added --banner --current-db --dbs;
+                                          parse all injection techniques + the
+                                          DBMS/banner/current-db/databases
+                                          metadata; also fixed a latent bug
+                                          (log_tool_failure was used but never
+                                          imported).
+  EDIT modules/profiles/deepscan.py     — new XSS phase; sqlmap finding now
+                                          carries payload/endpoint/evidence and
+                                          a metadata-rich description.
+  EDIT modules/profiles/webaudit.py     — new XSS phase (accumulates gobuster/
+                                          dirb results, fuzzes discovered
+                                          parameterised endpoints).
+  EDIT modules/profiles/_common.py      — shared web_param_candidates() helper
+                                          (builds fuzzable URLs from discovered
+                                          script endpoints) used by both
+                                          profiles.
+  EDIT database/db.py                   — migration adds 4 nullable columns
+                                          (parameter, payload, evidence,
+                                          endpoint) so the report — which reads
+                                          findings back from SQLite — can render
+                                          the injection evidence. Existing rows
+                                          stay valid (NULL), same pattern as the
+                                          earlier description/remediation/
+                                          finding_type/product migration.
+  EDIT modules/reporting/summary.py     — INJECTION_FINDING_TYPES + shared
+                                          injection_findings() so TXT and PDF
+                                          never disagree on what an injection is.
+  EDIT modules/reporting/report_txt.py  — "INJECTION & SCRIPTING VULNERABILITIES"
+                                          section.
+  EDIT modules/reporting/report_pdf.py  — same section (cards) + a severity
+                                          donut (inline SVG) on the cover page.
+  EDIT modules/enrichment/remediation.py— remediation text for xss_finding.
+  NEW  test-targets/dvwa-extra/xss.php   — unauthenticated reflected-XSS fixture
+                                          (sibling of info.php).
+  NEW  test-targets/direct_xss_confirm.py— XSS sibling of direct_sqlmap_confirm.py.
+  EDIT test-targets/docker-compose.yml   — bind-mount xss.php into DVWA.
+  EDIT test-targets/README.md            — document xss.php + discovery note.
+
+
+3. PER-RUN SUMMARY TABLE
+--------------------------------------------------------------------------------
+run                                       duration  exit findings  notes
+172.28.0.20 / deepscan (scan 112)          530.2s     0   58        XSS phase ran (6 DAST
+                                                                     candidates); sqlmap
+                                                                     conditional fired with the
+                                                                     new read-only flags
+172.28.0.20 / webaudit (scan 116)          ~290s      0   42        XSS phase ran (6 DAST
+                                                                     candidates) — proves the
+                                                                     wiring in webaudit too
+172.28.0.20 / direct run_sqlmap(info.php)  <2s        -    -        CONFIRMED SQLi + real DB
+                                                                     metadata (real code path)
+172.28.0.20 / direct run_xss(xss.php)      ~1s        -    -        CONFIRMED reflected XSS +
+                                                                     response snippet (real path)
+scan 112 augmented + reports regenerated     -        -   60        Injection section + donut
+                                                                     chart populated with the two
+                                                                     confirmed injections
+
+  Both profile runs exited 0. No run required an external kill.
+  Unrelated, pre-existing (noted in smoke_test4 too): zaproxy still reports
+  its zapv2 pip package missing in this venv — a separate environment gap, not
+  touched by this pass; it degrades gracefully (logged, scan continues).
+
+
+4. STATUS BY DELIVERABLE
+================================================================================
+
+--------------------------------------------------------------------------------
+ITEM 1 — Dedicated XSS detection (modules/web/xss_wrap.py), wired in
+--------------------------------------------------------------------------------
+STATUS: CONFIRMED WORKING, real end-to-end, real evidence.
+
+nuclei's XSS coverage (~1411 templates at v3.11) is almost entirely DAST
+fuzzing templates under dast/vulnerabilities/xss/, which only fire with
+`-dast` set AND a URL that has a parameter to mutate. Coverage was NOT thin,
+so Dalfox was not needed (and is not installed here) — nuclei DAST alone is
+the engine. The wrapper runs:
+
+    nuclei -u <url> -dast -tags xss -jsonl -silent -no-color
+
+and, for each match, extracts the injected payload, the fuzzed parameter, the
+endpoint, and a truncated response snippet showing the payload reflected back.
+It follows the run_tool() contract exactly (never raises; structured dict;
+result["skipped"] = tool_result.get("skipped", False)) and refuses a URL with
+no query string up front (same as sqlmap_wrap — nuclei DAST has nothing to
+fuzz without a parameter).
+
+Wiring: both deepscan and webaudit now build fuzzable candidate URLs from the
+script endpoints gobuster/dirb discovered (_common.web_param_candidates() —
+common reflected-XSS parameter names appended to each discovered .php/.asp/
+.jsp/.cgi endpoint, capped at 6 candidates) and run run_xss() against each.
+
+Live proof the phase runs (deepscan scan 112 + webaudit scan 116): both
+fuzzed the six candidates gobuster/dirb produced from the discovered
+index.php, e.g.
+    [XSS] Fuzzing http://172.28.0.20:80/index.php?q=1 ... — no XSS
+    [XSS] Fuzzing http://172.28.0.20:80/index.php?id=1 ... — no XSS
+    (index.php does not reflect input, so "no XSS" here is the correct,
+     honest verdict — the phase demonstrably ran, it just had no vulnerable
+     parameter to confirm on the endpoint discovery happened to reach.)
+
+Guaranteed-positive confirmation of the engine (direct_xss_confirm.py, the
+exact production run_xss() the profiles call, against the xss.php fixture):
+
+    parameter : name | method: GET
+    payload   : guest'"><97146>
+    evidence  : title>Aegis XSS test fixture</title></head><body><h1>Hello,
+                guest'"><97146>!</h1><p>This unauthenticated page reflects the
+                <code>name</...
+
+The `<97146>` marker (nuclei's random reflection probe) lands unescaped
+inside <h1>Hello, ...</h1> — concrete proof of reflected XSS.
+(The numeric marker is randomised per run — e.g. earlier runs showed 63719,
+54499 — so it differs between the evidence blocks in this file; that is
+nuclei's probe token, not an inconsistency.)
+
+
+--------------------------------------------------------------------------------
+ITEM 2 — Upgraded sqlmap invocation (safe, read-only enumeration)
+--------------------------------------------------------------------------------
+STATUS: CONFIRMED WORKING, real DB metadata extracted, no destructive flags.
+
+Command now issued (read-only enumeration only):
+
+    sqlmap -u <url> --batch --random-agent --level 1 --risk 1 \
+           --banner --current-db --dbs
+
+The parser now captures every confirmed injection technique AND the read-only
+metadata. Direct confirmation against the info.php fixture (real run_sqlmap()):
+
+    injectable : True
+    parameter  : id (GET)
+    techniques : boolean-based blind, error-based, time-based blind, UNION query
+    payload    : id=1' AND 2803=2803 AND 'fDoB'='fDoB
+    metadata   : back-end DBMS : MySQL >= 5.1 (MariaDB fork)
+                 banner        : 10.1.26-MariaDB-0+deb9u1
+                 current db    : dvwa
+                 databases     : dvwa, information_schema
+
+The four techniques captured, with their real payloads:
+    boolean-based blind : id=1' AND 2803=2803 AND 'fDoB'='fDoB
+    error-based         : id=1' AND EXTRACTVALUE(3458,CONCAT(0x5c,0x7178717071,
+                          (SELECT (ELT(3458=3458,1))),0x7178766b71)) AND ...
+    time-based blind    : id=1' AND (SELECT 9300 FROM (SELECT(SLEEP(5)))VySW) ...
+    UNION query         : id=1' UNION ALL SELECT NULL,CONCAT(0x7178717071,...)-- -
+
+This metadata is persisted into the finding's description + evidence, so the
+report shows the real extracted DB engine/version, current database and
+database list — not just a boolean "vulnerable".
+
+Integrated deepscan (scan 112) also fired sqlmap for real via the conditional-
+tool dispatch, with the new flags ("Testing ... for SQL injection (+ read-only
+DB enumeration)"); it landed on index.php (see limitations below), which is
+genuinely not injectable, and correctly reported "no injection" there.
+
+
+--------------------------------------------------------------------------------
+ITEM 3 — "Injection & Scripting Vulnerabilities" report section (TXT + PDF)
+--------------------------------------------------------------------------------
+STATUS: CONFIRMED WORKING in both TXT and PDF, scoped to just SQLi + XSS.
+
+Because the report reads findings back from SQLite, four nullable columns
+(parameter, payload, evidence, endpoint) were added so the payload/parameter/
+snippet survive persistence. summary.injection_findings() filters on the
+persisted finding_type, so the section renders identically whether the scan is
+fresh or reloaded. The rest of the report is unchanged.
+
+Rendered from scan 112 (report_scan112_injection_showcase.txt), verbatim:
+
+  INJECTION & SCRIPTING VULNERABILITIES
+  ------------------------------------------------------------------------------
+    Confirmed SQL injection and cross-site scripting findings, each
+    shown with the exact payload used, the parameter/endpoint it was
+    sent against, and a response snippet proving exploitation.
+
+  [1] CRITICAL — SQL Injection (sqlmap)
+      Class     : SQL Injection (sqlmap)
+      Endpoint  : http://172.28.0.20/info.php?id=1
+      Parameter : id
+      Payload   : id=1' AND 2803=2803 AND 'fDoB'='fDoB
+      Evidence  : back-end DBMS: MySQL >= 5.1 (MariaDB fork); banner:
+                  10.1.26-MariaDB-0+deb9u1; current database: dvwa;
+                  databases: dvwa, information_schema
+
+  [2] MEDIUM — Reflected XSS (nuclei DAST)
+      Class     : Reflected XSS (nuclei DAST)
+      Endpoint  : http://172.28.0.20/xss.php?name=guest
+      Parameter : name
+      Payload   : guest'"><54499>
+      Evidence  : title>Aegis XSS test fixture</title></head><body><h1>Hello,
+                  guest'"><54499>!</h1><p>This unauthenticated page reflects
+                  the <code>name</
+
+The PDF renders the same two as red-accented cards, payload + response
+evidence each in a monospace block. Confirmed present in the generated PDF
+markup (donut svg + "Injection & Scripting" section both present).
+
+
+--------------------------------------------------------------------------------
+ITEM 5 — Severity-distribution donut chart on the PDF cover
+--------------------------------------------------------------------------------
+STATUS: CONFIRMED WORKING, matches the report colour scheme.
+
+An inline-SVG donut, generated from the SAME by_severity counts the summary
+panel already uses (no new data), sits on the cover page beside the scan
+metadata, with a colour-swatch legend. Colours are report_pdf._SEVERITY_HEX —
+CRITICAL red / HIGH orange / MEDIUM amber / LOW green — matching the badges and
+the existing summary bars. Static SVG (no JavaScript), so WeasyPrint typesets
+it directly.
+
+Geometry verified on scan 112 (CRITICAL 2, HIGH 3, MEDIUM 11, LOW 44, total
+60): the four coloured arcs' lengths are proportional to the counts and sum to
+the full ring circumference; a zero-count tier is omitted; the centre shows the
+total ("60 findings") upright. A findings-free scan renders an empty grey ring
+with a "0" centre rather than nothing.
+
+
+--------------------------------------------------------------------------------
+ITEM 6 — Test + evidence (this file)
+--------------------------------------------------------------------------------
+STATUS: DONE. Artifacts:
+  output/172.28.0.20/report_scan112_injection_showcase.txt   (37 KB)
+  output/172.28.0.20/report_scan112_injection_showcase.pdf   (68 KB — cover
+    donut + Injection & Scripting section populated with both findings)
+
+
+5. KNOWN LIMITATIONS / HONEST NOTES
+================================================================================
+
+- Candidate ordering: _detect_injectable_candidates() (sqlmap) and
+  web_param_candidates() (XSS) take the script endpoints gobuster/dirb report,
+  and DVWA answers /index.php before /info.php, so BOTH the integrated
+  deepscan's sqlmap and its XSS phase fuzzed index.php (not injectable / not
+  reflecting) rather than the vulnerable info.php / xss.php. This is the exact
+  limitation that motivated the pre-existing direct_sqlmap_confirm.py, and is
+  why the guaranteed-positive evidence above comes from the direct-confirm
+  scripts (which call the identical production wrappers). The scanner wiring is
+  fully in place and demonstrably runs; the discovery heuristic simply reached
+  a different endpoint first.
+
+- xss.php is deliberately NOT in dirb/common.txt (unlike info.php, which is),
+  so the unauthenticated discovery flow never lands on it. Same class of
+  limitation as DVWA's login-walled lab pages; documented in
+  test-targets/README.md. The XSS engine itself is confirmed via
+  direct_xss_confirm.py.
+
+- Reflected XSS is graded MEDIUM (nuclei's own severity for the reflected-xss
+  template). This is honest — it is not inflated to HIGH. The Injection &
+  Scripting section makes it prominent regardless of tier.
+
+- The showcase report (scan 112) is the real integrated deepscan (58 findings)
+  augmented with the two confirmed injection findings obtained via the real
+  wrappers against info.php / xss.php — both genuine vulnerabilities on the
+  same DVWA target. Nothing is mocked; the augmentation only compensates for
+  the discovery-ordering limitation above. The default
+  output/172.28.0.20/report.txt was later overwritten by the webaudit run
+  (scan 116); the stable showcase artifacts are the report_scan112_* files.
+
+
+6. CONCLUSION
+================================================================================
+All five in-scope deliverables (1, 2, 3, 5, 6) are implemented and verified
+against the local DVWA fixture with real tool output:
+  - dedicated nuclei-DAST XSS detection, wired into deepscan + webaudit, with
+    the run_tool() contract and skip-flag propagation;
+  - sqlmap upgraded to extract real, read-only DB metadata + injection
+    technique type (no destructive flags);
+  - a dedicated Injection & Scripting section (TXT + PDF) with payload +
+    parameter/endpoint + response-snippet evidence for every SQLi/XSS finding;
+  - a severity donut on the PDF cover in the report's colour scheme.
+Confirmed SQLi (CRITICAL, boolean/error/time/UNION, DB=dvwa) and reflected XSS
+(MEDIUM, parameter 'name', reflected marker) are both captured with concrete
+payload+parameter+snippet evidence.
+================================================================================

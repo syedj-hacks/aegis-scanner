@@ -5,8 +5,13 @@ Webaudit profile orchestrator for Aegis Scanner (Phase 8 - profiles layer).
 Web-focused profile: DNS resolution, a port scan restricted to web ports
 (PROFILES['webaudit']['nmap_args'] already scopes nmap to 80,443,8080,8443),
 the full web module (header audit, nikto, gobuster, dirb, whatweb, sslyze,
-banner grabbing) against whatever of those ports came back open, CVE lookup
-+ severity + remediation on the web findings, and a text report.
+banner grabbing) against whatever of those ports came back open, a dedicated
+cross-site-scripting pass (nuclei `-dast -tags xss` via
+modules/web/xss_wrap.py, fuzzed against parameterised URLs built from the
+discovered script endpoints), CVE lookup + severity + remediation on the web
+findings, and a text report. Confirmed XSS findings carry the exact payload,
+parameter/endpoint and a response snippet, rendered in the report's
+Injection & Scripting section.
 
 Wrapper availability
 ---------------------
@@ -17,9 +22,11 @@ split (a full ZAP baseline scan is heavier than webaudit's fast-audit
 scope). It is still logged as skipped here rather than silently omitted.
 """
 
-from modules.utils.config import get_profile
+import time
+
+from modules.utils.config import get_profile, PROFILE_TIME_BUDGET_SECONDS
 from modules.utils.display import (
-    scan_progress_bar, print_phase, print_warning, print_success, print_error, print_info,
+    scan_progress_bar, print_phase, print_success, print_error, print_info, print_warning,
 )
 from modules.utils.logger import log_scan_start, log_scan_end, log_tool_failure
 from modules.recon.dns import resolve_dns
@@ -31,36 +38,38 @@ from modules.web.gobuster_wrap import run_gobuster
 from modules.web.dirb_wrap import run_dirb
 from modules.web.whatweb_wrap import run_whatweb
 from modules.web.sslyze_wrap import run_sslyze
-from modules.enrichment.cve_lookup import lookup_cves
+from modules.web.xss_wrap import run_xss
+from modules.enrichment.cve_lookup import lookup_cves_from_banner
 from modules.enrichment.severity import score_finding
 from modules.enrichment.remediation import get_remediation
 from database.db import insert_scan, insert_findings_bulk
-from modules.reporting.report_txt import generate_txt_report
+from modules.profiles._common import (
+    warn_unavailable_tools, count_and_report_tool_failures, web_param_candidates,
+    finalise_reports,
+)
 
 PROFILE_NAME = "webaudit"
 
-_AVAILABLE_TOOLS = {"nslookup", "nmap", "nikto", "gobuster", "dirb", "whatweb", "sslyze", "banner_grab"}
+# zaproxy has a real wrapper (modules/web/zap_wrap.py) but is deliberately
+# not run here — see the module docstring — so it's left out of this set on
+# purpose, not because no wrapper exists. warn_unavailable_tools() checks
+# GLOBAL_AVAILABLE_TOOLS before deciding which of those two messages to log.
+_WIRED_TOOLS = {"nslookup", "nmap", "nikto", "gobuster", "dirb", "whatweb", "sslyze", "banner_grab"}
 
 _HTTPS_PORTS = (443, 8443)
-
-
-def _warn_unavailable_tools(target: str, tools, profile_name: str) -> None:
-    if not tools or tools == "ALL":
-        return
-    for tool in tools:
-        if tool not in _AVAILABLE_TOOLS:
-            msg = (
-                f"'{tool}' is listed in PROFILES['{profile_name}'] but has no "
-                "wrapper module in this codebase yet — skipping"
-            )
-            log_tool_failure(target, tool, msg)
-            print_warning(f"[{profile_name}] {msg}")
+_WEB_PORTS = (80, 443, 8080, 8443)
 
 
 def _is_https_port(port_entry: dict) -> bool:
     port = port_entry.get("port")
     service = str(port_entry.get("service") or "").lower()
     return port in _HTTPS_PORTS or "ssl" in service or "https" in service
+
+
+def _is_web_port(port_entry: dict) -> bool:
+    port = port_entry.get("port")
+    service = str(port_entry.get("service") or "").lower()
+    return port in _WEB_PORTS or "http" in service or "ssl" in service
 
 
 def _score_and_remediate(findings: list) -> list:
@@ -181,27 +190,65 @@ def _findings_from_banners(banner_result: dict) -> list:
     ]
 
 
-def run_webaudit(target: str):
+def _findings_from_xss(xss_result: dict, port) -> list:
+    """
+    Build reflected-XSS findings carrying the payload nuclei injected, the
+    parameter/endpoint it was injected into, and the response snippet
+    showing the payload reflected back — the evidence the report's Injection
+    & Scripting section renders.
+    """
+    findings = []
+    for f in xss_result.get("findings") or []:
+        description = (
+            f"Reflected cross-site scripting in parameter '{f['parameter']}' "
+            f"({f['method']}) at {f['endpoint']} — the injected payload is "
+            f"reflected unescaped in the response body."
+        )
+        findings.append({
+            "type": "xss_finding", "port": port,
+            "parameter": f["parameter"],
+            "severity": (f["severity"] or "medium").upper(),
+            "payload": f["payload"],
+            "endpoint": f["endpoint"],
+            "evidence": f["evidence"],
+            "reference": f.get("reference"),
+            "description": description,
+        })
+    return findings
+
+
+def run_webaudit(target: str, non_interactive: bool = False):
     """
     Run the webaudit profile against `target`: DNS resolution, a nmap scan
     restricted to web ports, the full web module against whichever of those
     came back open, CVE/severity/remediation enrichment on the web findings,
     and a text report.
 
+    Findings are persisted per-port, immediately after that port's tool
+    loop finishes, rather than held in memory until every port has been
+    audited — an interrupt partway through a multi-port target keeps every
+    completed port's findings. A profile-level wall-clock budget
+    (config.PROFILE_TIME_BUDGET_SECONDS['webaudit']) also bounds the
+    per-port loop as a whole: TOOL_TIMEOUTS bounds one subprocess call, not
+    "headers+nikto+gobuster+dirb+whatweb+sslyze, repeated per open web
+    port", which has no ceiling of its own otherwise.
+
     Returns
     -------
-    tuple: (scan_id: int, report_path: str | None)
+    tuple: (scan_id: int, report_path: str | None, stats: dict)
     """
     log_scan_start(target, PROFILE_NAME)
     print_phase(f"WEBAUDIT — {target}")
 
     profile_cfg = get_profile(PROFILE_NAME)
-    _warn_unavailable_tools(target, profile_cfg.get("tools"), PROFILE_NAME)
+    warn_unavailable_tools(target, profile_cfg.get("tools"), PROFILE_NAME, _WIRED_TOOLS)
 
     scan_id = insert_scan(target, PROFILE_NAME)
 
     tool_results = []
     findings = []
+    gobuster_results = []
+    dirb_results = []
 
     with scan_progress_bar(2, f"Webaudit: {target}") as advance:
         dns_result = resolve_dns(target)
@@ -213,89 +260,126 @@ def run_webaudit(target: str):
         open_ports = port_result.get("open_ports") or []
         advance("Web port scan")
 
-    header_results, nikto_results, gobuster_results = [], [], []
-    dirb_results, whatweb_results, sslyze_results = [], [], []
-    banner_result = {"banners": []}
-
     if open_ports:
-        ports = [p["port"] for p in open_ports]
-        banner_result = grab_banners(target, ports)
-        tool_results.append(banner_result)
+        # webaudit's own nmap scan is already scoped to web ports only
+        # (PROFILES['webaudit']['nmap_args'] = -p 80,443,8080,8443), so
+        # every open port here is, by construction, one banner_grab's raw
+        # TCP probe wastes ~11s timing out on for nothing (HTTP(S) servers
+        # don't send an unsolicited banner — header_check/-sV already
+        # cover them). Kept as a filter rather than deleted outright in
+        # case that port scope ever changes.
+        non_web_ports = [p["port"] for p in open_ports if not _is_web_port(p)]
+        if non_web_ports:
+            banner_result = grab_banners(target, non_web_ports)
+            tool_results.append(banner_result)
+            insert_findings_bulk(scan_id, _score_and_remediate(_findings_from_banners(banner_result)))
+        else:
+            print_info(f"[{PROFILE_NAME}] all open ports are web ports — banner_grab skipped (nmap/headers already cover them)")
+
+        budget = PROFILE_TIME_BUDGET_SECONDS.get(PROFILE_NAME)
+        loop_start = time.time()
+        budget_exhausted = False
 
         with scan_progress_bar(len(open_ports) * 5, f"Web module: {target}") as advance:
             for port_entry in open_ports:
+                if budget is not None and (time.time() - loop_start) > budget:
+                    remaining = [p["port"] for p in open_ports[open_ports.index(port_entry):]]
+                    msg = (
+                        f"time budget ({budget}s) exhausted — skipping remaining "
+                        f"port(s) {remaining}, finishing with partial results"
+                    )
+                    log_tool_failure(target, PROFILE_NAME, msg)
+                    print_warning(f"[{PROFILE_NAME}] {msg}")
+                    budget_exhausted = True
+                    break
+
                 port = port_entry["port"]
                 use_https = _is_https_port(port_entry)
+                port_findings = []
 
                 header_result = check_headers(target, port=port, use_https=use_https)
                 tool_results.append(header_result)
-                header_results.append(header_result)
+                port_findings.extend(_score_and_remediate(_findings_from_headers(header_result)))
+                server_banner = header_result.get("server_banner")
+                if server_banner:
+                    cve_result = lookup_cves_from_banner(server_banner, target=target)
+                    port_findings.extend(_findings_from_cves(
+                        cve_result.get("cves") or [], port, server_banner,
+                    ))
                 advance(f"Headers :{port}")
 
                 nikto_result = run_nikto(target, port=port, use_https=use_https)
                 tool_results.append(nikto_result)
-                nikto_results.append(nikto_result)
+                port_findings.extend(_score_and_remediate(_findings_from_nikto(nikto_result)))
                 advance(f"Nikto :{port}")
 
                 gobuster_result = run_gobuster(target, port=port, use_https=use_https)
                 tool_results.append(gobuster_result)
                 gobuster_results.append(gobuster_result)
+                port_findings.extend(_score_and_remediate(_findings_from_gobuster(gobuster_result)))
                 advance(f"Gobuster :{port}")
 
                 dirb_result = run_dirb(target, port=port, use_https=use_https)
                 tool_results.append(dirb_result)
                 dirb_results.append(dirb_result)
+                port_findings.extend(_score_and_remediate(_findings_from_dirb(dirb_result)))
                 advance(f"Dirb :{port}")
 
                 whatweb_result = run_whatweb(target, port=port, use_https=use_https)
                 tool_results.append(whatweb_result)
-                whatweb_results.append(whatweb_result)
+                port_findings.extend(_score_and_remediate(_findings_from_whatweb(whatweb_result)))
                 advance(f"WhatWeb :{port}")
 
                 if use_https:
                     sslyze_result = run_sslyze(target, port=port)
                     tool_results.append(sslyze_result)
-                    sslyze_results.append(sslyze_result)
+                    port_findings.extend(_score_and_remediate(_findings_from_sslyze(sslyze_result)))
+
+                # Persisted as soon as this port's tools finish — not
+                # batched across the whole port loop — so a later port's
+                # interrupt/budget cutoff never costs this one's findings.
+                insert_findings_bulk(scan_id, port_findings)
+                findings.extend(port_findings)
+
+        # --- XSS fuzzing (dedicated) ---------------------------------
+        # nuclei DAST scoped to XSS templates, fuzzed against parameterised
+        # URLs built from the script endpoints gobuster/dirb discovered.
+        # Runs after the per-port loop so it has the full discovery set.
+        xss_candidates = web_param_candidates(gobuster_results, dirb_results)
+        if xss_candidates:
+            print_phase(f"XSS — {target}")
+            xss_findings = []
+            with scan_progress_bar(len(xss_candidates), f"XSS fuzzing: {target}") as advance:
+                for candidate_url, candidate_port in xss_candidates:
+                    xss_result = run_xss(target, candidate_url)
+                    tool_results.append(xss_result)
+                    xss_findings.extend(_findings_from_xss(xss_result, candidate_port))
+                    advance(f"XSS {candidate_url}")
+            xss_scored = _score_and_remediate(xss_findings)
+            insert_findings_bulk(scan_id, xss_scored)
+            findings.extend(xss_scored)
+        else:
+            print_info(
+                f"[{PROFILE_NAME}] no parameterised script endpoint discovered "
+                "— XSS fuzzing skipped (nothing to fuzz)"
+            )
     else:
         print_info(f"[{PROFILE_NAME}] no web port open on {target} — web module skipped")
 
-    findings.extend(_score_and_remediate(_findings_from_banners(banner_result)))
-
-    for header_result in header_results:
-        findings.extend(_score_and_remediate(_findings_from_headers(header_result)))
-        server_banner = header_result.get("server_banner")
-        if server_banner:
-            cve_result = lookup_cves(server_banner, target=target)
-            findings.extend(_findings_from_cves(
-                cve_result.get("cves") or [], header_result.get("port"), server_banner,
-            ))
-
-    for nikto_result in nikto_results:
-        findings.extend(_score_and_remediate(_findings_from_nikto(nikto_result)))
-
-    for gobuster_result in gobuster_results:
-        findings.extend(_score_and_remediate(_findings_from_gobuster(gobuster_result)))
-
-    for dirb_result in dirb_results:
-        findings.extend(_score_and_remediate(_findings_from_dirb(dirb_result)))
-
-    for whatweb_result in whatweb_results:
-        findings.extend(_score_and_remediate(_findings_from_whatweb(whatweb_result)))
-
-    for sslyze_result in sslyze_results:
-        findings.extend(_score_and_remediate(_findings_from_sslyze(sslyze_result)))
-
-    insert_findings_bulk(scan_id, findings)
-
     stats = {
         "tools_run": len(tool_results),
-        "tools_failed": sum(1 for r in tool_results if r.get("error")),
+        "tools_failed": count_and_report_tool_failures(target, tool_results),
+        "tools_skipped": sum(1 for r in tool_results if r.get("skipped")),
     }
     log_scan_end(target, stats)
 
-    report_path = generate_txt_report(scan_id)
+    # Writes both reports, prunes the capped history and prints the
+    # end-of-scan REPORT GENERATED banner — see _common.finalise_reports().
+    txt_path, pdf_path = finalise_reports(
+        target, PROFILE_NAME, scan_id, non_interactive=non_interactive
+    )
     print_success(f"[{PROFILE_NAME}] scan {scan_id} complete — {len(findings)} finding(s)")
-    return scan_id, report_path
+    return scan_id, txt_path, pdf_path, stats
 
 
 if __name__ == "__main__":
@@ -305,5 +389,5 @@ if __name__ == "__main__":
         print_error("Usage: python -m modules.profiles.webaudit <target>")
         sys.exit(1)
 
-    sid, path = run_webaudit(sys.argv[1])
+    sid, path, _stats = run_webaudit(sys.argv[1])
     print_success(f"Webaudit complete — scan_id={sid} report={path}")

@@ -16,9 +16,7 @@ parses vulnerabilities out of the core/plugins/themes sections.
 import json
 
 from modules.utils.error_handler import run_tool
-from modules.utils.logger import (
-    log_tool_start, log_tool_success, log_tool_failure, log_finding,
-)
+from modules.utils.logger import log_finding
 from modules.utils.display import (
     print_info, print_success, print_warning, print_error,
 )
@@ -118,14 +116,14 @@ def run_wpscan(target: str, port: int = 80, use_https: bool = False,
     nothing) all come back as error set (for the former) or findings empty
     (for the latter).
     """
-    log_tool_start(target, "wpscan")
-
     result = {
+        "tool": "wpscan",
         "target": target,
         "port": port,
         "findings": [],
         "raw_output": "",
         "error": None,
+        "skipped": False,
     }
 
     url = _build_url(target, port, use_https)
@@ -135,20 +133,19 @@ def run_wpscan(target: str, port: int = 80, use_https: bool = False,
 
     print_info(f"[WPScan] Scanning WordPress install at {url}")
 
+    # run_tool() already logs this call's start/success/failure under the
+    # "wpscan" tool name — no need to log it again here.
     tool_result = run_tool(target, "wpscan", command)
     result["raw_output"] = tool_result.get("stdout", "") or ""
+    result["skipped"] = tool_result.get("skipped", False)
 
     if not tool_result.get("success") and not result["raw_output"].strip():
-        err = tool_result.get("error") or tool_result.get("stderr") or "wpscan failed"
-        result["error"] = err
-        log_tool_failure(target, "wpscan", err)
-        print_error(f"[WPScan] wpscan failed for {url} — {err}")
+        result["error"] = tool_result.get("error") or tool_result.get("stderr") or "wpscan failed"
+        print_error(f"[WPScan] wpscan failed for {url} — {result['error']}")
         return result
 
     findings = _parse_wpscan_json(result["raw_output"])
     result["findings"] = findings
-
-    log_tool_success(target, "wpscan", tool_result.get("duration"))
 
     if findings:
         for f in findings:

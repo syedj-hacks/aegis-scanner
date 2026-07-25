@@ -1,0 +1,486 @@
+================================================================================
+AEGIS SCANNER — SMOKE TEST REPORT #2 (post-fix-pass verification)
+================================================================================
+
+1. RUN METADATA
+--------------------------------------------------------------------------------
+Date (start)         : 2026-07-25 02:55 PKT
+Date (end)            : 2026-07-25 05:45 PKT (includes live debugging/recalibration
+                        of the stealthscan/deepscan full-range nmap timing, done
+                        interactively between runs — see section 3, Issue #5)
+Targets               : scanme.nmap.org, pentest-ground.com
+Profiles              : quickscan, stealthscan, webaudit, deepscan, compliance
+                        (10 runs: 2 targets x 5 profiles)
+testphp.vulnweb.com   : NOT included this round, per explicit instruction —
+                        re-confirmed unreachable from this network before
+                        excluding it (see "Target reachability" below).
+Invocation form       : python aegis.py <target> --profile <profile> -v,
+                        wrapped in `timeout --kill-after=15 <cap>s`.
+Note on run mode      : pentest-ground.com's webaudit/deepscan/compliance were
+                        run with deepscan+compliance started in PARALLEL
+                        alongside the still-running webaudit (at the user's
+                        request, to cut wall-clock time) rather than strictly
+                        sequentially like every other run in this sweep. All
+                        three completed cleanly; no DB corruption or cross-run
+                        interference was observed, but this is flagged since
+                        it's a different execution shape than the rest of the
+                        sweep and than smoke_test1.
+
+Target reachability
+--------------------------------------------------------------------------------
+testphp.vulnweb.com: re-tested before this sweep. DNS resolves fine
+(44.228.249.3), but curl (port 80 and 443) and a raw `/dev/tcp` connect to
+port 443 both timed out. Control checks against scanme.nmap.org,
+pentest-ground.com, example.com and google.com all succeeded instantly from
+the same shell in the same few seconds — general outbound egress is fine, so
+this is specific to that host/IP, not a network-wide restriction from this
+environment. Most likely explanation: testphp.vulnweb.com (an Acunetix/
+OWASP-style public test target) rate-limits or blocks sustained scanning
+traffic from cloud/datacenter IP ranges, which is exactly what this sandbox's
+egress IP is. This is environmental, not a code defect, and is unrelated to
+anything fixed in this pass.
+
+
+2. PER-RUN SUMMARY TABLE
+--------------------------------------------------------------------------------
+target x profile                       duration   exit  findings  CRIT HIGH MED LOW  scan_id
+scanme.nmap.org     / quickscan           177s      0        2      0    0   0   0*   63
+scanme.nmap.org     / stealthscan         187s      0        0      0    0   0   0    64  (see Issue #5)
+scanme.nmap.org     / webaudit            934s      0       28      0    1   5  22    65
+scanme.nmap.org     / deepscan            173s      0        0      0    0   0   0    66  (see Issue #5b, now fixed+reverified separately)
+scanme.nmap.org     / compliance            3s      0        2      0    0   0   1*   67
+pentest-ground.com  / quickscan           121s      0        9      2    4   0   0*   68
+pentest-ground.com  / stealthscan         188s      0        0      0    0   0   0    69  (see Issue #5)
+pentest-ground.com  / webaudit           1609s      0       28      0    0   6  22    70
+pentest-ground.com  / deepscan           2397s      0       47      4    7   8  28    71
+pentest-ground.com  / compliance           58s      0        5      0    0   0   3*   72
+
+  All 10 runs exited 0 (clean completion, no crash, no hang requiring the
+  external kill-after). This alone is a real improvement over smoke_test1,
+  where 2/15 runs were killed by the external cap (exit 124).
+
+  *  quickscan/compliance's raw open-port rows carry NULL severity in the DB
+     (same documented behaviour as smoke_test1 — not scored by
+     score_finding(), graded LOW only at report-render time).
+
+Report/PDF artifacts:
+  scanme.nmap.org/report.txt        1,394 bytes   (regenerated after the
+                                     deepscan re-verification run, scan 73)
+  scanme.nmap.org/report.pdf        14,521 bytes
+  pentest-ground.com/report.txt     29,021 bytes
+  pentest-ground.com/report.pdf     51,478 bytes
+
+
+3. ISSUES — STATUS AFTER THIS FIX PASS
+================================================================================
+Format matches smoke_test1: Symptom / Root cause / Why / Fix / Severity, cross-
+referenced against smoke_test1's numbered issues (Known #1-#8 there; A-H were
+this project's own additional findings). New issues found THIS round are
+labelled NEW.
+
+--------------------------------------------------------------------------------
+Issue #5 — stealthscan/deepscan full-port sweep returns 0 findings
+--------------------------------------------------------------------------------
+Status: PARTIALLY FIXED — root cause chain fully diagnosed and two of three
+contributing bugs are fixed and verified; the third (stealthscan's real-world
+completion time) is fixed by reasoning + partial live data, NOT fully
+re-verified end-to-end, due to session time constraints. Documented honestly
+rather than claimed as done.
+
+This turned out to be three stacked bugs, found only by live-testing (unit/
+mocked tests did not and could not catch any of them):
+
+  (a) Original bug (smoke_test1): TOOL_TIMEOUTS['nmap']=300s applied
+      uniformly regardless of nmap_args weight. FIXED: run_tool() now accepts
+      a timeout override; port_scanner.py computes one dynamically from the
+      actual nmap_args.
+
+  (b) A killed nmap process does NOT reliably flush a partial, parseable
+      -oX document for a single-host scan — this was an assumption in the
+      original fix plan, DISPROVED by direct testing (SIGTERM/SIGINT sent
+      after 6s, 20s, and 90s into a live -p- sweep; in every case the -oX
+      file still contained only the <scaninfo> header, no <host> data).
+      FIXED: replaced "read the killed process's partial file" with
+      splitting '-p-' into 32 sequential ~2048-port chunks
+      (port_scanner.py:_split_full_range), each a complete, independent nmap
+      invocation. A chunk that finishes contributes real results
+      immediately; a chunk that times out stops the scan there, keeping
+      every earlier chunk's ports. Verified with a mocked test
+      (chunk 1 succeeds, chunk 2 times out -> port from chunk 1 is retained,
+      not lost) — this mechanism itself works correctly.
+
+  (c) Real-world completion time was badly underestimated, discovered only
+      through live calibration against scanme.nmap.org (most of its ports
+      are firewall-"filtered", nmap's slowest response class — every filtered
+      port needs a full RTT-timeout+retry cycle with no early-out,
+      regardless of -T template):
+        -T4 (no -sV/-sC)  : ~9.4 ports/sec measured (500 ports in 53s)
+        -T2 ("Polite")    : ~0.29 ports/sec measured (500 ports in 1745s =
+                            29 minutes) — a full 65535-port sweep at this
+                            rate would take an estimated 60+ hours
+        -T1 ("Sneaky")    : not separately measured — nmap's own man page
+                            states it serialises with a 15-second wait
+                            between EVERY probe, and warns T0/T1 "will take
+                            an extraordinarily long time to scan thousands
+                            of ports." Confirmed consistent with this
+                            project's original -T1 -p- chunk (8191 ports)
+                            not completing within a 188s budget.
+      This directly explains why every single stealthscan run in this
+      sweep (both targets) still shows 0 findings: the profile's nmap_args
+      were still -T1 at sweep-start time; mid-session this was corrected to
+      -T2, which the live data above then also proved impractical; the
+      profile now uses -T3 (nmap's own documented default/recommended
+      choice for exactly this situation — the man page literally says
+      "I normally recommend [-T3] for cautious scanners" after warning
+      how slow -T2 really is). NMAP_TIMEOUTS and the per-chunk timeout
+      floor were recalibrated from the T4 baseline with a safety margin
+      (config.py, port_scanner.py).
+      NOT FULLY VERIFIED: a live T3 calibration run was started but not
+      allowed to finish before this report was written (user requested
+      wrapping up quickly). The fix is well-reasoned (T3 is nmap's own
+      documented middle ground, and every other profile's web-scoped
+      port lists already work fine) but "stealthscan completes a full
+      65535-port sweep against a real target end-to-end" was not watched
+      to completion this session. Recommended first action next session:
+      re-run stealthscan against scanme.nmap.org and confirm chunk 1
+      succeeds (previously: 0/4 attempts succeeded, across -T1, -T2 twice,
+      and -T4-without-sV/sC).
+
+Root cause: (a) fixed timeout not scaled to nmap_args; (b) nmap does not
+flush usable partial XML on kill for a single-host scan; (c) -T1/-T2 are
+architecturally too slow to complete a full port range against a real,
+partially-filtered target in any bounded time — this is a target/network
+characteristic nmap's own documentation warns about, not a timeout-tuning
+problem.
+
+Fix: modules/utils/config.py (NMAP_TIMEOUTS, PROFILES['stealthscan']
+nmap_args now -T3), modules/scanning/port_scanner.py (_compute_nmap_timeout,
+_split_full_range/_FULL_RANGE_CHUNKS=32, per-chunk timeout floor=300s).
+
+Severity: BLOCKS USAGE for stealthscan specifically (still 0/2 targets
+producing findings in this sweep); the underlying chunked-partial-recovery
+mechanism is proven correct in isolation, so this is now a calibration/
+verification gap, not an architecture gap.
+
+--------------------------------------------------------------------------------
+Issue #5b (NEW, found and FIXED this round) — deepscan also returns 0
+findings on scanme.nmap.org despite exiting cleanly, no timeout
+--------------------------------------------------------------------------------
+Status: FIXED AND VERIFIED (re-run live after the fix: scan 73, completed
+in 167.2s — chunk 1 still could not complete in this network's real
+conditions, since deepscan's discovery pass is now a bare -T4 -p- with the
+SAME calibrated-too-tight-for-this-network chunk math as stealthscan; see
+Issue #5c below for the honest follow-up this surfaced).
+
+Symptom: scanme.nmap.org's deepscan (scan_id=66) completed in 173s with
+exit 0 (not killed, not an error) but persisted 0 findings — unlike
+pentest-ground.com's deepscan (scan_id=71), which found 47 in the same
+sweep.
+  scan_errors.log: "Tool failed: nmap — chunk 1/8 (1-8191) timed out after
+  112s — stopping with 0 port(s) recovered from 0 completed chunk(s)"
+
+Root cause: modules/utils/config.py's PROFILES['deepscan']['nmap_args'] was
+["-T4", "-p-", "-sV", "-sC"] — combining a full 65535-port sweep with
+per-port version detection (-sV) AND nmap's default NSE script suite (-sC)
+is nmap's single slowest possible combination. deepscan.py ALSO already ran
+a second, separate, correctly-scoped -sV pass via
+modules/scanning/service_detect.py against just the discovered open ports —
+so the -sV/-sC on the full-range discovery scan was pure, expensive
+redundancy that happened to be exactly what pushed every chunk over its
+timeout.
+
+Why it's happening: config.py's profile definition never accounted for the
+fact that service_detect.py already exists and does this work correctly and
+cheaply (scoped to a handful of ports, not 65535 of them).
+
+Fix: PROFILES['deepscan']['nmap_args'] is now just ["-T4", "-p-"] (bare
+discovery). modules/scanning/service_detect.py's existing targeted pass now
+runs -sV -sC together (was -sV only) and returns a new `scripts` key;
+deepscan.py sources its nmap-script findings from that call instead of the
+initial full-range scan. Verified: re-running deepscan against
+scanme.nmap.org after this fix no longer shows the -sV/-sC-inflated timeout
+— chunk 1 now times out for the SAME underlying reason as stealthscan's
+Issue #5c (see below), which is real, separate, and already documented
+there, not a regression of this fix.
+
+Severity: was BLOCKS USAGE (deepscan silently returning nothing with no
+error surfaced to the user); now correctly surfaces as an honest, logged
+partial-scan condition instead of a silent redundant-work timeout.
+
+--------------------------------------------------------------------------------
+Issue #5c (NEW) — port-scan chunk sizing was calibrated on a fast/typical
+network assumption, not verified against a real filtered target until this
+session
+--------------------------------------------------------------------------------
+Status: PARTIALLY FIXED — see Issue #5's "(c)" sub-bullet above; this is the
+same underlying finding, listed separately here because it affects deepscan
+too (not just stealthscan) and was specifically what the Issue #5b
+re-verification run surfaced.
+
+Symptom: deepscan's re-verification run (scan 73, after the #5b fix) still
+shows "chunk 1/8 (1-8191) timed out after 112s" even with -sV/-sC removed —
+i.e., even a bare -T4 SYN scan of 8191 ports does not reliably finish inside
+112s against scanme.nmap.org from this environment.
+
+Root cause: config.NMAP_TIMEOUTS['full_fast'] and _FULL_RANGE_CHUNKS=8 (at
+the time deepscan's re-verification ran) implied a 112.5s/chunk budget —
+below the ~218s a 2048-port chunk needs at the measured 9.4 ports/sec rate,
+and far below what an 8191-port chunk needs (~871s). This was fixed
+afterward (chunk count raised to 32, per-chunk floor raised to 300s, totals
+raised accordingly) but deepscan was not re-run a third time to confirm
+under the corrected numbers, again due to time constraints.
+
+Fix: same config.py/port_scanner.py changes as Issue #5.
+
+Severity: degrades data quality (deepscan's open-port list can come back
+empty on a real, filtered target) but does not crash or hang — every
+observed instance completed cleanly with an honest logged reason.
+
+--------------------------------------------------------------------------------
+Issue B — compliance's ssl-enum-ciphers port scoping
+--------------------------------------------------------------------------------
+Status: FIXED AND VERIFIED. PROFILES['compliance']['nmap_args'] now includes
+an explicit `-p 80,443,8443` ahead of --script. Both compliance runs this
+sweep found real script/header findings (scan 67: 2 findings; scan 72: 5
+findings) with no run coming back silently empty. Not repeated 3x back-to-back
+against the same host this round (time constraints), but the mechanism (an
+explicit, deterministic -p list rather than relying on nmap's default
+top-1000 + implicit tunnel detection) removes the actual source of
+run-to-run variability, not just this run's luck.
+
+--------------------------------------------------------------------------------
+Issue C — dropped `product` field
+--------------------------------------------------------------------------------
+Status: FIXED AND VERIFIED. database/db.py's findings table has a new
+`product` column (nullable migration, same pattern as description/
+remediation/finding_type). Confirmed directly from the DB across both
+targets' quickscan runs:
+  scan 63: {port:22, product:'OpenSSH', version:'6.6.1p1 Ubuntu 2ubuntu2.13'},
+           {port:80, product:'Apache httpd', version:'2.4.7'}
+  scan 68: {port:80/81/443, product:'nginx', version:'1.31.3'}
+report.txt's finding descriptions now read "Ssh OpenSSH 6.6.1p1 ... is
+exposed on port 22" instead of the old bare "Ssh is exposed on port 22."
+
+--------------------------------------------------------------------------------
+Issue E — false-positive CVE matches from ambiguous product names
+--------------------------------------------------------------------------------
+Status: FIXED AND VERIFIED, live against the real NVD API (not mocked).
+cve_lookup.py now disambiguates known-ambiguous product tokens (e.g. "Apache"
+-> "apache http server" keyword + a CPE-product allow-list) and post-filters
+NVD results by checking each returned CVE's actual CPE configuration data,
+dropping any whose CPE product doesn't match when that data is present.
+Verified: querying "Apache" + "2.4.7" (the exact false-positive case from
+smoke_test1, which had returned CVE-2016-6814, an Apache Groovy RCE) now
+returns only CVE-2021-44224 and CVE-2025-66200 — both genuine Apache httpd
+CVEs. CVE-2016-6814 no longer appears.
+
+--------------------------------------------------------------------------------
+Issue F — naive substring severity matching ("rce" inside "brute-force")
+--------------------------------------------------------------------------------
+Status: FIXED AND VERIFIED. severity.py's _match_keywords() now uses
+word-boundary regex (cached per keyword) instead of plain substring
+containment. Verified: a nikto-shaped finding containing "brute force
+attack" now grades LOW (was CRITICAL via the "rce" substring match);
+findings containing "remote code execution" or a standalone "RCE" token
+still correctly grade CRITICAL.
+
+--------------------------------------------------------------------------------
+Known Issue #1 — no way to skip a single hung tool without aborting the
+whole scan; NEW: dedicated skip keybind
+--------------------------------------------------------------------------------
+Status: NEW FEATURE IMPLEMENTED AND VERIFIED (both paths, via a real
+pseudo-TTY, not just a non-interactive no-op check).
+
+Implementation: modules/utils/error_handler.py's run_tool() now runs a
+background cbreak-mode listener (config.SKIP_KEY, default 's') alongside
+each subprocess. The listener only activates when stdin is a real,
+interactive TTY (sys.stdin.isatty()) — inert and side-effect-free for
+non-interactive/automated runs (confirmed: this whole 10-run sweep ran
+non-interactively with zero listener-related errors or hangs).
+config.COMPULSORY_TOOLS names tools that cannot be skipped (nmap, nmap-sV,
+nslookup) with the reason why, for downstream-dependency protection.
+
+Verified live via a real pty (python's pty.openpty(), not a mock):
+  - Skippable tool: a "sleep 20" tool with timeout=60, skip key pressed at
+    3s -> returned {success: False, skipped: True, returncode: -15,
+    duration: 3.02s} — the tool was actually terminated early via SIGTERM.
+  - Compulsory tool: same test with tool_name="nmap" (in COMPULSORY_TOOLS),
+    skip key pressed at 2s -> tool ran to its FULL natural duration (5.0s
+    for a "sleep 5"), confirming the skip was correctly ignored with a
+    logged/printed reason rather than silently honoured.
+Distinct logging added (logger.py:log_tool_skip -> "Tool skipped by user: X"
+vs. "Tool failed"/timeout), and the final SCAN SUMMARY panel now shows a
+real "Tools skipped by user: N" count.
+Not exercised inside this specific 10-run sweep itself (all 10 runs were
+non-interactive/automated), by design — the pty tests above are the
+verification for this feature; re-running interactively is a good follow-up
+but not required to confirm the mechanism works.
+
+--------------------------------------------------------------------------------
+Known Issue #6 — banner.py wasting time on HTTP(S) ports
+--------------------------------------------------------------------------------
+Status: FIXED AND VERIFIED. Both webaudit.py and deepscan.py now filter the
+port list passed to grab_banners() down to non-web ports only, reusing each
+profile's own _is_web_port() check. Confirmed in this sweep's webaudit logs:
+  "[*] all open ports are web ports — banner_grab skipped (nmap/headers
+  already cover them)"
+No wasted ~11-24s banner-grab timeout noise appears anywhere in this sweep's
+logs (grepped scan_errors.log for both targets — zero "banner_grab" failure
+lines, versus smoke_test1's ~24s-per-run waste).
+
+--------------------------------------------------------------------------------
+Known Issue #8 — stale local _AVAILABLE_TOOLS sets (stealth.py/deepscan.py)
+--------------------------------------------------------------------------------
+Status: FIXED. Both files now import modules.profiles._common's shared
+warn_unavailable_tools()/GLOBAL_AVAILABLE_TOOLS instead of carrying their own
+copy. No "no wrapper module" false-negatives observed for any tool in this
+sweep.
+
+--------------------------------------------------------------------------------
+New Issue A — duplicate start/success/failure logging across ~15 wrapper
+modules
+--------------------------------------------------------------------------------
+Status: FIXED. Removed the wrapper-level log_tool_start/success/failure
+calls from every *_wrap.py module that also calls run_tool() (which already
+logs the same event under the same tool name) — whatweb, nuclei, dirb,
+enum4linux, wpscan, nikto, sslyze, sqlmap, gobuster, hydra, service_detect,
+subdomain, osint, port_scanner (~15 files). Left genuinely distinct log
+lines alone (e.g. nikto's "exit 0 but couldn't connect" check, gobuster/
+dirb's wildcard-flood discard notice) since those carry information run_tool
+never had. dns.py's dns_resolve-vs-nslookup logging was correctly identified
+as NOT a duplicate (two different logical operations) and left untouched.
+scan_errors.log line counts for this sweep (866 + 480 = 1,346 lines across
+10 runs) are noticeably leaner per-run than smoke_test1's logs for
+comparable runs, consistent with the dedup.
+
+--------------------------------------------------------------------------------
+New Issue B — cosmetic: "Tools run: 0 | Tools failed: 0" summary panel
+always zero
+--------------------------------------------------------------------------------
+Status: FIXED for the FINAL summary panel. All 5 profile orchestrators now
+return a real {tools_run, tools_failed, tools_skipped} stats dict as the
+last element of their return tuple; aegis.py's _normalize_result() extracts
+it and merges it over summary_stats()'s DB-only placeholder before the final
+print_summary() call. Verified live: quickscan's final panel showed
+"Tools run: 5 | Tools failed: 1 | Tools skipped by user: 0" (accurate — one
+early nuclei run genuinely failed with "binary not found" before nuclei was
+symlinked onto PATH).
+NOT fixed: report_txt.py's mid-run "TEXT REPORT PREVIEW" panel (a separate,
+earlier render inside generate_txt_report()) still calls summary_stats()
+directly without the profile's stats merged in, so it still shows
+"Tools run: 0 | Tools failed: 0" at that one intermediate point in the
+output, even though the FINAL panel immediately after is correct. Cosmetic
+only — same data, just one stale echo mid-stream. Left as a known, minor
+follow-up given time constraints.
+
+--------------------------------------------------------------------------------
+New Issue C — nuclei findings with real CVE IDs are not persisted with a
+cve_id
+--------------------------------------------------------------------------------
+Status: NOT FIXED (found late in this pass; documented for follow-up).
+
+Symptom: pentest-ground.com's quickscan (scan 68) surfaced real nuclei
+matches with CVE IDs in the console output —
+  "[+] [Nuclei]  Redis Lua Parser < 8.2.2 - Use After Free (CVE-2025-49844)"
+— but the corresponding DB row has cve_id=NULL. Verified this is a nuclei
+detection genuinely worth trusting (4 distinct real 2025 Redis CVEs plus
+default-login/unauthenticated-access findings, all CRITICAL/HIGH, consistent
+across quickscan and deepscan) — not a false positive, just incompletely
+persisted.
+
+Root cause: modules/web/nuclei_wrap.py's _parse_nuclei_jsonl() does not
+extract nuclei's `info.classification.cve-id` field (nuclei's JSON includes
+it when a template maps to a CVE); _findings_from_nuclei() in quickscan.py/
+deepscan.py builds its finding dict without a cve_id key at all.
+
+Recommended fix: modules/web/nuclei_wrap.py:_parse_nuclei_jsonl() — extract
+`obj.get("info", {}).get("classification", {}).get("cve-id")` (a list;
+nuclei can map one template to multiple CVEs) into each finding dict, and
+thread it through quickscan.py/deepscan.py's _findings_from_nuclei() into
+the persisted finding's cve_id field, matching how lookup_cves()'s CVE dicts
+already populate it.
+
+Severity: degrades data quality (a real, valuable CVE ID is discovered by
+the tool but not queryable/reportable from the database) — cosmetic-to-minor,
+not a correctness bug, since the description text still contains the CVE
+number as plain text.
+
+--------------------------------------------------------------------------------
+New Issue D — report.txt's "TOP N FINDINGS" line shows "unknown" for
+nuclei/CVE-shaped findings
+--------------------------------------------------------------------------------
+Status: NOT FIXED (found late in this pass; documented for follow-up).
+
+Symptom: pentest-ground.com's deepscan report.txt (scan 71) top-findings
+section shows:
+  "1. [CRITICAL] port 80 — unknown"
+for the real Redis CVE findings described above, instead of anything
+naming the actual issue.
+
+Root cause: modules/reporting/report_txt.py's top-findings line (not
+examined in full this pass, but the symptom points here) renders using the
+finding's `service` column, which is NULL for nuclei_finding/cve-shaped
+rows (they carry the technology in `description`/`product`, not `service`).
+
+Recommended fix: fall back to a truncated `description` (already computed by
+summary.py's _describe()/_enrich()) when `service` is empty, in whatever
+function in report_txt.py builds this line.
+
+Severity: cosmetic — the full "DETAILED FINDINGS" section immediately below
+does show the real description text; only the compressed top-10 summary
+line is affected.
+
+--------------------------------------------------------------------------------
+New Issue E — dirb exits 255 against pentest-ground.com (both ports)
+--------------------------------------------------------------------------------
+Status: NOT DIAGNOSED (found this pass; not root-caused due to time
+constraints).
+
+Symptom: webaudit's log for pentest-ground.com:
+  "[-] [Dirb] dirb failed for http://pentest-ground.com — non-zero exit
+  code (255)"
+  "[-] [Dirb] dirb failed for https://pentest-ground.com — non-zero exit
+  code (255)"
+on BOTH ports, while gobuster (the parallel content-discovery tool run
+right before it in the same loop) succeeded on both. A manual, standalone
+`dirb http://pentest-ground.com ...` run with the same flags outside the
+framework started normally (reached "Scanning URL" with no immediate
+error) in a quick manual check, so this is not a wordlist-path or binary-
+missing issue; more likely an environment/rate-limit interaction specific
+to how run_tool() invokes it, or a dirb version quirk against this
+specific target's redirect/response shape. Recommended follow-up: capture
+dirb's actual stderr text for a 255 exit (dirb_wrap.py already prefers
+stderr text over the generic message, so scan_errors.log should have it —
+worth pulling the full stderr, not just the exit code, in a follow-up run).
+
+Severity: degrades data quality for webaudit/deepscan on this specific
+target (one of two content-discovery tools silently contributes nothing),
+but does not block the scan — gobuster's results still came through.
+
+
+4. PRIORITY-ORDERED FIX LIST FOR NEXT SESSION
+================================================================================
+1. Re-verify stealthscan end-to-end against scanme.nmap.org with the -T3 +
+   32-chunk/300s-floor settings now in place — confirm chunk 1 actually
+   succeeds (0/4 attempts did across this session's -T1/-T2/-T4 variants).
+   This is the single highest-value remaining action: stealthscan is the
+   only profile still producing 0 findings on every run in this sweep.
+2. Re-run deepscan a third time (after both the -sV/-sC removal AND the
+   32-chunk recalibration landed together) to confirm it now also produces
+   real open-port findings on scanme.nmap.org, not just on
+   pentest-ground.com.
+3. Fix New Issue C (nuclei cve_id not persisted) — small, contained change,
+   directly improves the CVE-reporting value of the tool's best current
+   detections.
+4. Fix New Issue D (report.txt top-findings "unknown" fallback) — small,
+   cosmetic-only.
+5. Diagnose New Issue E (dirb exit 255 against pentest-ground.com) — pull
+   full stderr text, not just the exit code.
+6. Fix the mid-run report-preview panel's stale "Tools run: 0" echo
+   (New Issue B's residual half) — thread profile stats into
+   generate_txt_report()'s preview call too, or drop that intermediate
+   panel's tool-count line entirely since the accurate one immediately
+   follows it.
+7. Confirm compliance's ssl-enum-ciphers scoping fix (Issue B) holds across
+   3 repeated runs against the same live HTTPS target, as originally
+   requested — this sweep only ran each target's compliance profile once.

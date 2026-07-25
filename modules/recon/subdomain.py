@@ -10,7 +10,7 @@ and dedupes the results, and returns a clean sorted list of subdomains.
 import re
 
 from modules.utils.error_handler import run_tool
-from modules.utils.logger import log_tool_start, log_tool_success, log_tool_failure, log_finding
+from modules.utils.logger import log_finding
 from modules.utils.display import print_info, print_success, print_warning, print_error, print_tree
 
 # Loose hostname validator: label.label.label..., each label alnum/hyphen,
@@ -68,8 +68,9 @@ def enumerate_subdomains(target: str) -> dict:
     }
 
     for tool_name, command in tool_commands.items():
-        log_tool_start(target, tool_name)
         print_info(f"[Subdomain] Running {tool_name} against {target}...")
+        # run_tool() already logs each call's start/success/failure under
+        # its own tool_name — no need to log it again here.
         tool_result = run_tool(target, tool_name, command)
         tool_results[tool_name] = tool_result
 
@@ -77,17 +78,26 @@ def enumerate_subdomains(target: str) -> dict:
             found = _extract_hostnames(tool_result.get("stdout", "") or "")
             all_subdomains.update(found)
             tools_used.append(tool_name)
-            log_tool_success(target, tool_name, tool_result.get("duration"))
             print_success(f"[Subdomain] {tool_name} found {len(found)} subdomain(s)")
         else:
             err = tool_result.get("error") or tool_result.get("stderr") or f"{tool_name} failed"
-            log_tool_failure(target, tool_name, err)
             print_warning(f"[Subdomain] {tool_name} failed or unavailable: {err}")
 
     subdomains_sorted = sorted(all_subdomains)
 
+    # This wraps two independent run_tool() calls (subfinder, amass), each
+    # with its own "skipped" flag nested in tool_results[name] — surfaced
+    # here as one top-level flag too so a profile orchestrator's simple
+    # per-result stats loop (which only ever looks at r.get("skipped"), not
+    # this dict's nested per-tool breakdown) still counts a skip as a skip
+    # rather than silently miscounting it as neither a success nor failure.
+    any_skipped = any(tr.get("skipped") for tr in tool_results.values())
+
     if not tools_used:
-        print_error(f"[Subdomain] All enumeration tools failed for {target}")
+        if any_skipped:
+            print_warning(f"[Subdomain] enumeration skipped by user for {target}")
+        else:
+            print_error(f"[Subdomain] All enumeration tools failed for {target}")
     else:
         print_success(f"[Subdomain] {len(subdomains_sorted)} unique subdomain(s) found for {target}")
 
@@ -95,11 +105,14 @@ def enumerate_subdomains(target: str) -> dict:
         log_finding(target, {"type": "subdomain", "value": sub})
 
     return {
+        "tool": "subdomain_enum",
         "target": target,
         "subdomains": subdomains_sorted,
         "count": len(subdomains_sorted),
         "tools_used": tools_used,
         "tool_results": tool_results,
+        "skipped": any_skipped,
+        "error": None if tools_used else "all enumeration tools failed or were skipped",
     }
 
 

@@ -22,6 +22,7 @@ through _sanitise() as a belt-and-braces guard before it reaches the
 console, the log file, or the returned dict.
 """
 
+import re
 import time
 
 import requests
@@ -131,6 +132,136 @@ def _build_keyword(product, version=None) -> str:
     if version is not None and str(version).strip():
         parts.append(str(version).strip())
     return " ".join(parts)[:_MAX_KEYWORD_LEN]
+
+
+# ---------------------------------------------------------------------
+# Product disambiguation
+# ---------------------------------------------------------------------
+# A bare banner token like "Apache" is genuinely ambiguous — NVD's
+# keywordSearch is a plain AND-of-words match, and "Apache" alone is a
+# substring of descriptions for Apache HTTP Server, Apache Tomcat, Apache
+# Struts, Apache Groovy, Apache ActiveMQ and dozens of other unrelated
+# Apache Software Foundation projects. A real scan hit this: an
+# "Apache/2.4.7" Server header returned CVE-2016-6814 (an Apache Groovy
+# RCE) as a top match — wrong product entirely, just the same vendor name.
+#
+# Each alias maps a banner token (lower-cased) to:
+#   keyword       : a more specific NVD keywordSearch phrase to send instead
+#                   of the bare token, biasing the free-text match toward
+#                   the right product
+#   cpe_products  : the CPE 2.3 "product" component(s) (the 5th ':'-field
+#                   in cpe:2.3:a:vendor:PRODUCT:version:...) that count as
+#                   a genuine match — checked in _cve_matches_product()
+#                   below against the CVE's own configurations/CPE data, a
+#                   much stronger signal than the free-text keyword search
+#                   alone since NVD assigns CPEs deliberately per-product.
+_PRODUCT_ALIASES = {
+    "apache": {"keyword": "apache http server", "cpe_products": {"http_server"}},
+    "nginx": {"keyword": "nginx", "cpe_products": {"nginx"}},
+    "iis": {"keyword": "internet information services", "cpe_products": {"internet_information_services", "internet_information_server"}},
+    "microsoft-iis": {"keyword": "internet information services", "cpe_products": {"internet_information_services", "internet_information_server"}},
+    "tomcat": {"keyword": "apache tomcat", "cpe_products": {"tomcat"}},
+    "openssh": {"keyword": "openssh", "cpe_products": {"openssh"}},
+    "vsftpd": {"keyword": "vsftpd", "cpe_products": {"vsftpd"}},
+    "proftpd": {"keyword": "proftpd", "cpe_products": {"proftpd"}},
+    "mysql": {"keyword": "mysql", "cpe_products": {"mysql"}},
+    "postgresql": {"keyword": "postgresql", "cpe_products": {"postgresql"}},
+    "lighttpd": {"keyword": "lighttpd", "cpe_products": {"lighttpd"}},
+}
+
+
+def _disambiguate_product(product) -> tuple:
+    """
+    Look up a raw product token against _PRODUCT_ALIASES.
+
+    Returns (keyword_product, cpe_products) where keyword_product is what
+    should be sent to NVD's keywordSearch (the alias's more specific phrase,
+    or the original token when there's no alias) and cpe_products is the
+    set of acceptable CPE product components to verify results against, or
+    None when this product has no known alias (in which case results are
+    not CPE-filtered — see _cve_matches_product()).
+    """
+    key = str(product or "").strip().lower()
+    alias = _PRODUCT_ALIASES.get(key)
+    if not alias:
+        return product, None
+    return alias["keyword"], alias["cpe_products"]
+
+
+def _extract_cpe_products(cve: dict) -> set:
+    """
+    Pull every CPE 2.3 "product" component NVD attached to this CVE's
+    vulnerable configurations (cpe:2.3:PART:VENDOR:PRODUCT:VERSION:...).
+    Returns a lower-cased set; empty when the CVE carries no CPE data (some
+    very new or very old entries don't) — callers must treat "no data" as
+    "cannot verify", not "does not match".
+    """
+    products = set()
+    for node in (cve.get("configurations") or []):
+        for inner in (node.get("nodes") or []):
+            for match in (inner.get("cpeMatch") or []):
+                criteria = match.get("criteria") or ""
+                fields = criteria.split(":")
+                # cpe:2.3:part:vendor:product:version:... -> index 4
+                if len(fields) > 4 and fields[4]:
+                    products.add(fields[4].lower())
+    return products
+
+
+def _cve_matches_product(cve: dict, cpe_products) -> bool:
+    """
+    True when this CVE should be kept for a disambiguated product query.
+
+    cpe_products is None for products with no known alias — those are
+    never filtered (best-effort keyword search remains the only signal, as
+    before). For an aliased product, the CVE is kept if either its CPE data
+    intersects the expected product set, or it has no CPE data at all (NVD
+    entries without configurations are rare but exist; dropping them would
+    trade one accuracy problem for another). It is only dropped when NVD
+    *does* attach CPE data and none of it matches — the strongest possible
+    signal that the keyword hit was a same-vendor, wrong-product false
+    positive like the Apache httpd/Groovy case this was built for.
+    """
+    if cpe_products is None:
+        return True
+    cve_products = _extract_cpe_products(cve)
+    if not cve_products:
+        return True
+    return bool(cve_products & cpe_products)
+
+
+_BANNER_TOKEN_RE = re.compile(r"^([A-Za-z][\w.+-]*)/([\w.+-]+)$")
+_VERSION_LIKE_RE = re.compile(r"^\d")
+
+
+def _parse_banner(banner) -> tuple:
+    """
+    Split a raw Server/X-Powered-By banner into (product, version).
+
+    Server headers commonly follow "Product/Version" (Apache/2.4.7,
+    nginx/1.18.0, Tengine/2.3.3), sometimes with trailing comment tokens
+    ("Apache/2.4.7 (Ubuntu) OpenSSL/1.0.1f"). Querying NVD with the whole
+    raw string as one keyword blob rarely matches anything, since
+    keywordSearch is a plain AND-of-words match and a slash-joined value or
+    a parenthetical is not a word any CVE description contains. Only the
+    first token is used, split on its own "/"; a second half that doesn't
+    look like a version (doesn't start with a digit) is dropped rather than
+    sent to NVD as a bogus version filter — some WAFs/CDNs return an
+    obfuscated Server value (e.g. "Tengine/Aserver") specifically to defeat
+    banner-based fingerprinting, and "Tengine" alone still stands a chance
+    of matching real CVEs where "Tengine/Aserver" never will.
+    """
+    text = str(banner or "").strip()
+    if not text:
+        return text, None
+
+    first_token = text.split()[0]
+    match = _BANNER_TOKEN_RE.match(first_token)
+    if not match:
+        return text, None
+
+    product, version = match.group(1), match.group(2)
+    return (product, version) if _VERSION_LIKE_RE.match(version) else (product, None)
 
 
 def _validate(product, version) -> str:
@@ -275,7 +406,7 @@ def _extract_references(cve: dict) -> list:
     return refs
 
 
-def _parse_cves(payload, product: str = "", version=None) -> list:
+def _parse_cves(payload, product: str = "", version=None, cpe_products=None) -> list:
     """
     Turn an NVD 2.0 response body into this module's clean CVE dicts.
 
@@ -285,14 +416,25 @@ def _parse_cves(payload, product: str = "", version=None) -> list:
     findings row (service, version, cve_id, cvss, severity) can be filled
     without carrying the parent result around.
 
+    cpe_products, when given (a disambiguated product — see
+    _disambiguate_product()), drops any CVE whose own CPE configuration
+    data names a different product entirely (_cve_matches_product()) — the
+    keywordSearch endpoint alone cannot tell "Apache HTTP Server" apart
+    from "Apache Groovy" beyond both containing the word "Apache".
+
     Sorted worst-first so a caller that only shows the top few gets the
     ones that matter; unscored CVEs sort last.
     """
     cves = []
+    dropped = 0
     for item in (payload or {}).get("vulnerabilities") or []:
         cve = (item or {}).get("cve") or {}
         cve_id = cve.get("id")
         if not cve_id:
+            continue
+
+        if not _cve_matches_product(cve, cpe_products):
+            dropped += 1
             continue
 
         score, severity, cvss_version = _extract_metric(cve.get("metrics"))
@@ -310,6 +452,11 @@ def _parse_cves(payload, product: str = "", version=None) -> list:
         })
 
     cves.sort(key=lambda c: (c["cvss_score"] is None, -(c["cvss_score"] or 0.0)))
+    if dropped:
+        print_warning(
+            f"[CVE] filtered {dropped} CVE(s) whose CPE data names a different "
+            f"product than '{product}' (same-vendor false-positive guard)"
+        )
     return cves
 
 
@@ -369,7 +516,13 @@ def lookup_cves(product, version=None, target: str = "nvd",
     except (TypeError, ValueError):
         limit = _DEFAULT_LIMIT
 
-    keyword = _build_keyword(product, version)
+    # A bare vendor-ish token ("Apache") is disambiguated to a more specific
+    # keyword phrase ("apache http server") when a known alias exists, and
+    # its acceptable CPE product set is carried through to _parse_cves() so
+    # a same-vendor, wrong-product hit (e.g. Apache Groovy for an Apache
+    # httpd banner) gets filtered out rather than reported as a real match.
+    keyword_product, cpe_products = _disambiguate_product(product)
+    keyword = _build_keyword(keyword_product, version)
     print_info(f"[CVE] Querying NVD for '{keyword}'")
 
     if not NVD_API_KEY:
@@ -427,7 +580,7 @@ def lookup_cves(product, version=None, target: str = "nvd",
         print_error(f"[CVE] NVD lookup failed for '{keyword}': {err}")
         return result
 
-    result["cves"] = _parse_cves(data.get("json"), result["product"], result["version"])
+    result["cves"] = _parse_cves(data.get("json"), result["product"], result["version"], cpe_products)
     log_tool_success(target, "nvd-cve-lookup")
 
     if not result["cves"]:
@@ -451,6 +604,17 @@ def lookup_cves(product, version=None, target: str = "nvd",
         print_info(f"[CVE]   {c['cve_id']} — CVSS {score} ({sev})")
 
     return result
+
+
+def lookup_cves_from_banner(banner, target: str = "nvd", limit: int = _DEFAULT_LIMIT) -> dict:
+    """
+    Convenience wrapper for callers holding a raw Server/X-Powered-By header
+    value (header_check.py's server_banner/powered_by) rather than an
+    already-split product/version pair. Splits the banner via _parse_banner()
+    (see its docstring) then delegates to lookup_cves() — same return shape.
+    """
+    product, version = _parse_banner(banner)
+    return lookup_cves(product, version, target=target, limit=limit)
 
 
 if __name__ == "__main__":

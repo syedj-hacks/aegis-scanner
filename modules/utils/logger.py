@@ -54,6 +54,16 @@ def log_tool_failure(target: str, tool_name: str, error: str):
     get_logger(target).error(f"Tool failed: {tool_name} — {error}")
 
 
+def log_tool_skip(target: str, tool_name: str):
+    """
+    Distinct from log_tool_failure: this tool did not fail or time out — the
+    operator deliberately pressed the skip key while it was running. Kept as
+    its own log line (rather than reusing "Tool failed") so a report or a
+    post-run audit can tell a genuine failure apart from a user decision.
+    """
+    get_logger(target).warning(f"Tool skipped by user: {tool_name}")
+
+
 def log_finding(target: str, finding: dict):
     get_logger(target).debug(f"Finding recorded: {finding}")
 

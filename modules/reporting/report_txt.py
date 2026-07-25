@@ -25,13 +25,17 @@ import textwrap
 from datetime import datetime
 
 from modules.utils.config import output_dir
+from modules.reporting.retention import report_filename
 from modules.utils.display import (
     print_info, print_success, print_warning, print_error,
     print_panel, print_table, print_summary,
 )
 from modules.utils.logger import get_logger
 from modules.enrichment.severity import SEVERITY_LEVELS
-from modules.reporting.summary import build_summary, summary_stats
+from modules.reporting.summary import (
+    build_summary, summary_stats, injection_findings, INJECTION_FINDING_TYPES,
+    field_display, service_display, cvss_display, distinct_identifiers,
+)
 
 # Report width. 78 keeps the whole report inside an 80-column terminal when
 # it is later cat'ed, which is the usual way a .txt report gets read.
@@ -90,13 +94,22 @@ def _field(label: str, value) -> str:
     return f"    {label:<{_LABEL_WIDTH}}: {value}"
 
 
-def _service_label(finding: dict) -> str:
-    """'http 2.4.7' / 'http' / 'unknown' — service and version as one cell."""
-    parts = [
-        str(finding.get("service") or "").strip(),
-        str(finding.get("version") or "").strip(),
-    ]
-    return " ".join(p for p in parts if p) or "unknown"
+# Terminal table cells are narrow, so the console gets an abbreviated form
+# of summary.field_display()'s wording: the distinction between "cannot
+# apply" and "not determined" is preserved, the explanatory tail is not.
+# The file report and the PDF carry the full phrasing.
+_TERMINAL_NOT_APPLICABLE = "N/A"
+_TERMINAL_UNKNOWN = "not determined"
+
+
+def _terminal_cell(finding: dict, column: str) -> str:
+    """Short form of field_display() that fits a terminal column."""
+    rendered = field_display(finding, column)
+    if rendered.startswith("N/A"):
+        return _TERMINAL_NOT_APPLICABLE
+    if rendered.startswith("not determined"):
+        return _TERMINAL_UNKNOWN
+    return rendered
 
 
 def _display_rows(findings: list) -> list:
@@ -107,15 +120,20 @@ def _display_rows(findings: list) -> list:
     the "-" placeholder when the key is *absent*. Rows read back from
     SQLite always carry every column, so a NULL cve_id arrives as a present
     key holding None and renders as an empty cell (and a NULL cvss renders
-    as the string "None"). Substituting the placeholder here keeps that
-    tidy without modifying display.py, which this phase does not own.
+    as the string "None").
+
+    Substituting a bare "-" here (the previous behaviour) was tidy but
+    uninformative: it made "this finding type has no CVE by nature" and
+    "a CVE should have been determined and wasn't" look identical. The
+    cells now say which one it is, in the abbreviated form a terminal
+    column has room for.
     """
     rows = []
     for finding in findings or []:
         row = dict(finding)
         for column in ("port", "service", "version", "cve_id", "cvss"):
             if row.get(column) is None:
-                row[column] = "-"
+                row[column] = _terminal_cell(finding, column)
         rows.append(row)
     return rows
 
@@ -167,13 +185,84 @@ def _top_findings_block(summary: dict) -> list:
         _rule(),
         "",
     ]
-    for index, finding in enumerate(top, start=1):
-        identifier = finding.get("cve_id") or _service_label(finding)
+    # Labelled as a set rather than one at a time, so two findings that
+    # would otherwise render the same truncated text are pulled apart —
+    # see summary.distinct_identifiers().
+    identifiers = distinct_identifiers(top)
+    for index, (finding, identifier) in enumerate(zip(top, identifiers), start=1):
         lines.append(
             f"    {index:>2}. [{finding.get('severity', 'LOW'):<8}] "
-            f"port {finding.get('port', '-')} — {identifier}"
+            f"port {field_display(finding, 'port')} — {identifier}"
         )
     lines.append("")
+    return lines
+
+
+# Safe display cap for a payload / evidence snippet in the injection
+# section. The XSS evidence is already truncated by xss_wrap; this bounds
+# the sqlmap payloads/metadata (a UNION payload or a long database list) so
+# one finding can't run to dozens of wrapped lines.
+_INJECTION_FIELD_MAXLEN = 300
+
+
+def _truncate(value, limit: int = _INJECTION_FIELD_MAXLEN) -> str:
+    text = str(value or "").strip()
+    if len(text) > limit:
+        return text[: limit - 3].rstrip() + "..."
+    return text
+
+
+def _injection_block(summary: dict) -> list:
+    """
+    Dedicated "Injection & Scripting Vulnerabilities" section: every
+    confirmed SQL injection and reflected-XSS finding, shown with the exact
+    payload, the parameter/endpoint it was sent against, and a response
+    snippet proving exploitation.
+
+    Rendered separately from (and ahead of) the general DETAILED FINDINGS
+    list, and only when at least one such finding exists — it does not
+    restructure the rest of the report. Scoped to exactly these two
+    vulnerability classes (see summary.INJECTION_FINDING_TYPES).
+    """
+    injections = injection_findings(summary)
+    if not injections:
+        return []
+
+    lines = [
+        _rule(),
+        "  INJECTION & SCRIPTING VULNERABILITIES",
+        _rule(),
+        "",
+        "    Confirmed SQL injection and cross-site scripting findings, each",
+        "    shown with the exact payload used, the parameter/endpoint it was",
+        "    sent against, and a response snippet proving exploitation.",
+        "",
+    ]
+
+    for index, finding in enumerate(injections, start=1):
+        kind = str(finding.get("finding_type") or "").lower()
+        label = INJECTION_FINDING_TYPES.get(kind, "Injection")
+        severity = finding.get("severity", "LOW")
+
+        lines += [
+            f"  [{index}] {severity} — {label}",
+            "  " + "-" * (_WIDTH - 2),
+            _field("Class", label),
+            _field("Endpoint", _truncate(finding.get("endpoint")) or "-"),
+            _field("Parameter", finding.get("parameter") or "-"),
+            "",
+            f"    {'Payload':<{_LABEL_WIDTH}}:",
+        ]
+        lines += _wrap(_truncate(finding.get("payload")) or "(not recorded)", 6)
+        lines += [
+            "",
+            f"    {'Evidence':<{_LABEL_WIDTH}}:",
+        ]
+        lines += _wrap(
+            _truncate(finding.get("evidence")) or "(no response snippet recorded)", 6
+        )
+        lines.append("")
+
     return lines
 
 
@@ -198,21 +287,17 @@ def _detail_block(summary: dict) -> list:
         ]
         return lines
 
-    for index, finding in enumerate(findings, start=1):
+    identifiers = distinct_identifiers(findings)
+    for index, (finding, identifier) in enumerate(zip(findings, identifiers), start=1):
         severity = finding.get("severity", "LOW")
-        cvss = finding.get("cvss")
-        cvss_cell = (
-            "not scored" if cvss is None
-            else f"{cvss} (source: {finding.get('severity_source', 'heuristic')})"
-        )
 
         lines += [
-            f"  [{index}] {severity} — {finding.get('cve_id') or _service_label(finding)}",
+            f"  [{index}] {severity} — {identifier}",
             "  " + "-" * (_WIDTH - 2),
-            _field("Port", finding.get("port", "-")),
-            _field("Service", _service_label(finding)),
-            _field("CVE", finding.get("cve_id") or "none"),
-            _field("CVSS", cvss_cell),
+            _field("Port", field_display(finding, "port")),
+            _field("Service", service_display(finding)),
+            _field("CVE", field_display(finding, "cve_id")),
+            _field("CVSS", cvss_display(finding)),
             _field("Severity", severity),
             "",
             f"    {'Description':<{_LABEL_WIDTH}}:",
@@ -240,6 +325,7 @@ def render_report(summary: dict) -> str:
     lines += _header_block(summary)
     lines += _summary_block(summary)
     lines += _top_findings_block(summary)
+    lines += _injection_block(summary)
     lines += _detail_block(summary)
     lines += [
         _rule("="),
@@ -281,25 +367,40 @@ def preview_report(summary: dict):
         else:
             print_warning(f"[Report] no findings recorded for {target}")
 
-        print_summary(target, summary_stats(summary))
+        # No real {tools_run, tools_failed, tools_skipped} exists yet at
+        # this point in the profile run — see print_summary()'s
+        # show_tool_counts docstring note.
+        print_summary(target, summary_stats(summary), show_tool_counts=False)
     except Exception as exc:
         # Console-only failure: log it and carry on to the file write.
         get_logger(target).warning(f"[Report] terminal preview failed: {exc}")
         print_warning(f"[Report] could not render the terminal preview: {exc}")
 
 
-def _resolve_output_path(target: str, output_path: str = None) -> str:
+def _resolve_output_path(target: str, output_path: str = None,
+                         profile: str = None, scan_id=None) -> str:
     """
     Decide where the report goes.
 
-    Default is config.output_dir(target)/report.txt — output_dir() creates
-    the per-target directory, which is the convention every other module
-    writes under. An explicit output_path is honoured verbatim; if it names
-    a directory that does not exist yet, it is created so the caller does
-    not have to.
+    Default is
+    config.output_dir(target)/report_<profile>_<target>_<scan_id>.txt —
+    one file per scan, so a new scan can no longer overwrite the previous
+    scan's report (see modules/reporting/retention.py for why that
+    mattered). output_dir() creates the per-target directory, which is the
+    convention every other module writes under.
+
+    Falls back to the historical fixed report.txt name only when the
+    profile or scan_id is unknown, which keeps a direct
+    generate_txt_report() call with neither argument working as it always
+    did. An explicit output_path is honoured verbatim; if it names a
+    directory that does not exist yet, it is created so the caller does not
+    have to.
     """
     if not output_path:
-        return os.path.join(output_dir(target), _DEFAULT_FILENAME)
+        directory = output_dir(target)
+        if profile and scan_id is not None:
+            return os.path.join(directory, report_filename(profile, target, scan_id, "txt"))
+        return os.path.join(directory, _DEFAULT_FILENAME)
 
     parent = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(parent, exist_ok=True)
@@ -347,7 +448,10 @@ def generate_txt_report(scan_id, output_path: str = None):
         return None
 
     try:
-        path = _resolve_output_path(target, output_path)
+        path = _resolve_output_path(
+            target, output_path,
+            profile=metadata.get("profile"), scan_id=metadata.get("id", scan_id),
+        )
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(body)
     except OSError as exc:

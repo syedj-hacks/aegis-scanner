@@ -42,9 +42,14 @@ recon/scan/audit toolset and can trip IDS/WAF alerts or lock out accounts.
   # it's gitignored on purpose):
   cp modules/utils/config.example.py modules/utils/config.py
 
-  # ZAP note: the apt zaproxy package installs the full ZAP app. If zap-baseline.py
-  # isn't on PATH after install, it ships inside the ZAP install dir -- add it to PATH
-  # or symlink it manually.
+  # ZAP note: modules/web/zap_wrap.py drives ZAP's own daemon over its REST API
+  # (via the python-owasp-zap-v2.4 client in requirements.txt), not a bundled
+  # zap-baseline.py script -- apt's zaproxy package doesn't ship one anyway. You
+  # need a JRE and zap.sh on this host (both covered by install.sh's apt step);
+  # if either is missing, ZAP is reported unavailable rather than the scan failing.
+
+  # nuclei note: if apt's nuclei package is missing/stale on your mirror, install.sh
+  # falls back to `go install` automatically (requires a Go toolchain on PATH).
 
 
 --------------------------------------------------------------------------------
@@ -72,6 +77,12 @@ Examples:
   python3 aegis.py example.com --profile compliance
   python3 aegis.py                                      # interactive: prompts for target + profile
 
+  # While a scan is running (interactive terminal only):
+  #   s          skip just the tool currently running, move to the next one
+  #              (ignored for nmap/DNS resolution -- everything downstream needs them)
+  #   Ctrl+C     same as 's' on a single press; a SECOND Ctrl+C within ~2s aborts
+  #              the whole scan instead
+
 
 --------------------------------------------------------------------------------
  3. PER-PROFILE DIRECT INVOCATION (bypasses the CLI, useful for debugging one
@@ -98,6 +109,7 @@ Examples:
   # Scanning
   python3 -c "from modules.scanning.port_scanner import scan_ports; print(scan_ports('scanme.nmap.org', profile='quickscan'))"
   python3 -c "from modules.scanning.service_detect import detect_services; print(detect_services('scanme.nmap.org', [22, 80]))"
+  # now runs nmap -sV -sC combined -- return dict also includes a 'scripts' key
   python3 -c "from modules.scanning.banner import grab_banners; print(grab_banners('scanme.nmap.org', [22, 80]))"
   python3 -c "from modules.scanning.enum4linux_wrap import run_enum4linux; print(run_enum4linux('scanme.nmap.org'))"
   python3 -c "from modules.scanning.hydra_wrap import run_hydra; print(run_hydra('scanme.nmap.org', 'ssh', port=22))"
@@ -116,6 +128,7 @@ Examples:
 
   # Enrichment
   python3 -c "from modules.enrichment.cve_lookup import lookup_cves; print(lookup_cves('nginx', '1.18.0'))"
+  python3 -c "from modules.enrichment.cve_lookup import lookup_cves_from_banner; print(lookup_cves_from_banner('Apache/2.4.7 (Ubuntu)'))"
   python3 -c "from modules.enrichment.severity import score_finding; print(score_finding({'cve_id':'CVE-2021-1234','cvss':9.1}))"
   python3 -c "from modules.enrichment.remediation import get_remediation; print(get_remediation({'cve_id':'CVE-2021-1234'}))"
 

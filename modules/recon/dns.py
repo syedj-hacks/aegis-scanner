@@ -76,16 +76,19 @@ def resolve_dns(target: str) -> dict:
     log_tool_start(target, "dns_resolve")
 
     result = {
+        "tool": "nslookup",
         "target": target,
         "resolved": False,
         "ip_addresses": [],
         "method": None,
         "raw_output": "",
         "error": None,
+        "skipped": False,
     }
 
     tool_result = run_tool(target, "nslookup", ["nslookup", target])
     result["raw_output"] = tool_result.get("stdout", "") or ""
+    result["skipped"] = tool_result.get("skipped", False)
 
     if tool_result.get("success"):
         ips = _parse_nslookup_output(result["raw_output"])

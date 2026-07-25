@@ -2,3 +2,4 @@ rich
 requests
 scapy
 weasyprint
+python-owasp-zap-v2.4

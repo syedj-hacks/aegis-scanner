@@ -25,6 +25,8 @@ The heuristic tables below are deliberately plain data so teammates can
 adjust a single entry without reading the control flow.
 """
 
+import re
+
 from modules.utils.logger import log_finding
 from modules.utils.display import print_info, print_warning
 
@@ -290,12 +292,36 @@ def _has_cve(finding: dict) -> bool:
     return bool(finding.get("cve_id") or finding.get("cves"))
 
 
+_keyword_pattern_cache = {}
+
+
+def _keyword_pattern(keyword: str):
+    """
+    Word-boundary regex for one keyword, cached so repeated scoring calls
+    don't recompile it every time.
+
+    Plain substring containment (the old `keyword in lowered` check) let
+    short, real keywords match inside unrelated words — "rce" (meant to
+    catch "RCE"/"remote code execution") also matched inside "brute-*f*orce*",
+    silently inflating a routine nikto brute-force finding to CRITICAL. \b
+    only anchors on alphanumeric/underscore boundaries, which still matches
+    a multi-word phrase like "sql injection" correctly (both edges of the
+    phrase land on word boundaries) while refusing to match "rce" as a
+    substring of a longer word.
+    """
+    pattern = _keyword_pattern_cache.get(keyword)
+    if pattern is None:
+        pattern = re.compile(r"\b" + re.escape(keyword) + r"\b")
+        _keyword_pattern_cache[keyword] = pattern
+    return pattern
+
+
 def _match_keywords(text: str, table) -> str:
     """Return the severity of the first keyword table entry that matches."""
     lowered = (text or "").lower()
     for severity, keywords in table:
         for keyword in keywords:
-            if keyword in lowered:
+            if _keyword_pattern(keyword).search(lowered):
                 return severity
     return ""
 
