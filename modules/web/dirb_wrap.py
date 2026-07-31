@@ -15,6 +15,7 @@ import os
 import re
 
 from modules.utils.error_handler import run_tool
+from modules.utils.config import get_rate_limits
 from modules.utils.logger import log_tool_failure, log_finding
 from modules.utils.display import (
     print_info, print_success, print_warning, print_error,
@@ -183,7 +184,7 @@ def _parse_dirb_output(stdout: str, base_url: str) -> list:
 
 
 def run_dirb(target: str, port: int = 80, use_https: bool = False,
-             wordlist: str = None) -> dict:
+             wordlist: str = None, profile: str = None) -> dict:
     """
     Brute-force directories/files on `target`'s web service with dirb, as a
     supplementary pass alongside gobuster_wrap.run_gobuster() (not a
@@ -234,7 +235,29 @@ def run_dirb(target: str, port: int = 80, use_https: bool = False,
     url = _build_url(target, port, use_https)
     command = ["dirb", url, resolved_wordlist] + _DIRB_BASE_ARGS
 
-    print_info(f"[Dirb] Enumerating {url} with {resolved_wordlist}")
+    # dirb's own inter-request delay (-z, milliseconds), exposed per profile.
+    #
+    # Explicitly NOT a second attempt at the problem _DEFAULT_WORDLISTS
+    # solves. That one was root-caused live to a target-side cumulative
+    # connection-count threshold, and -z was measured to make no difference
+    # to it — which is what ruled out a rate-based limiter and led to the
+    # smaller wordlist. This flag is for the different case a rate limiter
+    # actually is the constraint (notably several targets scanned at once
+    # via --targets), and it is off by default precisely because it is known
+    # not to help the case above.
+    #
+    # Every profile's configured value is None today, so the flag is omitted
+    # entirely and the command is byte-for-byte what it was before.
+    delay_ms = get_rate_limits(profile).get("dirb_delay_ms")
+    if delay_ms:
+        command += ["-z", str(int(delay_ms))]
+
+    pacing = f" (-z {int(delay_ms)}ms)" if delay_ms else ""
+    print_info(f"[Dirb] Enumerating {url} with {resolved_wordlist}{pacing}")
+    # dirb takes no custom cookie/header in a form that is consistent across
+    # builds, so an authenticated run deliberately does not pass one here —
+    # modules/utils/auth.py names dirb in UNAUTHENTICATED_TOOLS and the
+    # profile logs that explicitly rather than letting it pass silently.
 
     # run_tool() already logs this call's start/success/failure under the
     # "dirb" tool name — no need to log it again here.

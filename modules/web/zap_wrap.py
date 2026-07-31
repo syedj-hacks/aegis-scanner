@@ -27,6 +27,13 @@ import shutil
 import time
 
 from modules.utils.config import get_timeout
+
+# config.py is gitignored, so a per-user copy predating these keys is a real
+# possibility — unset means "spawn a local daemon", i.e. today's behaviour.
+try:
+    from modules.utils.config import ZAP_HOST, ZAP_PORT
+except ImportError:
+    ZAP_HOST, ZAP_PORT = None, 8090
 from modules.utils.logger import (
     log_tool_start, log_tool_success, log_tool_failure, log_finding,
 )
@@ -160,16 +167,116 @@ def _dedupe_alerts(alerts: list) -> list:
     return findings
 
 
-def run_zap_baseline(target: str, port: int = 80, use_https: bool = False) -> dict:
+def _apply_auth(zap, auth) -> None:
+    """
+    Install each of the run's credentials as a ZAP "replacer" rule, so every
+    request the daemon makes — spider and passive scan alike — carries them.
+
+    The replacer API is used rather than ZAP's full authentication/session-
+    management context because the credential here is already a finished
+    session token: there is no login form to script, no session to
+    re-establish, and the correct behaviour is simply "add this header to
+    everything". A context would be a much larger, more fragile
+    configuration to express the same thing.
+
+    Never raises. A ZAP build without the replacer add-on is a reason to
+    scan unauthenticated with a warning, not a reason to lose the scan —
+    and the warning matters, because ZAP silently returning an anonymous
+    view inside a run labelled authenticated is precisely the failure this
+    is meant to make visible.
+
+    The credential VALUE is never logged here, only the header NAME — see
+    modules/utils/auth.py.
+    """
+    if auth is None or not getattr(auth, "enabled", False):
+        return
+
+    headers = auth.headers()
+    if not headers:
+        return
+
+    installed = []
+    for index, header in enumerate(headers):
+        name, _, value = header.partition(":")
+        name, value = name.strip(), value.strip()
+        if not name or not value:
+            continue
+        try:
+            zap.replacer.add_rule(
+                description=f"aegis-auth-{index}",
+                enabled=True,
+                matchtype="REQ_HEADER",
+                matchregex=False,
+                matchstring=name,
+                replacement=value,
+            )
+            installed.append(name)
+        except Exception as exc:
+            print_warning(
+                f"[ZAP] could not set the '{name}' request header on the daemon "
+                f"session ({exc}) — ZAP is scanning UNAUTHENTICATED"
+            )
+
+    if installed:
+        print_info(
+            f"[ZAP] authenticated session: {', '.join(installed)} set on every request"
+        )
+
+
+def _clear_auth(zap, auth) -> None:
+    """
+    Remove the replacer rules _apply_auth() installed.
+
+    Only matters for a shared daemon (ZAP_HOST), which outlives the scan: a
+    credential left installed on it would be sent to whatever target the
+    next scan points at. That is a credential-disclosure bug, not an
+    untidiness, which is why it is cleaned up explicitly rather than left
+    to the daemon's own lifecycle.
+
+    Never raises.
+    """
+    if auth is None or not getattr(auth, "enabled", False):
+        return
+    for index in range(len(auth.headers())):
+        try:
+            zap.replacer.remove_rule(f"aegis-auth-{index}")
+        except Exception as exc:
+            print_warning(
+                f"[ZAP] could not remove the aegis-auth-{index} replacer rule "
+                f"from the shared daemon ({exc}) — remove it manually, or "
+                "restart the container, before scanning a different target"
+            )
+
+
+def run_zap_baseline(target: str, port: int = 80, use_https: bool = False,
+                     auth=None) -> dict:
     """
     Run a ZAP baseline-equivalent (spider + passive scan, no active attack
     payloads) against `target`'s web service.
+
+    Local daemon, or a remote/containerised one
+    -------------------------------------------
+    With config.ZAP_HOST unset — the default — this spawns a local zap.sh
+    daemon exactly as it always has, and behaviour is unchanged.
+
+    With ZAP_HOST set (typically the container in docker/zap/), it connects
+    to that already-running daemon instead and never spawns or stops
+    anything. That is what makes `docker compose restart zap` a real fix for
+    the add-on corruption class of failure documented in WRITEUP.md §3.1:
+    the container's ~/.ZAP profile is disposable, so a restart is
+    guaranteed to produce a clean one, rather than reusing the same
+    half-written add-on on disk that broke the previous run.
 
     Parameters
     ----------
     target    : str   host / IP (a full http(s):// URL is also accepted)
     port      : int   web service port (default 80)
     use_https : bool  scan over TLS
+    auth      : AuthConfig | None  credentials for an authenticated scan.
+                      Applied to the daemon session as a replacer rule
+                      before the spider runs, so every request ZAP makes
+                      (spider and passive scan alike) carries them. None
+                      leaves the session exactly as before.
 
     Returns
     -------
@@ -196,13 +303,24 @@ def run_zap_baseline(target: str, port: int = 80, use_https: bool = False) -> di
     result = {"tool": "zaproxy", "target": target, "port": port, "findings": [], "raw_output": "", "error": None, "skipped": False}
     url = _build_url(target, port, use_https)
 
-    zap_sh = _find_zap_sh()
-    if not zap_sh:
-        err = "zap.sh not found — OWASP ZAP is not installed on this host (expected under /usr/share/zaproxy/)"
-        result["error"] = err
-        log_tool_failure(target, "zaproxy", err)
-        print_error(f"[ZAP] {err}")
-        return result
+    # A configured ZAP_HOST means the daemon is somebody else's process
+    # (the docker/zap container, or a shared instance) — so zap.sh does not
+    # need to exist on this host at all, and looking for it would refuse to
+    # run a scan that would have worked perfectly well.
+    remote_host = ZAP_HOST
+    zap_sh = None
+    if not remote_host:
+        zap_sh = _find_zap_sh()
+        if not zap_sh:
+            err = (
+                "zap.sh not found — OWASP ZAP is not installed on this host "
+                "(expected under /usr/share/zaproxy/). Either install it, or "
+                "set ZAP_HOST in .env to point at a ZAP daemon (see docker/zap/)"
+            )
+            result["error"] = err
+            log_tool_failure(target, "zaproxy", err)
+            print_error(f"[ZAP] {err}")
+            return result
 
     try:
         from zapv2 import ZAPv2
@@ -220,9 +338,18 @@ def run_zap_baseline(target: str, port: int = 80, use_https: bool = False) -> di
     proc = None
     zap = None
 
+    host = remote_host or _ZAP_HOST
+    zap_port = ZAP_PORT if remote_host else _ZAP_PORT
+
     try:
-        print_info(f"[ZAP] Starting ZAP daemon on {_ZAP_HOST}:{_ZAP_PORT}")
-        proc = subprocess.Popen(
+        if remote_host:
+            # Nothing is spawned and, crucially, nothing is stopped in the
+            # finally block either — this daemon outlives the scan and is
+            # not ours to terminate.
+            print_info(f"[ZAP] Using the ZAP daemon at {host}:{zap_port} (ZAP_HOST is set)")
+        else:
+            print_info(f"[ZAP] Starting ZAP daemon on {host}:{zap_port}")
+            proc = subprocess.Popen(
             [
                 zap_sh, "-daemon",
                 "-host", _ZAP_HOST, "-port", str(_ZAP_PORT),
@@ -245,7 +372,7 @@ def run_zap_baseline(target: str, port: int = 80, use_https: bool = False) -> di
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
-        proxy = {"http": f"http://{_ZAP_HOST}:{_ZAP_PORT}", "https": f"http://{_ZAP_HOST}:{_ZAP_PORT}"}
+        proxy = {"http": f"http://{host}:{zap_port}", "https": f"http://{host}:{zap_port}"}
         zap = ZAPv2(apikey=None, proxies=proxy)
 
         ready = False
@@ -257,7 +384,15 @@ def run_zap_baseline(target: str, port: int = 80, use_https: bool = False) -> di
             except Exception:
                 time.sleep(1.0)
         if not ready:
+            if remote_host:
+                raise RuntimeError(
+                    f"no ZAP daemon answered at {host}:{zap_port} within "
+                    f"{_ZAP_STARTUP_TIMEOUT:.0f}s — is the container running? "
+                    "(docker compose up -d zap)"
+                )
             raise RuntimeError(f"ZAP daemon did not become ready within {_ZAP_STARTUP_TIMEOUT:.0f}s")
+
+        _apply_auth(zap, auth)
 
         print_info(f"[ZAP] Spidering {url}")
         scan_id = zap.spider.scan(url)
@@ -312,11 +447,25 @@ def run_zap_baseline(target: str, port: int = 80, use_https: bool = False) -> di
         print_error(f"[ZAP] baseline scan failed for {url} — {err}")
 
     finally:
-        if zap is not None:
+        # Shut down ONLY a daemon this call started. A configured ZAP_HOST
+        # daemon is shared and long-lived — the container, or an instance
+        # someone else is using — and shutting it down here would kill it
+        # after the first port of the first scan, leaving every later
+        # invocation to fail with "no ZAP daemon answered". The local-spawn
+        # path is unchanged and still always shuts its own daemon down.
+        if zap is not None and not remote_host:
             try:
                 zap.core.shutdown()
             except Exception:
                 pass
+        elif zap is not None and remote_host:
+            # A shared daemon outlives this scan, so the credential headers
+            # installed on it must not: without this, the next scan through
+            # the same daemon would silently carry this scan's credentials
+            # to a different target. Best-effort — a failure here is
+            # reported, never raised, because the scan itself is complete.
+            _clear_auth(zap, auth)
+
         if proc is not None:
             try:
                 proc.terminate()

@@ -22,6 +22,7 @@ import os
 import re
 
 from modules.utils.error_handler import run_tool
+from modules.utils.config import get_rate_limits
 from modules.utils.logger import log_tool_failure, log_finding
 from modules.utils.display import (
     print_info, print_success, print_warning, print_error,
@@ -38,10 +39,14 @@ _DEFAULT_WORDLISTS = [
 
 # -q  : suppress banner/noise so only result lines reach stdout
 # --np: no progress meter (it would otherwise pollute captured output)
-# -t  : threads
 # (-k, to skip TLS validation on self-signed test certs, is appended only
 #  when use_https is set)
-_GOBUSTER_BASE_ARGS = ["-q", "--np", "-t", "30"]
+#
+# -t (threads) is deliberately NOT here any more: it is per-profile now, via
+# config.get_rate_limits(), and appended in run_gobuster(). Leaving a "-t 30"
+# here as well would put -t on the command line twice. Every profile's
+# configured value is 30, so the resolved command is identical to before.
+_GOBUSTER_BASE_ARGS = ["-q", "--np"]
 
 # Matches gobuster's result lines, e.g.
 #   admin                (Status: 301) [Size: 0] [--> /admin/]
@@ -231,7 +236,7 @@ def _detect_wordpress(discovered: list) -> list:
 
 
 def run_gobuster(target: str, port: int = 80, use_https: bool = False,
-                 wordlist: str = None) -> dict:
+                 wordlist: str = None, profile: str = None, auth=None) -> dict:
     """
     Brute-force directories/files on `target`'s web service with gobuster.
 
@@ -243,6 +248,13 @@ def run_gobuster(target: str, port: int = 80, use_https: bool = False,
                       certs on test targets don't abort the run)
     wordlist  : str   path to a wordlist; defaults to the first entry of
                       _DEFAULT_WORDLISTS that exists on this system
+    profile   : str   scan profile name, used to look up this profile's
+                      thread count (config.get_rate_limits). Omitted/unknown
+                      resolves to the default 30 — the value that was
+                      hardcoded here before, so behaviour is unchanged.
+    auth      : AuthConfig | None  credentials for an authenticated scan.
+                      None (the default) builds exactly the same command as
+                      before; see modules/utils/auth.py.
 
     Returns
     -------
@@ -292,11 +304,22 @@ def run_gobuster(target: str, port: int = 80, use_https: bool = False,
 
     url = _build_url(target, port, use_https)
     result["base_url"] = url
-    command = ["gobuster", "dir", "-u", url, "-w", resolved_wordlist] + _GOBUSTER_BASE_ARGS
+    # -t comes from the profile's rate limit rather than _GOBUSTER_BASE_ARGS
+    # so a profile can go gentler on a target that throttles by connection
+    # count. get_rate_limits() returns 30 for every profile today, which is
+    # the value _GOBUSTER_BASE_ARGS carried, so this changes nothing by
+    # default — it only makes the knob reachable.
+    threads = get_rate_limits(profile).get("gobuster_threads") or 30
+    command = (
+        ["gobuster", "dir", "-u", url, "-w", resolved_wordlist]
+        + _GOBUSTER_BASE_ARGS + ["-t", str(threads)]
+    )
     if use_https:
         command.append("-k")
+    if auth is not None:
+        command += auth.gobuster_args()
 
-    print_info(f"[Gobuster] Enumerating {url} with {resolved_wordlist}")
+    print_info(f"[Gobuster] Enumerating {url} with {resolved_wordlist} (-t {threads})")
 
     # run_tool() applies config.get_timeout('gobuster') itself — no timeout
     # argument is passed or accepted here.

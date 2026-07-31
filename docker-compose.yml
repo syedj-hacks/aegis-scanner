@@ -1,0 +1,59 @@
+# docker-compose.yml
+# The containerised ZAP daemon for Aegis Scanner (item 9).
+#
+# Opt-in. The scanner does not need this to run: with ZAP_HOST unset,
+# modules/web/zap_wrap.py spawns a local zap.sh exactly as it always has,
+# and nothing in this file is consulted. Bring it up and set ZAP_HOST to
+# switch deepscan onto it:
+#
+#     docker compose up -d zap
+#     echo 'ZAP_HOST=127.0.0.1' >> .env
+#     echo 'ZAP_PORT=8090'      >> .env
+#
+# The recovery workflow this exists for — see docker/zap/Dockerfile for the
+# failure it addresses, and TUTORIAL.md for when to reach for it:
+#
+#     docker compose restart zap     # guaranteed-fresh ~/.ZAP profile
+#
+services:
+  zap:
+    build:
+      context: ./docker/zap
+    image: aegis-zap:local
+    container_name: aegis-zap
+
+    # Bound to LOOPBACK ONLY, deliberately.
+    #
+    # This daemon runs with api.disablekey=true — no API key — which is
+    # what lets zap_wrap.py talk to it without managing a shared secret.
+    # An unauthenticated ZAP API is a full HTTP proxy plus a scan engine
+    # that will make arbitrary requests on behalf of whoever reaches it, so
+    # exposing this port beyond localhost hands that to the whole network.
+    # If you genuinely need it reachable from another host, set an API key
+    # in the Dockerfile's CMD and thread it through ZAPv2(apikey=...)
+    # first — do not simply widen this binding.
+    ports:
+      - "127.0.0.1:8090:8090"
+
+    # NO volume for /home/zap/.ZAP, on purpose.
+    #
+    # A persistent profile is exactly the thing this container exists to
+    # avoid: it is what lets a corrupted or self-uninstalled add-on survive
+    # a restart, which is the failure mode documented in WRITEUP.md §3.1.
+    # Keeping the profile inside the container's own writable layer is what
+    # makes `docker compose restart zap` a real fix rather than a reboot
+    # that changes nothing.
+
+    healthcheck:
+      # The version endpoint is the same readiness signal zap_wrap.py polls
+      # for, so "healthy" here means precisely "a scan would now succeed"
+      # rather than "the process started".
+      test: ["CMD", "curl", "-sf", "http://localhost:8090/JSON/core/view/version/"]
+      interval: 10s
+      timeout: 5s
+      # ZAP's cold start is genuinely slow; start_period stops Compose from
+      # reporting it unhealthy while it is still legitimately booting.
+      start_period: 90s
+      retries: 5
+
+    restart: unless-stopped

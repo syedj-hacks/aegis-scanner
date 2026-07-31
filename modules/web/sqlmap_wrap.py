@@ -194,7 +194,7 @@ def _parse_sqlmap_output(stdout: str) -> tuple:
     return findings, metadata
 
 
-def run_sqlmap(target: str, url: str) -> dict:
+def run_sqlmap(target: str, url: str, auth=None) -> dict:
     """
     Test a specific URL (with a query string) for SQL injection with sqlmap,
     then read back safe DB metadata for any confirmed injection.
@@ -247,6 +247,12 @@ def run_sqlmap(target: str, url: str) -> dict:
         return result
 
     command = ["sqlmap", "-u", url] + _SQLMAP_BASE_ARGS
+    # --cookie / --headers for an authenticated run. Injection testing behind
+    # a login is the case that most needs auth -- the interesting parameters
+    # usually sit past one -- so sqlmap gets the full credential, not just the
+    # basic-auth subset nikto is limited to.
+    if auth is not None:
+        command += auth.sqlmap_args()
     print_info(f"[Sqlmap] Testing {url} for SQL injection (+ read-only DB enumeration)")
 
     # run_tool() already logs this call's start/success/failure under the

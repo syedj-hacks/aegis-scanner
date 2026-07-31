@@ -17,6 +17,8 @@ configured tool against the *profile's own* wired set first, then against
 this global set, so the two situations get two different, honest messages.
 """
 
+from concurrent.futures import ThreadPoolExecutor
+
 from modules.utils.logger import log_tool_failure
 from modules.utils.display import print_info, print_warning, print_error
 from modules.reporting.report_txt import generate_txt_report
@@ -26,12 +28,24 @@ from modules.reporting.completion import print_report_summary
 from modules.reporting.summary import build_summary
 from database.db import record_scan_tools
 
+# config.py is gitignored, so a per-user copy predating the concurrency keys
+# is a real possibility — fall back to the previous sequential behaviour
+# rather than failing to import the whole profiles layer.
+try:
+    from modules.utils.config import (
+        PARALLEL_WEB_TOOLS, MAX_CONCURRENT_WEB_TOOLS, PARALLEL_WEB_TOOL_PROFILES,
+    )
+except ImportError:
+    PARALLEL_WEB_TOOLS = False
+    MAX_CONCURRENT_WEB_TOOLS = 1
+    PARALLEL_WEB_TOOL_PROFILES = set()
+
 # Every tool with a real wrapper module somewhere in this codebase today,
 # regardless of which profile(s) actually call it.
 GLOBAL_AVAILABLE_TOOLS = {
     "nslookup", "nmap", "nikto", "gobuster", "dirb", "whatweb", "nuclei",
-    "sslyze", "zaproxy", "banner_grab", "subfinder", "amass", "theharvester",
-    "wpscan", "sqlmap", "hydra", "enum4linux",
+    "sslyze", "testssl", "zaproxy", "banner_grab", "subfinder", "amass",
+    "theharvester", "wpscan", "sqlmap", "hydra", "enum4linux",
 }
 
 # --- Web-parameter candidate discovery (shared by XSS fuzzing) ------------
@@ -291,6 +305,87 @@ def warn_unavailable_tools(target: str, tools, profile_name: str, wired_tools: s
             )
             log_tool_failure(target, tool, msg)
             print_warning(f"[{profile_name}] {msg}")
+
+
+# --- Per-port web-tool concurrency --------------------------------------
+# The five tools a profile runs against ONE open web port — nikto, gobuster,
+# dirb, whatweb, sslyze — never read each other's output. Each only needs the
+# port/service facts already resolved before the loop starts. Run one after
+# another, they serialise five independent network waits, which is where most
+# of a deepscan's wall-clock time goes.
+#
+# What is deliberately NOT pooled, and why:
+#   nuclei DAST XSS   needs the paths gobuster/dirb discovered — a genuine
+#                     data dependency, so it stays after the loop
+#   ZAP               one daemon, one session; concurrent baseline scans
+#                     against it are not a supported shape
+#   sqlmap/hydra/     active-injection and credential-guessing tools. Two of
+#   wpscan/enum4linux these racing the same host is both louder and less
+#                     interpretable than running them in order, and a target
+#                     that rate-limits under the load makes BOTH tools'
+#                     results unreliable rather than just slowing them down.
+#                     Fully sequential, unchanged.
+#
+# Failure isolation is the other reason this helper exists rather than each
+# profile calling ThreadPoolExecutor inline: run_tool() never raises, but the
+# mapper functions around it can (a malformed field, an unexpected None), and
+# an exception escaping a worker would otherwise take out the whole port's
+# results. Here each task's exception is converted into the same structured
+# "this tool failed" dict the rest of the pipeline already understands, so a
+# broken mapper costs one tool, not one port.
+def run_web_tools(tasks: list, profile: str = None, parallel: bool = None) -> list:
+    """
+    Run independent per-port web tools, concurrently where enabled.
+
+    Parameters
+    ----------
+    tasks    : list of (tool_name, callable) — each callable takes no
+               arguments and returns a wrapper's usual result dict.
+    profile  : str  the profile name, used to decide whether this profile
+               opted into concurrency (config.PARALLEL_WEB_TOOL_PROFILES).
+    parallel : bool | None  explicit override, for tests. None consults the
+               config.
+
+    Returns results in the SAME ORDER as `tasks`, regardless of the order
+    they finished in. This matters: findings are persisted in the order this
+    list is walked, so leaving it in completion order would make a scan's
+    row ordering vary run to run purely on network timing, and every
+    report-diffing or row-comparison check downstream would see phantom
+    changes. Order is an output of this function, not an accident of it.
+
+    Never raises.
+    """
+    if parallel is None:
+        parallel = bool(PARALLEL_WEB_TOOLS) and profile in PARALLEL_WEB_TOOL_PROFILES
+
+    def _guarded(name, fn):
+        """Run one tool; convert an escaping exception into a failure dict."""
+        try:
+            return fn()
+        except Exception as exc:
+            # Matches run_tool()'s contract so count_and_report_tool_failures()
+            # and persist_tool_run() handle it with no special case.
+            return {"tool": name, "error": f"unexpected error: {exc}", "skipped": False}
+
+    if not parallel or len(tasks) < 2:
+        return [_guarded(name, fn) for name, fn in tasks]
+
+    workers = max(1, min(int(MAX_CONCURRENT_WEB_TOOLS), len(tasks)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        # executor.map preserves input order in its output, which is exactly
+        # the guarantee documented above.
+        return list(pool.map(lambda t: _guarded(t[0], t[1]), tasks))
+
+
+def web_tool_concurrency(profile: str) -> int:
+    """
+    The concurrency level actually in effect for `profile`'s web tools — 1
+    meaning sequential. Reported in -v output so a run states what it did
+    rather than what the config file said at some point.
+    """
+    if not PARALLEL_WEB_TOOLS or profile not in PARALLEL_WEB_TOOL_PROFILES:
+        return 1
+    return max(1, int(MAX_CONCURRENT_WEB_TOOLS))
 
 
 def finalise_reports(target: str, profile: str, scan_id,

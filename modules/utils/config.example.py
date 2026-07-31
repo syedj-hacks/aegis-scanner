@@ -94,6 +94,12 @@ TOOL_TIMEOUTS = {
     "dirsearch": 300,
     "wafw00f": 30,
     "sslyze": 60,
+    # testssl.sh runs a long series of individual handshake probes and is
+    # substantially slower than sslyze for that reason -- a full -U
+    # vulnerability sweep against a live host measured ~4 minutes during
+    # this project's verification, so the budget is sized well past that
+    # rather than at it.
+    "testssl": 900,
     "masscan": 180,
     "enum4linux": 180,
     "wpscan": 300,
@@ -214,6 +220,123 @@ CONDITIONAL_TOOLS = {
     "wpscan": "wordpress_fingerprinted",
     "enum4linux": "smb_service_found",
 }
+
+# ---- Within-scan concurrency ----
+# The tools a profile runs against ONE port (nikto, gobuster, dirb, whatweb,
+# sslyze) do not read each other's output — they only need the port/service
+# info already resolved before the loop starts. Running them one after
+# another therefore serialises five independent network waits for no reason,
+# which is most of where a deepscan's wall-clock time goes.
+#
+# These are subprocess calls, so the work happens in other processes and the
+# GIL is not a factor; a thread pool is the right tool. Only genuinely
+# independent tools are pooled — see PARALLEL_WEB_TOOLS below for the ones
+# deliberately left sequential and why.
+#
+# Set PARALLEL_WEB_TOOLS = False to fall back to fully sequential execution
+# (for debugging, or a target that reacts badly to concurrent probing).
+PARALLEL_WEB_TOOLS = True
+MAX_CONCURRENT_WEB_TOOLS = 5
+
+# Which profiles the per-port web-tool pool applies to. Opt-in by name, not
+# "every profile that has a web loop", so adding a profile is a deliberate
+# act. stealthscan is absent and must stay absent: concurrent probing is the
+# exact opposite of a minimal-footprint scan, and tests/t_stealth_guard.py
+# asserts it is not in here.
+PARALLEL_WEB_TOOL_PROFILES = {"webaudit", "deepscan"}
+
+# How many of deepscan's 32 full-range nmap chunks may run at once.
+# Conservative by default: each chunk is a full nmap process, and three
+# concurrent SYN sweeps against one host is already a noticeably heavier
+# footprint than one. Set to 1 for the previous fully-sequential behaviour.
+#
+# ONLY applies to a '-p-' sweep, which today means deepscan alone.
+# stealthscan does not sweep the full range (see PROFILES) so this value can
+# never reach it, by construction.
+MAX_CONCURRENT_NMAP_CHUNKS = 3
+
+# ---- Multi-target concurrency (--targets) ----
+# Distinct from the within-scan concurrency above: this is how many separate
+# TARGETS run at once. Deliberately small — each target concurrently runs its
+# own web-tool pool, so the real outbound request rate is roughly
+# MAX_CONCURRENT_TARGETS x MAX_CONCURRENT_WEB_TOOLS.
+MAX_CONCURRENT_TARGETS = 2
+
+# ---- Per-profile rate limiting / backoff ----
+# Generalises the fix applied to dirb, which was tripping a connection-count
+# threshold on some targets and getting throttled into uselessness. That was
+# solved for one tool by shrinking its wordlist; the general problem is that
+# a profile has no way to say "go gently against this class of target".
+#
+# EVERY DEFAULT BELOW REPRODUCES TODAY'S BEHAVIOUR EXACTLY. gobuster already
+# ran with '-t 30'; nikto, dirb and nuclei ran with no pacing flag at all,
+# and None here means "do not pass the flag", not "pass zero". Nothing gets
+# slower unless someone deliberately changes a value. This makes throttling
+# *available* per profile; it does not impose it.
+#
+# Keys, and the flag each maps to:
+#   gobuster_threads  -> gobuster -t <n>
+#   dirb_delay_ms     -> dirb -z <ms>          (None = flag omitted)
+#   nikto_pause_s     -> nikto -Pause <s>      (None = flag omitted)
+#   nuclei_rate_limit -> nuclei -rate-limit <n/s>  (None = nuclei's own default)
+#
+# Matters more once --targets means several hosts are being probed at once:
+# a profile used for bulk scanning can be throttled without touching the
+# profile used for a single authorised engagement.
+_DEFAULT_RATE_LIMIT = {
+    "gobuster_threads": 30,
+    "dirb_delay_ms": None,
+    "nikto_pause_s": None,
+    "nuclei_rate_limit": None,
+}
+
+PROFILE_RATE_LIMITS = {
+    "quickscan":   dict(_DEFAULT_RATE_LIMIT),
+    "stealthscan": dict(_DEFAULT_RATE_LIMIT),
+    "webaudit":    dict(_DEFAULT_RATE_LIMIT),
+    "deepscan":    dict(_DEFAULT_RATE_LIMIT),
+    "compliance":  dict(_DEFAULT_RATE_LIMIT),
+}
+
+
+def get_rate_limits(profile: str = None) -> dict:
+    """
+    The resolved rate-limit settings for `profile`, falling back to the
+    defaults (i.e. today's behaviour) for an unknown or absent profile.
+
+    Always returns every key, so a caller can read a setting without
+    guarding for its absence. Returns a copy — a caller that mutates the
+    result must not be able to reconfigure the profile for the whole run.
+    """
+    resolved = dict(_DEFAULT_RATE_LIMIT)
+    resolved.update(PROFILE_RATE_LIMITS.get(profile) or {})
+    return resolved
+
+
+# ---- Authenticated scanning (opt-in) ----
+# Credentials for scanning behind a login. Sourced from the environment/.env
+# so a credential never has to be typed into a shell history or committed;
+# aegis.py's --auth-cookie/--auth-header flags override these when given.
+#
+# Omitting all of them reproduces today's behaviour exactly — every tool is
+# invoked with no auth argument, byte for byte as before.
+#
+# The VALUE of any of these is a secret and is never logged, never written
+# to scan_errors.log and never rendered into a report. Only the FACT that
+# authentication was configured is recorded (see modules/utils/auth.py).
+AUTH_COOKIE = os.environ.get("AEGIS_AUTH_COOKIE") or None
+AUTH_HEADER = os.environ.get("AEGIS_AUTH_HEADER") or None
+AUTH_BASIC_USER = os.environ.get("AEGIS_AUTH_BASIC_USER") or None
+AUTH_BASIC_PASS = os.environ.get("AEGIS_AUTH_BASIC_PASS") or None
+
+# ---- ZAP daemon location ----
+# Unset (the default) means today's behaviour: zap_wrap.py spawns a local
+# zap.sh daemon itself. Setting ZAP_HOST points it at an already-running
+# daemon instead — typically the container in docker/zap/, whose disposable
+# ~/.ZAP profile is what makes 'docker compose restart zap' a real fix for
+# the add-on corruption class of failure documented in WRITEUP.md §3.1.
+ZAP_HOST = os.environ.get("ZAP_HOST") or None
+ZAP_PORT = int(os.environ.get("ZAP_PORT") or 8090)
 
 # ---- Known-good targets (regression guard) ----
 # Hosts whose open ports are an established fact. port_scanner.py flags

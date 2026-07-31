@@ -19,6 +19,7 @@ import json
 import re
 
 from modules.utils.error_handler import run_tool
+from modules.utils.config import get_rate_limits
 from modules.utils.logger import log_finding
 from modules.utils.display import (
     print_info, print_success, print_warning, print_error,
@@ -185,7 +186,7 @@ def _parse_nuclei_jsonl(stdout: str) -> list:
 
 
 def run_nuclei(target: str, port: int = 80, use_https: bool = False,
-               severity: list = None) -> dict:
+               severity: list = None, profile: str = None, auth=None) -> dict:
     """
     Scan `target`'s web service with nuclei's community template set.
 
@@ -231,7 +232,19 @@ def run_nuclei(target: str, port: int = 80, use_https: bool = False,
         + _NUCLEI_BASE_ARGS
     )
 
-    print_info(f"[Nuclei] Scanning {url} (severity={','.join(severity_list)})")
+    # Per-profile request-rate ceiling (-rate-limit, requests/second). None
+    # for every profile today, which leaves nuclei on its own default (150/s)
+    # exactly as before -- passing nothing and passing 150 are the same run,
+    # but only passing nothing is guaranteed to stay the same if nuclei ever
+    # changes that default, so the flag is genuinely omitted.
+    rate_limit = get_rate_limits(profile).get("nuclei_rate_limit")
+    if rate_limit:
+        command += ["-rate-limit", str(int(rate_limit))]
+    if auth is not None:
+        command += auth.nuclei_args()
+
+    pacing = f", rate-limit={int(rate_limit)}/s" if rate_limit else ""
+    print_info(f"[Nuclei] Scanning {url} (severity={','.join(severity_list)}{pacing})")
 
     # run_tool() already logs this call's start/success/failure under the
     # "nuclei" tool name — no need to log it again here.

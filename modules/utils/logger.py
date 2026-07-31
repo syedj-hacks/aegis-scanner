@@ -6,37 +6,62 @@ Every scan gets its own scan_errors.log under output/[target]/.
 
 import logging
 import os
+import threading
 from datetime import datetime
 from modules.utils.config import output_dir
 
 _loggers = {}
+
+# Guards _loggers and the handler-attachment below.
+#
+# Needed since --targets runs several targets concurrently in one process:
+# two threads reaching get_logger() for the SAME target at once could both
+# see an empty logger.handlers and both attach a FileHandler to it, after
+# which every line that target logs is written to scan_errors.log twice.
+# The check and the attach have to be one atomic step, not two.
+#
+# Different targets are not the problem — they get different loggers and
+# different files, which is exactly the per-target isolation --targets
+# promises. It is the same-target race that duplicates lines.
+_loggers_lock = threading.Lock()
+
 
 def get_logger(target: str) -> logging.Logger:
     """
     Returns a logger scoped to a specific target's output directory.
     Reuses the same logger instance if called again for the same target
     within one run (avoids duplicate handlers).
+
+    Thread-safe: multi-target runs call this from several threads at once.
     """
-    if target in _loggers:
-        return _loggers[target]
+    logger = _loggers.get(target)
+    if logger is not None:
+        return logger
 
-    log_path = os.path.join(output_dir(target), "scan_errors.log")
+    with _loggers_lock:
+        # Re-checked inside the lock: another thread may have created it
+        # between the fast path above and acquiring the lock.
+        logger = _loggers.get(target)
+        if logger is not None:
+            return logger
 
-    logger = logging.getLogger(f"aegis.{target}")
-    logger.setLevel(logging.DEBUG)
-    logger.propagate = False  # don't also spam the root logger / console
+        log_path = os.path.join(output_dir(target), "scan_errors.log")
 
-    if not logger.handlers:
-        file_handler = logging.FileHandler(log_path, encoding="utf-8")
-        formatter = logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"
-        )
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+        logger = logging.getLogger(f"aegis.{target}")
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False  # don't also spam the root logger / console
 
-    _loggers[target] = logger
-    return logger
+        if not logger.handlers:
+            file_handler = logging.FileHandler(log_path, encoding="utf-8")
+            formatter = logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S"
+            )
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+
+        _loggers[target] = logger
+        return logger
 
 
 def log_tool_start(target: str, tool_name: str):

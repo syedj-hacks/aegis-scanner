@@ -58,11 +58,42 @@ except ImportError:
     # keybind is simply unavailable (Ctrl+C still works everywhere).
     _TTY_MODULES_AVAILABLE = False
 
-# Set by the listener thread when the skip key is pressed; cleared by
-# run_tool() as soon as it has acted on it (skipped, or refused because the
-# tool is compulsory). Module-level and shared rather than per-call because
-# only one tool is ever running at a time.
-_skip_requested = threading.Event()
+# When the skip key was last pressed (time.time(), 0.0 = never).
+#
+# This used to be a threading.Event, on the stated assumption that "only one
+# tool is ever running at a time". That assumption no longer holds:
+# webaudit/deepscan now run their independent per-port web tools through a
+# thread pool (config.PARALLEL_WEB_TOOLS), so several run_tool() calls are
+# genuinely in flight at once. An Event cleared by whichever call noticed it
+# first would have made a keypress skip one arbitrary, unpredictable member
+# of the batch.
+#
+# A timestamp gives a rule that is well-defined no matter how many tools are
+# running: a press skips every tool that was ALREADY RUNNING when the key
+# went down, and no tool started afterwards. With one tool running that is
+# identical to the old behaviour; with a batch it means "skip the group of
+# tools running right now", which is the only reading a user watching a
+# progress bar could act on deliberately.
+#
+# Each run_tool() call tracks which press it has already acted on in a local
+# variable, so a compulsory tool that refuses a press does not consume it on
+# behalf of the skippable tools running alongside it, and does not re-print
+# its refusal on every poll.
+_skip_press_time = [0.0]
+
+# Whether the skip key is active at all this run.
+#
+# Switched off for multi-target runs (--targets). "Skip the tool running
+# right now" has no single referent when six tools across three targets are
+# in flight — a keypress would skip whichever set happened to be running,
+# which is not a control anyone can use deliberately. It is disabled and
+# said so, rather than left on and unpredictable. Ctrl+C still works.
+_skip_listener_enabled = [True]
+
+
+def set_skip_listener_enabled(enabled: bool) -> None:
+    """Enable/disable the skip-key listener process-wide."""
+    _skip_listener_enabled[0] = bool(enabled)
 
 # How often (seconds) the listener polls stdin for a keypress, and how often
 # run_tool()'s wait loop checks the timeout/skip state. Small enough that a
@@ -75,36 +106,56 @@ class _SkipKeyListener:
     """
     Puts stdin into cbreak mode (no line buffering, no echo, but signals
     like Ctrl+C's SIGINT still fire — cbreak leaves ISIG alone) and watches
-    for config.SKIP_KEY in a daemon thread for the lifetime of one run_tool()
-    call. No-ops entirely when stdin isn't an interactive TTY.
+    for config.SKIP_KEY in a daemon thread. No-ops entirely when stdin isn't
+    an interactive TTY.
+
+    Process-wide and reference-counted, NOT one instance per run_tool() call.
+    There is only one stdin and only one terminal mode, so concurrent tools
+    must not each save-and-restore it: with a thread pool running five web
+    tools per port, five listeners would each call tcgetattr/tcsetattr on the
+    same fd, and the first one to finish would restore "the old settings" —
+    which, having been captured after an earlier listener already switched to
+    cbreak, ARE cbreak. The terminal is then left with echo off after the
+    scan ends, which reads to the user as a hung shell.
+
+    So: the first acquire() captures the real pre-scan settings and starts
+    one reader thread; later acquires only bump the count; the last release()
+    restores. Guarded by a lock because acquire/release are now called from
+    several worker threads at once.
     """
 
-    def __init__(self, key: str = SKIP_KEY):
-        self._key = (key or "s").lower()[:1]
-        self._stop = threading.Event()
-        self._thread = None
-        self._old_settings = None
-        self._active = False
+    _lock = threading.Lock()
+    _refcount = 0
+    _thread = None
+    _stop = threading.Event()
+    _old_settings = None
+    _key = (SKIP_KEY or "s").lower()[:1]
 
-    def start(self):
-        if not _TTY_MODULES_AVAILABLE:
+    @classmethod
+    def acquire(cls):
+        if not _TTY_MODULES_AVAILABLE or not _skip_listener_enabled[0]:
             return
-        try:
-            if not sys.stdin.isatty():
-                return
-            self._old_settings = termios.tcgetattr(sys.stdin)
-            tty.setcbreak(sys.stdin.fileno())
-        except (termios.error, ValueError, OSError, AttributeError):
-            self._old_settings = None
-            return
+        with cls._lock:
+            if cls._refcount == 0:
+                try:
+                    if not sys.stdin.isatty():
+                        return
+                    cls._old_settings = termios.tcgetattr(sys.stdin)
+                    tty.setcbreak(sys.stdin.fileno())
+                except (termios.error, ValueError, OSError, AttributeError):
+                    cls._old_settings = None
+                    return
+                cls._stop.clear()
+                cls._thread = threading.Thread(target=cls._listen, daemon=True)
+                cls._thread.start()
+            # Only counted once the terminal is genuinely ours, so a
+            # non-TTY run never has a release() to unbalance.
+            if cls._old_settings is not None:
+                cls._refcount += 1
 
-        self._active = True
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._listen, daemon=True)
-        self._thread.start()
-
-    def _listen(self):
-        while not self._stop.is_set():
+    @classmethod
+    def _listen(cls):
+        while not cls._stop.is_set():
             try:
                 ready, _, _ = select.select([sys.stdin], [], [], _POLL_INTERVAL)
             except (OSError, ValueError):
@@ -114,16 +165,32 @@ class _SkipKeyListener:
                     ch = sys.stdin.read(1)
                 except OSError:
                     return
-                if ch and ch.lower() == self._key:
-                    _skip_requested.set()
+                if ch and ch.lower() == cls._key:
+                    _skip_press_time[0] = time.time()
 
-    def stop(self):
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-        if self._active and self._old_settings is not None:
+    @classmethod
+    def release(cls):
+        if not _TTY_MODULES_AVAILABLE:
+            return
+        with cls._lock:
+            if cls._refcount == 0:
+                return
+            cls._refcount -= 1
+            if cls._refcount > 0:
+                return
+
+            cls._stop.set()
+            thread, cls._thread = cls._thread, None
+            old, cls._old_settings = cls._old_settings, None
+
+        # Joining outside the lock: the reader thread can be up to one
+        # _POLL_INTERVAL from noticing the stop flag, and holding the lock
+        # for that long would stall every other tool's acquire/release.
+        if thread is not None:
+            thread.join(timeout=1.0)
+        if old is not None:
             try:
-                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_settings)
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
             except (termios.error, OSError):
                 pass
 
@@ -256,7 +323,6 @@ def run_tool(target: str, tool_name: str, command: list, timeout: float = None) 
     }
 
     proc = None
-    listener = _SkipKeyListener()
     try:
         # Popen (rather than subprocess.run) so a Ctrl+C mid-scan, a timeout,
         # or a skip keypress can all kill the child process before this
@@ -283,7 +349,14 @@ def run_tool(target: str, tool_name: str, command: list, timeout: float = None) 
 
         reader_thread = threading.Thread(target=_drain, daemon=True)
         reader_thread.start()
-        listener.start()
+        _SkipKeyListener.acquire()
+
+        # The most recent skip press this call has already acted on. Local,
+        # not shared: with several tools running concurrently, one tool
+        # consuming a press must not hide it from the others, and a
+        # compulsory tool refusing one must not re-print that refusal on
+        # every 0.2s poll for the rest of its run.
+        handled_press = _skip_press_time[0]
 
         outcome = None  # None (clean exit) | "timeout" | "skipped"
         while True:
@@ -295,8 +368,13 @@ def run_tool(target: str, tool_name: str, command: list, timeout: float = None) 
                 outcome = "timeout"
                 break
 
-            if _skip_requested.is_set():
-                _skip_requested.clear()
+            # A press counts for this tool only if it happened after this
+            # tool started — that is what scopes a skip to the tools running
+            # at the moment the key went down, and stops a stale press from
+            # instantly killing the next tool to start.
+            press = _skip_press_time[0]
+            if press > handled_press and press > start:
+                handled_press = press
                 if is_compulsory:
                     reason = COMPULSORY_TOOLS.get(tool_name.lower(), "required by downstream modules")
                     print_warning(
@@ -351,6 +429,23 @@ def run_tool(target: str, tool_name: str, command: list, timeout: float = None) 
                 pass
         result["duration"] = time.time() - start
         result["error"] = _handle_interrupt(target, tool_name)
+        # A single Ctrl+C is a deliberate user skip, and has to be recorded
+        # as one. Without this flag classify_tool_outcome() sees an error
+        # string with skipped=False and classifies it "failed", so the scan
+        # that the user politely stepped past one tool in reports a TOOL
+        # FAILURE — printed as "[Failed] nikto: skipped by user (Ctrl+C)",
+        # counted in the summary panel, and persisted to scan_tools_run.
+        #
+        # This is the same skip-flag bug already fixed three times in this
+        # codebase's wrappers (zap_wrap.py, header_check.py, banner.py) —
+        # is_user_skip() and the SKIP_REASON_* constants exist precisely to
+        # stop it recurring, and run_tool(), the function they were written
+        # for, was itself still missing it. The skip-key path above sets the
+        # flag; the Ctrl+C path did not, so two spellings of "the user
+        # skipped this" were classified two different ways.
+        result["skipped"] = is_user_skip(result["error"])
+        if result["skipped"]:
+            log_tool_skip(target, tool_name)
 
     except Exception as e:
         # Catch-all — guarantees the framework NEVER crashes because
@@ -360,7 +455,7 @@ def run_tool(target: str, tool_name: str, command: list, timeout: float = None) 
         log_tool_failure(target, tool_name, result["error"])
 
     finally:
-        listener.stop()
+        _SkipKeyListener.release()
 
     return result
 

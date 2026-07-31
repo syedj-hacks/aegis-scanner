@@ -103,7 +103,13 @@ FINDING_TYPE_PRODUCERS = {
     "smb_share": {"enum4linux"},
     "smb_user": {"enum4linux"},
     "sqlmap_finding": {"sqlmap"},
-    "sslyze_finding": {"sslyze"},
+    # testssl.sh emits into the same TLS finding family as sslyze on
+    # purpose (see modules/web/testssl_wrap.py): a TLS weakness is the same
+    # kind of fact whichever tool observed it, and the reports/severity/
+    # compliance mapping should not each need a second vocabulary for it.
+    # Both are therefore legitimate producers of this type, and a
+    # compliance scan can credit either.
+    "sslyze_finding": {"sslyze", "testssl"},
     "technology_fingerprint": {"whatweb"},
     "weak_credentials": {"hydra"},
     "wordpress_fingerprinted": {"gobuster"},
@@ -123,7 +129,7 @@ FINDING_TYPE_PRODUCERS = {
 PROFILE_PRODUCERS = {
     "quickscan": {"nmap", "whatweb", "nuclei"},
     "stealthscan": {"nmap"},
-    "compliance": {"nmap", "sslyze", "whatweb"},
+    "compliance": {"nmap", "sslyze", "testssl", "whatweb"},
     "webaudit": {
         "nmap", "nikto", "gobuster", "dirb", "whatweb", "sslyze",
         "banner_grab", "header_check", "nvd", "nuclei",

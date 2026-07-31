@@ -53,9 +53,10 @@ from modules.utils.logger import log_scan_start, log_scan_end, log_tool_failure,
 from modules.profiles._common import (
     warn_unavailable_tools, GLOBAL_AVAILABLE_TOOLS,
     count_and_report_tool_failures, persist_tool_run, web_param_candidates,
-    finalise_reports,
+    finalise_reports, run_web_tools, web_tool_concurrency,
     nuclei_description, nuclei_port, nuclei_service, named_description,
 )
+from modules.utils.auth import load_auth, announce as announce_auth
 from modules.recon.dns import resolve_dns
 from modules.recon.subdomain import enumerate_subdomains
 from modules.recon.osint import harvest_osint
@@ -672,7 +673,7 @@ def _check_conditional_tools(target: str, flags: dict, context: dict) -> tuple:
             # .php (the old behaviour) meant a non-injectable /index.php shut
             # the whole pass down before /info.php was ever tried.
             for candidate_url, candidate_port in candidates:
-                sqlmap_result = run_sqlmap(target, candidate_url)
+                sqlmap_result = run_sqlmap(target, candidate_url, auth=auth)
                 new_tool_results.append(sqlmap_result)
                 new_findings.extend(_findings_from_sqlmap(sqlmap_result, candidate_port))
                 if sqlmap_result.get("injectable"):
@@ -694,7 +695,7 @@ def _check_conditional_tools(target: str, flags: dict, context: dict) -> tuple:
     return new_findings, new_tool_results
 
 
-def run_deepscan(target: str, non_interactive: bool = False):
+def run_deepscan(target: str, non_interactive: bool = False, auth=None):
     """
     Run the full deepscan profile against `target`.
 
@@ -707,6 +708,21 @@ def run_deepscan(target: str, non_interactive: bool = False):
 
     profile_cfg = get_profile(PROFILE_NAME)
     warn_unavailable_tools(target, profile_cfg.get("tools"), PROFILE_NAME, _AVAILABLE_TOOLS)
+
+    # None (the default, and every existing call site) resolves to whatever
+    # .env/environment configures. With nothing set that is a disabled
+    # AuthConfig whose *_args() all return [], so every tool command is built
+    # exactly as it was before authenticated scanning existed.
+    if auth is None:
+        auth = load_auth()
+    announce_auth(auth, PROFILE_NAME)
+
+    concurrency = web_tool_concurrency(PROFILE_NAME)
+    if concurrency > 1:
+        print_info(
+            f"[{PROFILE_NAME}] running independent per-port web tools "
+            f"{concurrency}-way concurrent"
+        )
 
     scan_id = insert_scan(target, PROFILE_NAME)
 
@@ -810,6 +826,9 @@ def run_deepscan(target: str, non_interactive: bool = False):
                 use_https = _is_https_port(port_entry)
                 port_findings = []
 
+                # Sequential and first: the Server banner it returns is the
+                # key the CVE lookup below runs on, so this is a real data
+                # dependency rather than one of the independent tools.
                 header_result = check_headers(target, port=port, use_https=use_https)
                 tool_results.append(header_result)
                 port_findings.extend(_score_and_remediate(_findings_from_headers(header_result)))
@@ -822,37 +841,56 @@ def run_deepscan(target: str, non_interactive: bool = False):
                     ))
                 advance(f"Headers :{port}")
 
-                nikto_result = run_nikto(target, port=port, use_https=use_https)
+                # The four mutually independent discovery/fingerprint tools.
+                # nuclei and ZAP below are deliberately NOT in this pool:
+                # ZAP is a single daemon with a single session, and nuclei's
+                # per-port template run is heavy enough that adding it would
+                # change this profile's outbound request profile considerably
+                # more than the four cheap tools do. Both stay sequential.
+                tasks = [
+                    ("nikto", lambda: run_nikto(target, port=port, use_https=use_https,
+                                                profile=PROFILE_NAME, auth=auth)),
+                    ("gobuster", lambda: run_gobuster(target, port=port, use_https=use_https,
+                                                      profile=PROFILE_NAME, auth=auth)),
+                    ("dirb", lambda: run_dirb(target, port=port, use_https=use_https,
+                                              profile=PROFILE_NAME)),
+                    ("whatweb", lambda: run_whatweb(target, port=port, use_https=use_https)),
+                ]
+                results = run_web_tools(tasks, profile=PROFILE_NAME)
+                by_tool = dict(zip([name for name, _ in tasks], results))
+
+                nikto_result = by_tool["nikto"]
                 tool_results.append(nikto_result)
                 port_findings.extend(_score_and_remediate(_findings_from_nikto(nikto_result)))
                 advance(f"Nikto :{port}")
 
-                gobuster_result = run_gobuster(target, port=port, use_https=use_https)
+                gobuster_result = by_tool["gobuster"]
                 tool_results.append(gobuster_result)
                 gobuster_results.append(gobuster_result)
                 port_findings.extend(_score_and_remediate(_findings_from_gobuster(gobuster_result)))
                 advance(f"Gobuster :{port}")
 
-                dirb_result = run_dirb(target, port=port, use_https=use_https)
+                dirb_result = by_tool["dirb"]
                 tool_results.append(dirb_result)
                 dirb_results.append(dirb_result)
                 port_findings.extend(_score_and_remediate(_findings_from_dirb(dirb_result)))
                 advance(f"Dirb :{port}")
 
-                whatweb_result = run_whatweb(target, port=port, use_https=use_https)
+                whatweb_result = by_tool["whatweb"]
                 tool_results.append(whatweb_result)
                 port_findings.extend(_score_and_remediate(_findings_from_whatweb(whatweb_result)))
                 advance(f"WhatWeb :{port}")
 
                 severity_list = profile_cfg.get("nuclei_severity")
-                nuclei_result = run_nuclei(target, port=port, use_https=use_https, severity=severity_list)
+                nuclei_result = run_nuclei(target, port=port, use_https=use_https,
+                                           severity=severity_list, profile=PROFILE_NAME, auth=auth)
                 tool_results.append(nuclei_result)
                 port_findings.extend(_score_and_remediate(
                     _findings_from_nuclei(nuclei_result, seen=seen_nuclei_matches)
                 ))
                 advance(f"Nuclei :{port}")
 
-                zap_result = run_zap_baseline(target, port=port, use_https=use_https)
+                zap_result = run_zap_baseline(target, port=port, use_https=use_https, auth=auth)
                 tool_results.append(zap_result)
                 port_findings.extend(_score_and_remediate(_findings_from_zap(zap_result)))
                 advance(f"ZAP :{port}")

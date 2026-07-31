@@ -519,16 +519,30 @@ def distinct_identifiers(findings: list) -> list:
 
 def cvss_display(finding: dict) -> str:
     """
-    CVSS cell, including where the grade came from when there is a score.
+    CVSS cell: the score, where it came from, and — for a locally computed
+    score — the vector it was computed from.
 
     An unscored finding is not a mystery — severity.py graded it
     heuristically — so the label says which of the two happened rather than
     leaving the reader to wonder whether scoring failed.
+
+    The vector is shown because a locally computed score without one is
+    just a differently-spelled severity bucket: "5.3" invites the reader to
+    trust it, while "5.3 [CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N]"
+    lets them check it and disagree with a specific metric. NVD-sourced
+    scores carry no vector here — they are attributable to the CVE record
+    itself, which is the authority for them, and inventing a vector to
+    display alongside one would misrepresent whose judgement it was.
     """
     cvss = finding.get("cvss")
     if cvss is None:
         return field_display(finding, "cvss")
-    return f"{cvss} (source: {finding.get('severity_source', 'heuristic')})"
+
+    source = finding.get("severity_source", "heuristic")
+    vector = str(finding.get("cvss_vector") or "").strip()
+    if vector:
+        return f"{cvss} (source: {source}) [{vector}]"
+    return f"{cvss} (source: {source})"
 
 
 # --- Defensive de-duplication --------------------------------------------

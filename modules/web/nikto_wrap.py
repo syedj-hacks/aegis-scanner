@@ -22,6 +22,7 @@ Two nikto quirks this wrapper exists to absorb:
 import re
 
 from modules.utils.error_handler import run_tool
+from modules.utils.config import get_rate_limits
 from modules.utils.config import get_timeout
 from modules.utils.logger import log_tool_failure, log_finding
 from modules.utils.display import (
@@ -241,7 +242,8 @@ def _detect_failure(stdout: str) -> str:
     return ""
 
 
-def run_nikto(target: str, port: int = 80, use_https: bool = False) -> dict:
+def run_nikto(target: str, port: int = 80, use_https: bool = False,
+              profile: str = None, auth=None) -> dict:
     """
     Run nikto against `target`'s web service.
 
@@ -300,6 +302,23 @@ def run_nikto(target: str, port: int = 80, use_https: bool = False) -> dict:
     )
     if use_https:
         command.append("-ssl")
+
+    # Per-profile pacing (-Pause, seconds between tests). None for every
+    # profile today, so the flag is omitted and the command is unchanged.
+    # Note this trades coverage for politeness against -maxtime: nikto stops
+    # at the deadline either way, so pausing means fewer tests get run in the
+    # same window. That is the intended trade when it is switched on, not a
+    # side effect -- which is why it is off by default.
+    pause_s = get_rate_limits(profile).get("nikto_pause_s")
+    if pause_s:
+        command += ["-Pause", str(pause_s)]
+
+    # nikto's only credential option is -id (basic auth). A cookie/header
+    # credential cannot be passed to it; auth.unsupported_note() reports
+    # that at the top of the scan rather than letting nikto quietly return
+    # an anonymous view inside a run labelled authenticated.
+    if auth is not None:
+        command += auth.nikto_args()
 
     scheme = "https" if use_https else "http"
     result["base_url"] = f"{scheme}://{host}:{port}"

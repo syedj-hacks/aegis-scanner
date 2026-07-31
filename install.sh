@@ -31,13 +31,19 @@ VENV_DIR="$REPO_ROOT/venv"
 #                                 install, grab it from the ZAP install itself
 #                                 (see https://www.zaproxy.org/docs/docker/baseline-scan/)
 #   sslyze                        modules/web/sslyze_wrap.py
+#   testssl.sh                    modules/web/testssl_wrap.py — complements sslyze rather than
+#                                 replacing it: sslyze inventories accepted protocols/ciphers,
+#                                 testssl.sh tests for named TLS vulnerabilities (Heartbleed,
+#                                 ROBOT, renegotiation, ...) that sslyze does not check at all.
+#                                 In apt on Debian/Kali as "testssl.sh"; a git-clone fallback
+#                                 below covers distros where it is not packaged.
 #   wpscan                        modules/web/wpscan_wrap.py
 #   sqlmap                        modules/web/sqlmap_wrap.py
 #   hydra                         modules/scanning/hydra_wrap.py
 #   enum4linux                    modules/scanning/enum4linux_wrap.py
 SCAN_TOOLS=(
     bind9-dnsutils nmap nikto gobuster subfinder amass theharvester dirb
-    whatweb nuclei zaproxy sslyze wpscan sqlmap hydra enum4linux
+    whatweb nuclei zaproxy sslyze testssl.sh wpscan sqlmap hydra enum4linux
 )
 
 # Python environment + WeasyPrint's native Pango/Cairo/GDK-Pixbuf bindings
@@ -75,6 +81,27 @@ if ! command -v nuclei >/dev/null 2>&1 && ! command -v "$HOME/go/bin/nuclei" >/d
             || echo "[-] 'go install' for nuclei failed — nuclei_wrap.py will log 'binary not found' until this is resolved"
     else
         echo "[-] nuclei is missing and no Go toolchain is present to install it — install Go or nuclei manually"
+    fi
+fi
+
+# testssl.sh is packaged in Debian/Kali apt (verified: 3.2.2+dfsg-1), so the
+# SCAN_TOOLS entry above normally covers it. It is a single self-contained
+# bash script, though, and is NOT packaged everywhere — so where apt has no
+# package, clone it instead of leaving compliance scans without their
+# vulnerability-check half. modules/web/testssl_wrap.py probes
+# /opt/testssl.sh/testssl.sh explicitly, which is where this puts it.
+if ! command -v testssl.sh >/dev/null 2>&1 && ! command -v testssl >/dev/null 2>&1 \
+   && [[ ! -x /opt/testssl.sh/testssl.sh ]]; then
+    if command -v git >/dev/null 2>&1; then
+        echo "[*] testssl.sh is not available from apt here — installing via git clone to /opt/testssl.sh"
+        if $SUDO git clone --depth 1 --branch 3.2 https://github.com/testssl/testssl.sh.git /opt/testssl.sh; then
+            $SUDO chmod +x /opt/testssl.sh/testssl.sh
+            echo "[+] testssl.sh installed to /opt/testssl.sh/testssl.sh"
+        else
+            echo "[-] git clone of testssl.sh failed — the compliance profile will log it as unavailable and continue"
+        fi
+    else
+        echo "[-] testssl.sh is missing and git is not installed to fetch it — install one or the other manually"
     fi
 fi
 

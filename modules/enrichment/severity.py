@@ -28,6 +28,7 @@ adjust a single entry without reading the control flow.
 import re
 
 from modules.utils.logger import log_finding
+from modules.enrichment.cvss import apply_local_cvss
 from modules.utils.display import print_info, print_warning
 
 # ---------------------------------------------------------------------
@@ -468,6 +469,16 @@ def score_finding(finding: dict, target: str = "enrichment") -> dict:
 
     scored = dict(finding)
     kind = _finding_type(scored)
+
+    # Fill in a local CVSS v3.1 vector for findings NVD has no score for
+    # (missing headers, weak TLS, exposed sensitive paths, confirmed
+    # injection). apply_local_cvss() is a no-op when a score already exists
+    # from any source, so an NVD-supplied score is never touched — see
+    # modules/enrichment/cvss.py. Applied BEFORE _extract_score() so the
+    # resulting severity comes from the score and the vector travels with
+    # it into the report, rather than the keyword heuristic running first
+    # and the vector arriving as unused decoration.
+    scored = apply_local_cvss(scored)
 
     score = _extract_score(scored)
     if score is not None:

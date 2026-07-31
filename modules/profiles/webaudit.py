@@ -45,8 +45,9 @@ from modules.enrichment.remediation import get_remediation
 from database.db import insert_scan, insert_findings_bulk
 from modules.profiles._common import (
     warn_unavailable_tools, count_and_report_tool_failures, web_param_candidates,
-    persist_tool_run, finalise_reports,
+    persist_tool_run, finalise_reports, run_web_tools, web_tool_concurrency,
 )
+from modules.utils.auth import load_auth, announce as announce_auth
 
 PROFILE_NAME = "webaudit"
 
@@ -263,7 +264,7 @@ def _findings_from_xss(xss_result: dict, port) -> list:
     return findings
 
 
-def run_webaudit(target: str, non_interactive: bool = False):
+def run_webaudit(target: str, non_interactive: bool = False, auth=None):
     """
     Run the webaudit profile against `target`: DNS resolution, a nmap scan
     restricted to web ports, the full web module against whichever of those
@@ -288,6 +289,21 @@ def run_webaudit(target: str, non_interactive: bool = False):
 
     profile_cfg = get_profile(PROFILE_NAME)
     warn_unavailable_tools(target, profile_cfg.get("tools"), PROFILE_NAME, _WIRED_TOOLS)
+
+    # None (the default, and every existing call site) resolves to whatever
+    # .env/environment configures — which, with nothing set, is a disabled
+    # AuthConfig whose *_args() all return [], so every command is built
+    # exactly as before.
+    if auth is None:
+        auth = load_auth()
+    announce_auth(auth, PROFILE_NAME)
+
+    concurrency = web_tool_concurrency(PROFILE_NAME)
+    if concurrency > 1:
+        print_info(
+            f"[{PROFILE_NAME}] running independent per-port web tools "
+            f"{concurrency}-way concurrent"
+        )
 
     scan_id = insert_scan(target, PROFILE_NAME)
 
@@ -343,6 +359,9 @@ def run_webaudit(target: str, non_interactive: bool = False):
                 use_https = _is_https_port(port_entry)
                 port_findings = []
 
+                # header_check runs first and alone, outside the pool: its
+                # Server banner is what the CVE lookup below is keyed on, so
+                # this one IS a data dependency, unlike the five that follow.
                 header_result = check_headers(target, port=port, use_https=use_https)
                 tool_results.append(header_result)
                 port_findings.extend(_score_and_remediate(_findings_from_headers(header_result)))
@@ -354,30 +373,50 @@ def run_webaudit(target: str, non_interactive: bool = False):
                     ))
                 advance(f"Headers :{port}")
 
-                nikto_result = run_nikto(target, port=port, use_https=use_https)
+                # nikto / gobuster / dirb / whatweb / sslyze are mutually
+                # independent for a given port — none reads another's output —
+                # so they go through the shared pool. run_web_tools() returns
+                # results in task order regardless of completion order, which
+                # is what keeps finding rows stable across runs.
+                tasks = [
+                    ("nikto", lambda: run_nikto(target, port=port, use_https=use_https,
+                                                profile=PROFILE_NAME, auth=auth)),
+                    ("gobuster", lambda: run_gobuster(target, port=port, use_https=use_https,
+                                                      profile=PROFILE_NAME, auth=auth)),
+                    ("dirb", lambda: run_dirb(target, port=port, use_https=use_https,
+                                              profile=PROFILE_NAME)),
+                    ("whatweb", lambda: run_whatweb(target, port=port, use_https=use_https)),
+                ]
+                if use_https:
+                    tasks.append(("sslyze", lambda: run_sslyze(target, port=port)))
+
+                results = run_web_tools(tasks, profile=PROFILE_NAME)
+                by_tool = dict(zip([name for name, _ in tasks], results))
+
+                nikto_result = by_tool["nikto"]
                 tool_results.append(nikto_result)
                 port_findings.extend(_score_and_remediate(_findings_from_nikto(nikto_result)))
                 advance(f"Nikto :{port}")
 
-                gobuster_result = run_gobuster(target, port=port, use_https=use_https)
+                gobuster_result = by_tool["gobuster"]
                 tool_results.append(gobuster_result)
                 gobuster_results.append(gobuster_result)
                 port_findings.extend(_score_and_remediate(_findings_from_gobuster(gobuster_result)))
                 advance(f"Gobuster :{port}")
 
-                dirb_result = run_dirb(target, port=port, use_https=use_https)
+                dirb_result = by_tool["dirb"]
                 tool_results.append(dirb_result)
                 dirb_results.append(dirb_result)
                 port_findings.extend(_score_and_remediate(_findings_from_dirb(dirb_result)))
                 advance(f"Dirb :{port}")
 
-                whatweb_result = run_whatweb(target, port=port, use_https=use_https)
+                whatweb_result = by_tool["whatweb"]
                 tool_results.append(whatweb_result)
                 port_findings.extend(_score_and_remediate(_findings_from_whatweb(whatweb_result)))
                 advance(f"WhatWeb :{port}")
 
                 if use_https:
-                    sslyze_result = run_sslyze(target, port=port)
+                    sslyze_result = by_tool["sslyze"]
                     tool_results.append(sslyze_result)
                     port_findings.extend(_score_and_remediate(_findings_from_sslyze(sslyze_result)))
 

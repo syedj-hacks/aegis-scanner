@@ -38,9 +38,11 @@ from modules.utils.display import (
 from modules.utils.logger import log_scan_start, log_scan_end
 from modules.scanning.port_scanner import scan_ports
 from modules.web.sslyze_wrap import run_sslyze
+from modules.web.testssl_wrap import run_testssl
 from modules.web.whatweb_wrap import run_whatweb
 from modules.enrichment.severity import score_finding
 from modules.enrichment.remediation import get_remediation
+from modules.enrichment.compliance_map import apply_compliance_refs
 from database.db import insert_scan, insert_findings_bulk
 from modules.profiles._common import (
     warn_unavailable_tools, count_and_report_tool_failures, persist_tool_run,
@@ -49,17 +51,28 @@ from modules.profiles._common import (
 
 PROFILE_NAME = "compliance"
 
-_WIRED_TOOLS = {"nmap", "sslyze", "whatweb"}
+_WIRED_TOOLS = {"nmap", "sslyze", "testssl", "whatweb"}
 
 _SSL_SCRIPT_ID = "ssl-enum-ciphers"
 _FALLBACK_TLS_PORT = 443
 
 
 def _score_and_remediate(findings: list) -> list:
+    """
+    Score, remediate, and — uniquely to this profile — stamp each finding
+    with the PCI-DSS/ISO 27001/NIST 800-53 controls it bears on.
+
+    apply_compliance_refs() is passed PROFILE_NAME explicitly and is a no-op
+    for anything else, so the mapping cannot leak into another profile by a
+    shared helper being reused later. Findings with no honest mapping keep
+    compliance_refs NULL rather than being assigned a loosely-related
+    control — see modules/enrichment/compliance_map.py.
+    """
     out = []
     for finding in findings:
         scored = score_finding(finding)
-        out.append(get_remediation(scored))
+        remediated = get_remediation(scored)
+        out.append(apply_compliance_refs(remediated, profile=PROFILE_NAME))
     return out
 
 
@@ -107,7 +120,7 @@ def _tls_ports(scripts: list, open_ports: list) -> list:
     return []
 
 
-def run_compliance(target: str, non_interactive: bool = False):
+def run_compliance(target: str, non_interactive: bool = False, auth=None):
     """
     Run the compliance profile against `target`: the nmap scan configured by
     PROFILES['compliance']['nmap_args'] (its --script results now captured
@@ -117,6 +130,13 @@ def run_compliance(target: str, non_interactive: bool = False):
     Returns
     -------
     tuple: (scan_id: int, report_path: str | None)
+    
+    `auth` is accepted and deliberately unused: every profile is dispatched
+    through the same call in aegis.py/multi_target.py, so the signature has
+    to be uniform. This profile runs no tool that takes a credential, and
+    silently accepting one it cannot use is better than a TypeError only
+    some profiles raise -- announce_auth() in the profiles that DO use it is
+    what tells the user where auth actually applies.
     """
     log_scan_start(target, PROFILE_NAME)
     print_phase(f"COMPLIANCE — {target}")
@@ -138,7 +158,10 @@ def run_compliance(target: str, non_interactive: bool = False):
 
         # type="open_port" stamped at the source — see stealth.py for why an
         # untyped row is a liability once a report has to classify it.
-        findings.extend(dict(p, type="open_port") for p in open_ports)
+        findings.extend(
+            apply_compliance_refs(dict(p, type="open_port"), profile=PROFILE_NAME)
+            for p in open_ports
+        )
         findings.extend(_score_and_remediate(_findings_from_scripts(scripts)))
         advance("Scoring script findings")
 
@@ -150,7 +173,7 @@ def run_compliance(target: str, non_interactive: bool = False):
 
     tls_ports = _tls_ports(scripts, open_ports)
     if tls_ports:
-        with scan_progress_bar(len(tls_ports) * 2, f"TLS audit: {target}") as advance:
+        with scan_progress_bar(len(tls_ports) * 3, f"TLS audit: {target}") as advance:
             for port in tls_ports:
                 port_findings = []
 
@@ -158,6 +181,19 @@ def run_compliance(target: str, non_interactive: bool = False):
                 tool_results.append(sslyze_result)
                 port_findings.extend(_score_and_remediate(_findings_from_sslyze(sslyze_result)))
                 advance(f"Sslyze :{port}")
+
+                # testssl.sh alongside sslyze, not instead of it. sslyze
+                # inventories what the endpoint ACCEPTS; testssl.sh tests
+                # whether it is VULNERABLE to named TLS attacks (Heartbleed,
+                # ROBOT, renegotiation, ...) which sslyze does not test for
+                # at all. Neither is derivable from the other, so running
+                # one and not the other leaves a real gap — see
+                # modules/web/testssl_wrap.py. Both emit the same finding
+                # shape, so they merge into one TLS finding family.
+                testssl_result = run_testssl(target, port=port)
+                tool_results.append(testssl_result)
+                port_findings.extend(_score_and_remediate(_findings_from_sslyze(testssl_result)))
+                advance(f"Testssl :{port}")
 
                 whatweb_result = run_whatweb(target, port=port, use_https=True)
                 tool_results.append(whatweb_result)

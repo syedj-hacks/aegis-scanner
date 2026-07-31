@@ -123,7 +123,7 @@ def _findings_from_nuclei(nuclei_result: dict) -> list:
     return findings
 
 
-def run_quickscan(target: str, non_interactive: bool = False):
+def run_quickscan(target: str, non_interactive: bool = False, auth=None):
     """
     Run the quickscan profile against `target`: DNS resolution, a fast
     profile-driven nmap port scan, service/version detection, a quick
@@ -133,6 +133,13 @@ def run_quickscan(target: str, non_interactive: bool = False):
     Returns
     -------
     tuple: (scan_id: int, report_path: str | None)
+    
+    `auth` is accepted and deliberately unused: every profile is dispatched
+    through the same call in aegis.py/multi_target.py, so the signature has
+    to be uniform. This profile runs no tool that takes a credential, and
+    silently accepting one it cannot use is better than a TypeError only
+    some profiles raise -- announce_auth() in the profiles that DO use it is
+    what tells the user where auth actually applies.
     """
     log_scan_start(target, PROFILE_NAME)
     print_phase(f"QUICKSCAN — {target}")

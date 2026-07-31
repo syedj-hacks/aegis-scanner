@@ -37,6 +37,7 @@ from modules.reporting.summary import (
     field_display, service_display, cvss_display, distinct_identifiers,
     profile_scope_note,
 )
+from modules.enrichment.compliance_map import group_by_framework, FRAMEWORKS
 
 # Report width. 78 keeps the whole report inside an 80-column terminal when
 # it is later cat'ed, which is the usual way a .txt report gets read.
@@ -356,6 +357,81 @@ def _detail_block(summary: dict) -> list:
     return lines
 
 
+def _compliance_block(summary: dict) -> list:
+    """
+    Findings grouped by the framework control each maps to — PCI-DSS,
+    ISO 27001, NIST 800-53.
+
+    Rendered ONLY for the compliance profile, and empty for every other, so
+    no other profile's report changes by a single byte. That gate is
+    deliberate rather than incidental: a control reference asserts a finding
+    is evidence about a named requirement, and stamping that on every CVE a
+    deepscan turns up would make the assertion meaningless. See
+    modules/enrichment/compliance_map.py.
+
+    A framework with no findings is omitted rather than printed empty: a
+    heading with nothing under it reads as "assessed and clean", which is a
+    stronger claim than "nothing mapped here".
+    """
+    profile = (summary.get("scan_metadata") or {}).get("profile")
+    if str(profile or "").strip().lower() != "compliance":
+        return []
+
+    findings = summary.get("findings") or []
+    grouped = group_by_framework(findings)
+
+    lines = [
+        _rule(),
+        "  COMPLIANCE CONTROL MAPPING",
+        _rule(),
+        "",
+    ]
+
+    if not grouped:
+        lines += [
+            "    No finding in this scan mapped to a tracked control.",
+            "",
+            "    This is not a pass: it means the findings recorded here are of",
+            "    types this project has no defensible mapping for, so they were",
+            "    left unmapped rather than assigned a loosely-related control.",
+            "",
+        ]
+        return lines
+
+    lines += [
+        "    Each finding below is evidence bearing on the listed control. A",
+        "    mapping is not a compliance verdict — it identifies which",
+        "    requirement this evidence belongs under when assessed.",
+        "",
+    ]
+
+    # Fixed framework order, not dict order, so successive reports of the
+    # same target are diffable against each other.
+    for _prefix, label in FRAMEWORKS:
+        entries = grouped.get(label)
+        if not entries:
+            continue
+
+        lines += [f"    {label}", "    " + "-" * (_WIDTH - 6)]
+
+        # One heading per control, with the findings under it: an auditor
+        # reads a requirement at a time, not a finding at a time.
+        by_control = {}
+        for reference, finding in entries:
+            by_control.setdefault(reference, []).append(finding)
+
+        for reference in sorted(by_control):
+            lines += _wrap(reference, 6)
+            for finding in by_control[reference]:
+                severity = finding.get("severity", "LOW")
+                description = finding.get("description") or "No description available."
+                lines += _wrap(f"[{severity}] {description}", 10)
+            lines.append("")
+        lines.append("")
+
+    return lines
+
+
 def render_report(summary: dict) -> str:
     """
     Build the full plain-text report body for a summary.
@@ -369,6 +445,7 @@ def render_report(summary: dict) -> str:
     lines += _summary_block(summary)
     lines += _top_findings_block(summary)
     lines += _injection_block(summary)
+    lines += _compliance_block(summary)
     lines += _detail_block(summary)
     lines += [
         _rule("="),

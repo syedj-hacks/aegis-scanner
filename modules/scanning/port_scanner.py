@@ -15,9 +15,17 @@ sensible default fast-scan is used.
 import os
 import tempfile
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 
 from modules.utils.error_handler import run_tool
 from modules.utils.config import get_profile, get_timeout, NMAP_TIMEOUTS
+
+# config.py is gitignored, so a per-user copy predating this key is a real
+# possibility — 1 restores the previous fully-sequential sweep.
+try:
+    from modules.utils.config import MAX_CONCURRENT_NMAP_CHUNKS as _MAX_CONCURRENT_CHUNKS
+except ImportError:
+    _MAX_CONCURRENT_CHUNKS = 1
 
 # config.py is gitignored (each install carries its own), so an older copy
 # predating the regression guard is a real possibility — fall back to the
@@ -444,33 +452,90 @@ def scan_ports(target: str, profile: str = None) -> dict:
 
         open_ports, scripts = [], []
         reach = {"host_up": None, "responsive": 0, "silent": 0}
-        for i, (lo, hi) in enumerate(chunk_ranges, start=1):
+
+        # Chunks run in small concurrent waves rather than strictly one at a
+        # time. Each chunk was already a self-contained nmap invocation with
+        # its own -oX file and its own timeout, so this is purely a
+        # scheduling change — no chunk's result depends on any other's.
+        #
+        # The stop-on-failure contract is preserved, and is the reason for
+        # the wave structure rather than one big pool: the sequential loop
+        # stopped at the first failing chunk and kept every chunk before it.
+        # With N chunks in flight, "before it" is only well-defined at a wave
+        # boundary, so a failure anywhere in a wave lets that whole wave
+        # finish (its results are real and already paid for) and then stops.
+        # Chunk results are merged in range order, never completion order.
+        #
+        # per_chunk_timeout is unchanged. It is a per-process wall-clock
+        # budget, and running three of them at once does not give any one of
+        # them less time — only the total sweep gets shorter.
+        concurrency = max(1, min(int(_MAX_CONCURRENT_CHUNKS), len(chunk_ranges)))
+        if concurrency > 1:
+            print_info(
+                f"[Ports] full-range sweep: {len(chunk_ranges)} chunks, "
+                f"{concurrency} at a time (per-chunk timeout {per_chunk_timeout:.0f}s)"
+            )
+
+        def _run_chunk(indexed):
+            i, (lo, hi) = indexed
             chunk_args = other_args + ["-p", f"{lo}-{hi}"]
             xml_text, tool_result = _run_nmap_xml(
                 target, chunk_args, per_chunk_timeout,
                 label=f"nmap (chunk {i}/{len(chunk_ranges)}: {lo}-{hi})",
             )
-            open_ports.extend(_parse_nmap_xml(xml_text))
-            scripts.extend(_parse_nmap_scripts(xml_text))
+            return i, lo, hi, xml_text, tool_result
 
-            # Accumulated across every chunk so a sweep that comes back
-            # empty can say whether the target was answering at all.
-            chunk_reach = _parse_nmap_reachability(xml_text)
-            reach["responsive"] += chunk_reach["responsive"]
-            reach["silent"] += chunk_reach["silent"]
-            if chunk_reach["host_up"] is not None:
-                reach["host_up"] = chunk_reach["host_up"]
+        indexed_chunks = list(enumerate(chunk_ranges, start=1))
+        stopped = False
 
-            if not tool_result.get("success"):
+        for wave_start in range(0, len(indexed_chunks), concurrency):
+            wave = indexed_chunks[wave_start:wave_start + concurrency]
+
+            if concurrency == 1:
+                wave_results = [_run_chunk(c) for c in wave]
+            else:
+                with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                    # map() preserves input order, so merging below happens in
+                    # port-range order however the chunks actually finished.
+                    wave_results = list(pool.map(_run_chunk, wave))
+
+            failure = None
+            for i, lo, hi, xml_text, tool_result in wave_results:
+                open_ports.extend(_parse_nmap_xml(xml_text))
+                scripts.extend(_parse_nmap_scripts(xml_text))
+
+                # Accumulated across every chunk so a sweep that comes back
+                # empty can say whether the target was answering at all.
+                chunk_reach = _parse_nmap_reachability(xml_text)
+                reach["responsive"] += chunk_reach["responsive"]
+                reach["silent"] += chunk_reach["silent"]
+                if chunk_reach["host_up"] is not None:
+                    reach["host_up"] = chunk_reach["host_up"]
+
+                if not tool_result.get("success") and failure is None:
+                    failure = (i, lo, hi, tool_result)
+
+            # Reported only after the whole wave has been merged. Building
+            # the message at the point of failure would quote the port and
+            # chunk counts as they stood mid-wave, understating both — the
+            # rest of the wave's results are real and ARE kept, so a message
+            # written before them would contradict what the scan returns.
+            if failure is not None:
+                i, lo, hi, tool_result = failure
                 err = tool_result.get("error") or tool_result.get("stderr") or "nmap failed"
+                completed = sum(1 for _, _, _, _, tr in wave_results if tr.get("success"))
+                completed += wave_start   # every chunk in every prior wave
                 result["error"] = (
                     f"chunk {i}/{len(chunk_ranges)} ({lo}-{hi}) {err} — "
                     f"stopping with {len(open_ports)} port(s) recovered from "
-                    f"{i - 1} completed chunk(s)"
+                    f"{completed} completed chunk(s)"
                 )
                 result["skipped"] = tool_result.get("skipped", False)
                 log_tool_failure(target, "nmap", result["error"])
                 print_warning(f"[Ports] {target}: {result['error']}")
+                stopped = True
+
+            if stopped:
                 break
 
         result["open_ports"] = sorted(open_ports, key=lambda p: p["port"])

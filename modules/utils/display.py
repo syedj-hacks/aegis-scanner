@@ -163,6 +163,54 @@ def show_spinner(description: str):
         yield
 
 
+# --- Multi-target output mode --------------------------------------------
+# Rich's Progress is a live-updating display that owns a region of the
+# terminal and repaints it. There is exactly one module-level `console`
+# above, so two Progress contexts running at once on different threads both
+# try to own and repaint the same region: the bars overwrite each other,
+# the cursor ends up in the wrong place, and the output is unreadable — and
+# it stays broken after the run, because whichever context exits last
+# restores a cursor state the other has already moved.
+#
+# --targets runs several scans concurrently in one process, so this is not
+# hypothetical. Rather than attempt to multiplex a single-scan UI it was
+# never designed for, multi-target runs switch the bars off and fall back
+# to one plain line per event. Less pretty, and it is actually readable
+# when three targets are interleaving.
+#
+# Single-target runs never touch this and keep the Rich progress bar
+# exactly as before.
+_multi_target_mode = False
+
+
+def set_multi_target_mode(enabled: bool) -> None:
+    """Switch the live progress bars off (see the note above)."""
+    global _multi_target_mode
+    _multi_target_mode = bool(enabled)
+
+
+def multi_target_mode() -> bool:
+    return _multi_target_mode
+
+
+@contextmanager
+def _plain_progress(total_steps: int, description: str):
+    """
+    The no-Rich fallback used in multi-target mode: same `advance` contract
+    as scan_progress_bar, printed as ordinary lines that interleave safely.
+    """
+    state = {"done": 0}
+
+    def advance(step_label: str = ""):
+        state["done"] += 1
+        if step_label:
+            console.print(
+                f"[dim]({state['done']}/{total_steps})[/dim] {description}: {step_label}"
+            )
+
+    yield advance
+
+
 @contextmanager
 def scan_progress_bar(total_steps: int, description: str = "Scanning"):
     """
@@ -171,7 +219,15 @@ def scan_progress_bar(total_steps: int, description: str = "Scanning"):
         with scan_progress_bar(5, "Running full scan") as advance:
             run_tool_1(); advance("Nmap done")
             run_tool_2(); advance("Nikto done")
+
+    Falls back to plain interleaved lines when several targets are being
+    scanned at once — see set_multi_target_mode().
     """
+    if _multi_target_mode:
+        with _plain_progress(total_steps, description) as advance:
+            yield advance
+        return
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),

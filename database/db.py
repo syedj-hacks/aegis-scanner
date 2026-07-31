@@ -68,9 +68,16 @@ def init_db():
     # into evidence/remediation.
     cur.execute("PRAGMA table_info(findings)")
     existing_columns = {row[1] for row in cur.fetchall()}
+    # cvss_vector / compliance_refs were added last. cvss_vector carries the
+    # CVSS v3.1 vector string behind a locally-computed score (see
+    # modules/enrichment/cvss.py) so a report can show WHY a finding scored
+    # what it did — a bare number with no vector is just a differently
+    # spelled severity bucket. compliance_refs carries the PCI-DSS/ISO
+    # 27001/NIST 800-53 control references for a finding, populated by the
+    # compliance profile only.
     for column in ("description", "remediation", "finding_type", "product",
                    "parameter", "payload", "evidence", "endpoint",
-                   "reference"):
+                   "reference", "cvss_vector", "compliance_refs"):
         if column not in existing_columns:
             cur.execute(f"ALTER TABLE findings ADD COLUMN {column} TEXT")
 
@@ -143,8 +150,9 @@ def insert_finding(scan_id: int, finding: dict):
         """INSERT INTO findings
            (scan_id, port, service, version, cve_id, cvss, severity,
             description, remediation, finding_type, product,
-            parameter, payload, evidence, endpoint, reference)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            parameter, payload, evidence, endpoint, reference,
+            cvss_vector, compliance_refs)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             scan_id,
             finding.get("port"),
@@ -162,10 +170,36 @@ def insert_finding(scan_id: int, finding: dict):
             finding.get("evidence"),
             finding.get("endpoint"),
             finding.get("reference"),
+            finding.get("cvss_vector"),
+            # Stored as a comma-separated string: the reports render these
+            # as text and never query into them, so a join table would add
+            # a schema and a JOIN to buy nothing. Only the compliance
+            # profile populates it; every other profile leaves it NULL.
+            _compliance_refs_text(finding.get("compliance_refs")),
         ),
     )
     conn.commit()
     conn.close()
+
+
+def _compliance_refs_text(refs):
+    """
+    Flatten a finding's compliance_refs to the TEXT column's format.
+
+    Accepts the list of reference strings the mapper produces, or an
+    already-flattened string (a row read back out and re-inserted). None
+    and an empty list both become NULL rather than an empty string, so
+    "no mapping" and "mapped to nothing" cannot be told apart by accident
+    downstream — they are the same thing.
+    """
+    if not refs:
+        return None
+    if isinstance(refs, str):
+        return refs or None
+    try:
+        return ", ".join(str(r) for r in refs if r) or None
+    except TypeError:
+        return None
 
 
 def insert_findings_bulk(scan_id: int, findings: list):

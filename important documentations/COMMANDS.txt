@@ -86,7 +86,14 @@ recon/scan/audit toolset and can trip IDS/WAF alerts or lock out accounts.
   #               delete the oldest report automatically instead of asking. IMPLIED
   #               whenever stdin/stdout is not a terminal, so piped/cron runs get it free
   # --version     prints "Aegis Scanner 1.0.0" and exits
-  # -h/--help     full usage + profile table
+  # -h/--help     beginner-oriented usage: the profile table, worked examples and the
+  #               during-a-scan keybinds, generated LIVE from aegis.py's own PROFILES
+  #               dict (see _build_epilog()). That is the authoritative copy -- run
+  #               `python3 aegis.py --help` rather than trusting this block to be
+  #               current, and when you add a profile, --help picks it up by itself.
+  #               Deliberately scoped to the scan command only: the test/audit,
+  #               database and config commands below stay in this file, so a new user
+  #               running --help is not buried in maintenance tooling.
 
 Examples:
 
@@ -101,8 +108,14 @@ Examples:
   # While a scan is running (interactive terminal only):
   #   s          skip just the tool currently running, move to the next one
   #              (ignored for nmap/DNS resolution -- everything downstream needs them)
-  #   Ctrl+C     same as 's' on a single press; a SECOND Ctrl+C within ~2s aborts
-  #              the whole scan instead
+  #              This is the reliable skip: it is only ever read while a tool runs,
+  #              so it means exactly one thing at every moment of a scan.
+  #   Ctrl+C     skips the running tool too, but ONLY while a tool is actually
+  #              running. run_tool()/safe_call() are what intercept the interrupt,
+  #              so a Ctrl+C landing in the gaps between tools (CVE enrichment,
+  #              database writes, report generation) has nothing to catch it and
+  #              ends the whole scan. A SECOND Ctrl+C within ~2s always ends it.
+  #              Verified live, both paths, 2026-07-31 -- see smoke_test11.
 
 
 --------------------------------------------------------------------------------
