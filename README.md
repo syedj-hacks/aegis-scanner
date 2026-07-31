@@ -34,3 +34,19 @@ are all resolved relative to it). Each scan is recorded in
 
 `aegis.py --help` lists all flags, and `aegis.py --version` prints the
 current version.
+
+## Documentation
+All project documentation lives in [`important documentations/`](important%20documentations/):
+
+| File | What it covers |
+|---|---|
+| `TUTORIAL.md` | Start here — install, first scan, reading a report. |
+| `COMMANDS.txt` | Every command, flag, and maintenance/one-off tool invocation. |
+| `OVERVIEW_CONTEXT.md` | Repo map, module-by-module API surface, data flow. |
+| `BACKEND_STRUCTURE.md` | Internals: every wrapper's contract, the shared conventions, known gaps. |
+| `WRITEUP.md` | Design decisions and honesty notes — why things work the way they do. |
+| `aegis_scanner_status_and_capabilities.txt` | Plain-language status: what is verified live, what isn't, demo guidance. |
+
+`smoke_test/` holds the per-pass live verification write-ups, and
+`test-targets/` is a local, isolated docker lab of intentionally vulnerable
+services used to exercise the conditional tools (wpscan/sqlmap/hydra/enum4linux).

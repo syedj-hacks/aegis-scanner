@@ -194,7 +194,7 @@ Examples:
   # One-off historical repair tool. Dry-run by default; nothing in the scanner calls it.
   python3 tools/backfill_nuclei_identity.py            # show what it WOULD change
   python3 tools/backfill_nuclei_identity.py --apply    # actually write
-  python3 tools/backfill_nuclei_identity.py --revert smoke_test/backfill_nuclei_identity_<ts>.txt
+  python3 tools/backfill_nuclei_identity.py --revert "important documentations/backfill_nuclei_identity_<ts>.txt"
 
 
 --------------------------------------------------------------------------------

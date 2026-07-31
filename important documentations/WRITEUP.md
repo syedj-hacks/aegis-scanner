@@ -7,8 +7,8 @@ target, per-port incremental result persistence, wall-clock budgets on the web-a
 closed the last "listed in config but never actually run" gaps in `quickscan`/`compliance`,
 root-caused and fixed a handful of live-reproduced bugs (dirb's connection-threshold abort, a
 "unknown" fallback in reports, a skip-vs-failure miscount across every tool wrapper, a
-substring-match false positive in severity scoring, a same-vendor/wrong-product false positive
-in CVE lookups), and rewrote the ZAP wrapper to drive ZAP's own daemon API directly instead of a
+substring-match false positive in severity scoring, a same-vendor/wrong-product and a
+wrong-version false positive in CVE lookups), and rewrote the ZAP wrapper to drive ZAP's own daemon API directly instead of a
 bundled script Kali's apt package never actually ships.
 
 The rounds since then have been about **making the output trustworthy**, which turned out to be a
@@ -181,8 +181,11 @@ Internals / data flow / known gaps: [BACKEND_STRUCTURE.md](BACKEND_STRUCTURE.md)
   fires in DAST mode against a URL that actually has a parameter to mutate — run without either,
   the templates never fire and *the scan looks clean*. So the wrapper refuses a URL with no query
   string rather than run a scan that can only report nothing, and the profiles build fuzzable URLs
-  from the paths gobuster/dirb already found. Candidate ordering turned out to matter: without it,
-  six probes went to `/index.php` and `/xss.php` was never fuzzed at all.
+  from the paths gobuster/dirb already found. Candidate ordering turned out to matter for both the
+  XSS and the sqlmap pass (they share one ranked candidate builder): without it, the whole budget
+  went to `/index.php` and the genuinely interesting endpoints (`/xss.php`, `/info.php`) were never
+  reached — the ranker puts likely-parameterised names ahead of site roots, and sqlmap now probes
+  the ranked list until one confirms rather than stopping at the first `.php`.
 - **sqlmap enumerates, and only enumerates.** A confirmed injection is followed by three read-only
   metadata requests (`--banner --current-db --dbs`) so the finding carries real evidence instead
   of a bare `vulnerable: true`. It never requests `--dump`, `--os-shell`, `--sql-shell` or file
@@ -206,6 +209,16 @@ Internals / data flow / known gaps: [BACKEND_STRUCTURE.md](BACKEND_STRUCTURE.md)
   wrong product. Known tokens (apache, nginx, iis, tomcat, openssh, vsftpd, proftpd, mysql,
   postgresql, lighttpd) now map to a more specific keyword *and* a CPE-product allowlist that
   filters out same-vendor, wrong-product false positives.
+- **...and they check the version range, not just the product.** Right product is only half the
+  question. NVD's `keywordSearch` is an AND-of-words match, so a CVE whose description says
+  "before 10.3" is returned for a host running *exactly* 10.3 — the release that **fixed** it.
+  The 2026-07-29 verification pass caught 7 of these (5 on an OpenSSH 10.3 host, 2 on Apache
+  2.4.25). The lookup now reads the vulnerable CPE ranges NVD attaches to each CVE and drops one
+  only when the detected version is *definitively* outside all of them. Anything ambiguous — no
+  CPE data, a version wildcard, a detected version too coarse to place (a bare `"4"` against a
+  `"before 4.1.22"` bound), or no version detected at all — is **kept**. The rule is the same one
+  the product filter uses: *cannot verify is not the same as does not match*, so the filter can
+  over-report but never silently hide a real CVE.
 - **The CLI can run fully interactively**, and its final summary panel now shows real tool-run/
   failed/skipped counts (previously always zero, because that data only existed inside the
   profile orchestrator and was never passed back up to the panel that displays it).
@@ -224,10 +237,13 @@ Internals / data flow / known gaps: [BACKEND_STRUCTURE.md](BACKEND_STRUCTURE.md)
   by design (scope decisions documented in each profile's own file), not oversights.
 - `whatweb_wrap.py`'s CMS-detection flag (`cms_detected`) has no consumer yet — only gobuster's
   `wordpress_fingerprinted` flag currently triggers the `wpscan` conditional check.
-- `deepscan`'s conditional tools (sqlmap/hydra/wpscan/enum4linux) firing has mainly been verified
-  against targets purpose-built to trigger them — this project's two default smoke-test targets
-  don't meet any of the four trigger conditions on their own, so everyday smoke-test runs don't
-  exercise that dispatch path.
+- `deepscan`'s conditional tools (sqlmap/hydra/wpscan/enum4linux) have all four been verified
+  firing live end-to-end with real evidence and **zero tool failures**, against the local
+  intentionally-vulnerable lab in `test-targets/` (WordPress → wpscan, DVWA → sqlmap CRITICAL SQLi
+  with DB enumeration, openssh → hydra `admin:admin`, samba → enum4linux shares/users). This
+  project's two default *internet* smoke-test targets don't meet any of the four trigger
+  conditions on their own, so everyday smoke-test runs against those don't exercise the dispatch
+  path — bring up the lab (`cd test-targets && docker-compose up -d`) to see it.
 - **The tools-run record has live coverage on deepscan and quickscan only.** The other three
   profiles wire it identically (the same one line in the same place) and compile clean, but were
   not exercised live in the pass that added it. Low risk; not the same as a live run.

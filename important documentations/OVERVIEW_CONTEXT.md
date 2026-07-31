@@ -126,9 +126,9 @@ modules/
     _common.py                   shared profile-layer helpers — all five orchestrators use these
                                   instead of five profile-local, easily-stale copies:
                                   warn_unavailable_tools() + GLOBAL_AVAILABLE_TOOLS (§3.1);
-                                  web_param_candidates() (builds fuzzable ?param= URLs from
-                                  gobuster/dirb paths for the XSS pass — candidate ORDERING
-                                  matters, see §3.2); classify_tool_outcome() (the one
+                                  web_param_candidates() (builds ranked fuzzable ?param= URLs from
+                                  gobuster/dirb paths — shared by the XSS pass and the sqlmap
+                                  probe; candidate ORDERING matters); classify_tool_outcome() (the one
                                   ran/skipped/failed predicate); count_and_report_tool_failures()
                                   (counting and reporting are the same function on purpose);
                                   persist_tool_run(); finalise_reports() (report → prune →
@@ -165,6 +165,12 @@ modules/
   web/
     header_check.py              check_headers(target, port=80, use_https=False) -> header dict
     nikto_wrap.py                run_nikto(target, port=80, use_https=False) -> {findings:[...]}
+                                  Runs with "-nointeractive -ask no": nikto 2.6's post-scan
+                                  "submit to CIRT.net? (y/n)" prompt blocked on stdin even under
+                                  -nointeractive, wasting the full timeout and discarding every
+                                  finding. -maxtime = tool timeout - 90s so nikto stops itself
+                                  and flushes its report; a timeout that still overshoots keeps
+                                  whatever findings it had already printed.
     gobuster_wrap.py             run_gobuster(target, port=80, use_https=False, wordlist=None) -> {discovered_paths:[...], wordpress_fingerprinted}
     dirb_wrap.py                 run_dirb(target, port=80, use_https=False, wordlist=None)
                                   -> {discovered_paths:[...], error}. Now tries dirb's own bundled
@@ -229,6 +235,16 @@ modules/
                                   CPE data names a different product — found live: a bare "Apache"
                                   banner was returning an Apache Groovy RCE as a top match, wrong
                                   product entirely, just the same vendor name.
+                                  A SECOND gate then filters by CPE VERSION RANGE: NVD's
+                                  keywordSearch is an AND-of-words match, so a CVE described
+                                  "before 10.3" came back against a host running exactly 10.3 —
+                                  the fixed release (7 such false positives found live on
+                                  2026-07-29: OpenSSH 10.3, Apache 2.4.25). A CVE is dropped only
+                                  when the detected version is DEFINITIVELY outside every
+                                  vulnerable cpeMatch range; no CPE data, a version wildcard, an
+                                  imprecise detected version (bare "4" vs "before 4.1.22"), or no
+                                  detected version at all keeps it. Cannot-verify never means
+                                  drop — it over-reports before it under-reports.
     severity.py                  score_finding(finding) -> finding copy + severity/severity_source/cvss.
                                   Keyword matching is now word-boundary regex, not substring
                                   containment — "rce" used to match inside "brute-*f*orce*" and
@@ -279,7 +295,10 @@ modules/
     deepscan.py    run_deepscan(target)    -> (scan_id, txt_path, pdf_path, stats)
     compliance.py  run_compliance(target)  -> (scan_id, report_path, stats)
 output/<target>/                scan_errors.log, report.txt, report.pdf (created per target)
-important documentations/       human + AI docs (this file, WRITEUP.md, TUTORIAL.md, COMMANDS.txt, BACKEND_STRUCTURE.md)
+important documentations/       human + AI docs (this file, WRITEUP.md, TUTORIAL.md, COMMANDS.txt,
+                                BACKEND_STRUCTURE.md, aegis_scanner_status_and_capabilities.txt, and
+                                the backfill_nuclei_identity_*.txt audit dump)
+smoke_test/                     per-pass verification write-ups (smoke_test1..10.txt)
 ```
 
 Every profile now returns a trailing `stats` dict (`{tools_run, tools_failed, tools_skipped}`)
@@ -344,7 +363,10 @@ run_xss(target, url)
 run_sslyze(target, port=443)
   -> {findings: [{issue, detail}], raw_output, error, skipped}
 run_wpscan(target, port=80, use_https=False, api_token=None)
-  -> {findings: [{component, title, reference}], raw_output, error, skipped}
+  -> {findings: [{component, title, reference, severity}], raw_output, error, skipped}
+      # findings include token-less enumeration evidence (identified version, enumerated
+      # theme/plugins, interesting_findings: xmlrpc/readme/wp-cron) graded LOW/MEDIUM, plus
+      # any API-token vuln matches (HIGH) — not just the (usually empty) vulnerabilities[] arrays
 run_zap_baseline(target, port=80, use_https=False)
   -> {findings: [{rule_id, name, status, severity, confidence, description, solution, reference,
       url, param, evidence, attack, method, cwe, url_count}], raw_output, error, skipped}
@@ -431,12 +453,14 @@ is safely on disk, so a retention failure can never cost the report just waited 
 banner last, so the paths are the final thing on screen.
 
 `deepscan.py`'s `_check_conditional_tools(target, flags, context) -> (raw_findings,
-tool_results)` carries whatever the three detector functions produced (`injectable_url`,
-`login_service`, `wordpress_port`, plus the unconditional `smb_service_found` check) so the
-right wrapper gets called with the right argument. A trigger condition that ISN'T met is now
-logged explicitly (`condition '<flag>' not met — skipping <tool>`, INFO level) instead of
-silently doing nothing — added because deepscan's conditional-tool absence used to have zero
-audit trail.
+tool_results)` carries whatever the detector functions produced (`injectable_candidates` — a
+ranked, bounded list of `?id=1` probe URLs; `login_service`/`login_port`; `wordpress_port`; plus
+the unconditional `smb_service_found` check) so the right wrapper gets called with the right
+argument. The sqlmap branch loops the candidate list and stops at the first confirmed injection;
+the others fire once. A trigger condition that ISN'T met is logged explicitly
+(`condition '<flag>' not met — skipping <tool>`, INFO level) instead of silently doing nothing —
+added because deepscan's conditional-tool absence used to have zero audit trail. All four have
+now been verified firing live with real evidence against the local `test-targets/` lab.
 
 ---
 

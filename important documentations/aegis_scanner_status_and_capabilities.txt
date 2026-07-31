@@ -1,6 +1,9 @@
 ================================================================================
 AEGIS SCANNER — STATUS, CAPABILITIES, AND HONEST ASSESSMENT
 Written 2026-07-25, after the smoke_test3 verification pass
+Revised 2026-07-29 (full verification pass — see smoke_test/TEST_RUN_
+FINDINGS_20260729.md; §3.4 conditional tools resolved) and 2026-07-31
+(§3.5 CVE version-range filtering resolved)
 ================================================================================
 
 WHAT THIS DOCUMENT IS
@@ -172,20 +175,86 @@ without dropping coverage. Budget deepscan runs generously in a live demo
 (don't assume they'll finish in under 2 minutes) or lead with quickscan/
 webaudit/compliance/stealthscan, all of which are consistently fast.
 
-3.4 CONDITIONAL_TOOLS (wpscan/sqlmap/hydra/enum4linux) require a matching
-    target to demonstrate
+3.4 CONDITIONAL_TOOLS (wpscan/sqlmap/hydra/enum4linux) — RESOLVED 2026-07-29:
+    all four now observed firing live with real evidence
 --------------------------------------------------------------------------------
-These four tools only fire when their trigger condition is met (WordPress
-fingerprinted, an injectable-looking parameter found, a brute-forceable
-login service open, an SMB port open). Neither scanme.nmap.org nor
-pentest-ground.com triggers any of the four. This is not a bug — it's
-correct, target-dependent behaviour — but it does mean a live demo cannot
-show these four tools actually running unless a target that meets one of
-those conditions is available. This session added a fix so the reason is
-now always explicit in scan_errors.log ("condition 'X' not met — skipping
-Y") instead of the tool being invisibly absent with no explanation, which
-at least makes the "why didn't this run" question answerable during a demo
-without needing to explain the framework's internals.
+UPDATE 2026-07-29: this is no longer a gap. These four tools only fire when
+their trigger condition is met (WordPress fingerprinted, an injectable
+parameter found, a brute-forceable login service open, an SMB port open),
+and neither scanme.nmap.org nor pentest-ground.com meets any of them — but
+`test-targets/docker-compose.yml` (a local, isolated, intentionally
+vulnerable lab on 172.28.0.0/24) does. A full deepscan against each
+container produced genuine, evidence-bearing findings with ZERO tool
+failures:
+  - wpscan   (172.28.0.10, WordPress) — 6 findings: WordPress 7.0.2
+    identified, XML-RPC / readme.html / external wp-cron exposure,
+    twentytwentyfive theme enumerated
+  - sqlmap   (172.28.0.20, DVWA) — CRITICAL boolean-based-blind SQL
+    injection on /info.php?id=1, with safe read-only DB enumeration
+    (DBMS MariaDB 10.1.26, current database "dvwa", databases listed)
+  - hydra    (172.28.0.30, openssh) — weak credential admin:admin found
+  - enum4linux (172.28.0.40, samba) — 2 shares + 1 user via null session
+
+Three real bugs were found and fixed while verifying this end-to-end:
+  1. wpscan reported nothing on a genuine WordPress site — its wrapper only
+     read the (empty, without an API token) vulnerabilities[] arrays. It now
+     also surfaces the identified version, enumerated theme/plugins, and
+     wpscan's "interesting findings" as LOW/MEDIUM evidence.
+  2. nikto hung the full 600s and was killed with zero output — nikto 2.6's
+     post-scan "submit to CIRT.net? (y/n)" prompt blocked on stdin even
+     under -nointeractive. Fixed with `-ask no` (+ a wider self-terminate
+     margin and partial-output salvage). WP and DVWA deepscans both went
+     from 1 tool failure to 0.
+  3. sqlmap tested only the FIRST discovered .php (usually /index.php, a
+     non-injectable redirect) and so missed a genuinely injectable endpoint
+     (/info.php) found in the same run. It now probes a ranked, bounded set
+     of discovered endpoints (promising names first) and stops at the first
+     confirmed injection.
+
+The "condition 'X' not met — skipping Y" scan_errors.log line is still
+emitted when a given target legitimately doesn't trigger a tool, so the
+"why didn't this run" question stays answerable during a demo.
+
+To reproduce: `cd test-targets && docker-compose up -d`, then
+`venv/bin/python3 aegis.py 172.28.0.<10|20|30|40> --profile deepscan`.
+See test-targets/README.md for the one-time per-container setup.
+(Note: an older revision of this file said to use /usr/bin/python3 because
+the venv lacked the zapv2 ZAP client. That is no longer true — the venv has
+zapv2 as of 2026-07-29 and deepscans run through venv/bin/python3 with ZAP
+active: 61 passive rules, 0 tool failures. Run Aegis through the SAME
+interpreter you installed into.)
+
+
+3.5 NVD CVE version-range false positives — RESOLVED 2026-07-31
+--------------------------------------------------------------------------------
+Found during the 2026-07-29 verification pass, fixed 2026-07-31. The CVE
+enrichment in modules/enrichment/cve_lookup.py filtered NVD results by CPE
+*product* but not by CPE *version range*. Because NVD's keywordSearch is a
+plain AND-of-words match, a CVE described "before 10.3" was returned — and
+reported — against a host running exactly 10.3, i.e. the release that FIXED
+it. That produced 7 false-positive CVE findings in one session (5 on the SSH
+lab's OpenSSH 10.3, 2 on DVWA's Apache 2.4.25), plus a batch of stale Samba
+CVEs matched against Samba 4.12.2 where nmap had only detected the major
+version. The CVEs themselves were real; they were misapplied to a version
+that isn't vulnerable.
+
+The lookup now reads the vulnerable CPE ranges NVD attaches to each CVE
+(versionStartIncluding/Excluding, versionEndIncluding/Excluding) and drops a
+CVE only when the detected version is DEFINITIVELY outside every one of them
+for the accepted product. Anything ambiguous is kept: no CPE data, a version
+wildcard, a detected version too coarse to place against a bound (the bare
+"4" vs "before 4.1.22" Samba case above), or no detected version at all. So
+the filter can still over-report, but it can never silently hide a real CVE
+— the same "cannot verify is not the same as does not match" rule the
+product filter already used. Each drop is logged with its count.
+
+Demo note: the earlier advice in §4 to "point at the NVD CVE lookup as proof
+it finds real vulns" is safe to use again with this fix in place. Two caveats
+worth knowing if a reviewer digs in: (a) a CVE is only as precise as the
+version nmap detected — a major-version-only banner keeps borderline CVEs by
+design; (b) nuclei-sourced CVEs were accurate even before this fix, because
+they are actively detected rather than version-keyword-matched, so they are
+the stronger thing to point at if you want a single example.
 
 
 4. IDEAS TO MAKE IT LOOK MORE PROFESSIONAL FOR A DEMO / REVIEW
@@ -204,7 +273,11 @@ without needing to explain the framework's internals.
   lookup and nuclei findings specifically — those are traceable to a
   public CVE ID or a named, real-world template match, which is more
   convincing than a generic "missing header" finding even though both are
-  genuine.
+  genuine. The CVE lookup now filters by CPE version range as well as
+  product (§3.5), so a "fixed in this exact version" CVE is no longer
+  reported against a host running it — but if you want the single
+  strongest example, use a nuclei-sourced CVE: those are actively
+  detected rather than matched from a version banner.
 - ZAP is now a legitimate evidence source too (fixed this session — see
   3.1) — its findings (missing CSP, missing anti-clickjacking header,
   missing SRI attribute, server version disclosure) are a good complement
@@ -214,12 +287,13 @@ without needing to explain the framework's internals.
   target doesn't trigger them, the "condition not met" log line (now
   present) is the answer — show it rather than letting it look like the
   tool was silently skipped or forgotten.
-- Consider trying a deliberately WordPress-hosted, deliberately
-  SMB-exposed, or deliberately SQLi-vulnerable target once (even a local
-  DVWA/Metasploitable VM, not necessarily one of the two internet targets
-  used throughout this session) purely to get one real, live demonstration
-  of the conditional-tools path working end-to-end before a demo — it's
-  the one part of the toolset that's never been observed actually firing.
+- The conditional-tools path (wpscan/sqlmap/hydra/enum4linux) is now
+  demonstrable live end-to-end: bring up the local lab in
+  `test-targets/` (`docker-compose up -d`) and scan each container's IP
+  with deepscan — see §3.4 for the exact targets, the real evidence each
+  produced, and the three bugs that were fixed in the process. This was
+  the last part of the toolset that had never been observed firing; it
+  now has been, with zero tool failures on every one of the four.
 
 
 5. IF EVIDENCE ISN'T REAL SOMEWHERE — WHAT TO DO
