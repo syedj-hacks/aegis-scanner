@@ -243,10 +243,22 @@ sig = check_finding(row(finding_type="open_port", port=80, reference="http://x")
                     "stealthscan")
 check("a reference populated on an open_port row is flagged",
       any(i["issue"] == "field_signature" for i in sig), sig)
-check("a cvss populated on a missing_security_header row is flagged",
+# CVSS on a missing_security_header is now LEGAL, not a violation: item 6
+# (modules/enrichment/cvss.py) computes a local CVSS v3.1 vector for exactly
+# these types. This assertion previously required the opposite; it was
+# updated the day the scoring engine landed, together with
+# summary._NOT_APPLICABLE["cvss"], which no longer lists the scored types.
+check("a cvss populated on a missing_security_header row is NOW allowed (item 6)",
+      not any(i["issue"] == "field_signature"
+              for i in check_finding(row(finding_type="missing_security_header",
+                                         description="x", cvss=4.7), "webaudit")))
+# ...but a cvss on a type cvss.py deliberately leaves UNSCORED (open_port is
+# exposure, not an assessed weakness) is still a signature violation, so the
+# check still has teeth for the types that really cannot carry one.
+check("a cvss populated on an open_port row is still flagged",
       any(i["issue"] == "field_signature"
-          for i in check_finding(row(finding_type="missing_security_header",
-                                     description="x", cvss=9.8), "webaudit")))
+          for i in check_finding(row(finding_type="open_port", port=80, cvss=9.8),
+                                 "stealthscan")))
 
 # The two classifiers are documented as one contract.
 shapes = [

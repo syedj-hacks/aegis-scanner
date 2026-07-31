@@ -44,6 +44,40 @@ services:
     # makes `docker compose restart zap` a real fix rather than a reboot
     # that changes nothing.
 
+    # ---- REACHING YOUR TARGETS -------------------------------------------
+    # The single most likely thing to go wrong with this container, hit
+    # during its own verification: ZAP runs in ITS network namespace, not
+    # yours. A target you can curl from the host may be unroutable from
+    # inside the container, and a containerised daemon has its own routing,
+    # DNS and firewall view.
+    #
+    # Measured here: the scanner could reach the local DVWA lab at
+    # 172.28.0.20 fine, while this container could not (the lab sits on
+    # test-targets_aegis-test-net). ZAP reported a complete spider and zero
+    # alerts — a clean-looking result for a host it never fetched a page
+    # from. zap_wrap.py now detects that (it checks ZAP's own site tree, not
+    # the spider's attempted-URL list) and reports it as a tool FAILURE, so
+    # the misconfiguration is loud instead of silent. But the fix is here:
+    #
+    #   - scanning INTERNET targets: works as shipped, nothing to do
+    #   - scanning another COMPOSE PROJECT's containers: attach this service
+    #     to that project's network, e.g.
+    #
+    #       networks:
+    #         - default
+    #         - test-targets_aegis-test-net
+    #
+    #     and declare it at the bottom of this file:
+    #
+    #       networks:
+    #         test-targets_aegis-test-net:
+    #           external: true
+    #
+    #   - scanning something on the DOCKER HOST itself: reach it at
+    #     host.docker.internal (add `extra_hosts: ["host.docker.internal:
+    #     host-gateway"]`), not 127.0.0.1 — inside the container, 127.0.0.1
+    #     is the container.
+
     healthcheck:
       # The version endpoint is the same readiness signal zap_wrap.py polls
       # for, so "healthy" here means precisely "a scan would now succeed"

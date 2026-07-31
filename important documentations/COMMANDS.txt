@@ -25,7 +25,9 @@ recon/scan/audit toolset and can trip IDS/WAF alerts or lock out accounts.
 
   # install.sh does, in order:
   #   1. apt install bind9-dnsutils nmap nikto gobuster subfinder amass theharvester dirb
-  #                   whatweb nuclei zaproxy sslyze wpscan sqlmap hydra enum4linux
+  #                   whatweb nuclei zaproxy sslyze testssl.sh wpscan sqlmap hydra enum4linux
+  #      (testssl.sh IS packaged on Debian/Kali -- verified 3.2.2+dfsg-1. Where it is not,
+  #       install.sh falls back to a git clone into /opt/testssl.sh, which the wrapper probes.)
   #   2. apt install python3-venv python3-pip libpango-1.0-0 libpangocairo-1.0-0
   #                   libcairo2 libgdk-pixbuf-2.0-0   (WeasyPrint's native PDF libs)
   #   3. python3 -m venv venv
@@ -72,6 +74,9 @@ recon/scan/audit toolset and can trip IDS/WAF alerts or lock out accounts.
 --------------------------------------------------------------------------------
 
   python3 aegis.py [target] [--profile PROFILE] [-v | --verbose] [--non-interactive]
+                   [--targets FILE|a.com,b.com] [--max-concurrent-targets N]
+                   [--auth-cookie COOKIE] [--auth-header 'Name: value']
+                   [--diff SCAN_A SCAN_B] [--diff-verbose]
                    [--version] [-h | --help]
 
   # target        hostname or IP address (validated before anything runs); now OPTIONAL --
@@ -80,7 +85,11 @@ recon/scan/audit toolset and can trip IDS/WAF alerts or lock out accounts.
   # --profile     quickscan (default) | stealthscan | webaudit | deepscan | compliance
   #               omitting this with a target given still silently defaults to quickscan
   #               (unchanged behavior); the profile menu only appears in interactive mode
-  # -v/--verbose  prints the resolved tool list + nmap_args for the chosen profile
+  # -v/--verbose  prints the resolved tool list + nmap_args for the chosen profile, PLUS the
+  #               concurrency actually in effect for this run (web-tool pool width, nmap chunk
+  #               width) and the resolved per-profile rate limits (gobuster -t, dirb -z,
+  #               nikto -Pause, nuclei -rate-limit) and whether auth is configured. These
+  #               report what the RUN did, not what config.py says in the abstract.
   # --non-interactive
   #               never prompt: when the stored-report cap (5 per profile+target) is hit,
   #               delete the oldest report automatically instead of asking. IMPLIED
@@ -104,6 +113,42 @@ Examples:
   python3 aegis.py example.com --profile compliance
   python3 aegis.py                                      # interactive: prompts for target + profile
   venv/bin/python aegis.py example.com --profile deepscan --non-interactive   # scripted run
+
+  # --- Multi-target (added 2026-07-31) ---------------------------------------------
+  python3 aegis.py --targets a.example.com,b.example.com --profile quickscan
+  python3 aegis.py --targets targets.txt --profile webaudit      # one host per line; # comments ok
+  python3 aegis.py --targets targets.txt --max-concurrent-targets 3
+  # Each target gets its own output/<target>/ dir and scan_errors.log. Default 2 at a time
+  # (config.MAX_CONCURRENT_TARGETS). While several targets run, the live progress bar is
+  # replaced by one line per event and the 's' skip key is DISABLED -- neither can address
+  # one scan unambiguously. Ctrl+C still stops the run. A positional target given alongside
+  # --targets is ignored, with a warning.
+
+  # --- Authenticated scans (added 2026-07-31, opt-in) ------------------------------
+  python3 aegis.py 127.0.0.1 --profile webaudit --auth-cookie 'PHPSESSID=abc; security=low'
+  python3 aegis.py api.example.com --profile webaudit --auth-header 'Authorization: Bearer <tok>'
+  # Preferred: put it in .env instead, so the credential is not in shell history --
+  #   AEGIS_AUTH_COOKIE / AEGIS_AUTH_HEADER / AEGIS_AUTH_BASIC_USER + AEGIS_AUTH_BASIC_PASS
+  # Basic auth needs BOTH user and pass; half a pair is refused with a warning rather than
+  # sent as "user:None". Reaches nikto (basic auth only), gobuster, nuclei, sqlmap and ZAP.
+  # whatweb and dirb run UNAUTHENTICATED (no clean custom-auth support) and say so.
+  # The credential VALUE is never logged, reported or stored -- only the method.
+  # Omitting all of it reproduces pre-2026-07-31 behavior byte for byte.
+
+  # --- Diff two finished scans (added 2026-07-31) ----------------------------------
+  python3 aegis.py --diff 137 168                # new / fixed / unverified / changed / unchanged
+  python3 aegis.py --diff 137 168 --diff-verbose # also lists the unchanged findings
+  # Runs NO scan; prints to stdout so it can be piped into a mail body or a log.
+  # UNVERIFIED means "absent from the later scan, but the tool that finds it did not run in
+  # that scan" -- those are NOT remediated, and are listed separately for that reason.
+
+  # --- Scheduled scanning (cron, not a daemon) -------------------------------------
+  scripts/scheduled_scan.sh <target> [profile]
+  # Scans, diffs against the previous scan of the same target, prints ONLY the delta, and
+  # exits non-zero when something is new or changed (which is what makes cron mail you).
+  #   30 2 * * * cd /home/jafar/aegis-scanner && scripts/scheduled_scan.sh example.com quickscan
+  # cron has a minimal PATH and no virtualenv -- the script prefers venv/bin/python3 when
+  # present; otherwise set PATH= at the top of your crontab.
 
   # While a scan is running (interactive terminal only):
   #   s          skip just the tool currently running, move to the next one

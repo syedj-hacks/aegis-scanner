@@ -1,0 +1,246 @@
+================================================================================
+ SMOKE TEST 11 — Commercial-grade upgrade batch (items 1–10)
+ feature/commercial-upgrade   |   2026-07-31
+================================================================================
+
+This is the honest record of the commercial-upgrade batch, in the same spirit as
+smoke_test1–10: what was asked, what was built, what was VERIFIED LIVE, what came
+back differently than hoped, and what remains open. Where a result was thrown out,
+it says so and why.
+
+Read the companion CHECKPOINT_20260731_commercial_upgrade.md for the mid-batch
+pause notes; this supersedes it.
+
+--------------------------------------------------------------------------------
+ HEADLINE
+--------------------------------------------------------------------------------
+
+  Test gate    : 549 assertions, 0 failures  (baseline was 416/0)
+  db_sweep     : 199/199 rendered, 0 crashes, 0 ambiguous cells, 0 attribution
+                 issues (2 known-historical, allowlisted, unchanged)
+  New tests    : t_stealth_guard (15), t_cvss (66), t_diff (29), t_testssl (18),
+                 + additions to t_phase3 (+5) and t_phase9 (+2)
+  Regression   : stealthscan unchanged — 96.9s vs 96.0s baseline, same 20-port
+                 list, same -T2 (the explicit guard from the top of the brief)
+  Changed      : 13 files, +680/-60 since the checkpoint commit; ~30 files across
+                 the whole batch
+
+  Four bugs were found and fixed DURING live verification, three of them the
+  same invisible-failure shape as the historical scan-97 zero-ports bug. Details
+  in the BUGS section — they are the most important part of this report.
+
+--------------------------------------------------------------------------------
+ PER-ITEM STATUS
+--------------------------------------------------------------------------------
+
+1. --help + Ctrl+C ...................... DONE, verified (PTY probes)
+   The reported "Ctrl+C skips the tool" text was wrong on TWO counts:
+   - the panel promised unconditional skip; Ctrl+C only skips WHILE a tool is
+     running (run_tool/safe_call intercept it). In the gaps between tools it
+     propagates to main() and ends the scan. Measured live: SIGINT during a
+     subprocess -> clean skip, scan continues; SIGINT between tools -> exit.
+     Panel + COMMANDS.txt + TUTORIAL all corrected; the skip key is now
+     presented first as the reliable control.
+   - run_tool()'s KeyboardInterrupt branch set error but never skipped=True, so
+     a deliberate Ctrl+C skip was classified a TOOL FAILURE. Fixed + re-probed.
+   --help rewritten beginner-first, profile table generated live from PROFILES.
+
+2a. Parallel per-port web tools ......... DONE, verified LOSSLESS
+    nikto/gobuster/dirb/whatweb/sslyze pooled per port, order-preserving.
+    Prerequisite fixes: the skip-key listener (was per-call termios save/restore
+    -> refcounted singleton) and get_logger() (was racy -> lock-guarded).
+    PARITY PROVEN: DVWA deepscan sequential(198) vs concurrent(201) = 48 vs 48
+    findings, identical severity split, diff = 0 new / 0 fixed / 48 unchanged.
+
+2b. Parallel nmap chunk sweep ........... DONE, verified (wave scheduling)
+    MAX_CONCURRENT_NMAP_CHUNKS=3, runs in waves to keep stop-on-first-failure;
+    merges in port-range order. Sequential path proven byte-identical by a
+    fake-nmap harness.
+
+    >>> TIMING — read this carefully, the number is not a simple win <<<
+    Two A/B runs were done (concurrency OFF vs ON, same code, back to back):
+
+      Run 1, scanme.nmap.org : 1530.7s -> 510.2s  (3.00x)   *** DISCARDED ***
+        Thrown out: the host degraded between the two halves (it stopped
+        answering entirely — confirmed with a live probe afterwards). The
+        "after" run lost 16 findings, ALL from the sequential tools (ZAP 7,
+        nmap_script 4, nuclei 2, service_version 2, nikto 1) and NONE from the
+        parallelised ones. So that 3.00x measured target decay as much as
+        concurrency, and is not trustworthy.
+
+      Run 2, DVWA container  :  536.9s -> 568.2s  (0.94x)   *** CLEAN ***
+        Uncontaminated (localhost, stable throughout, 48=48 findings both ways)
+        and shows essentially NO speedup — 5.8% SLOWER, within noise.
+
+    The honest conclusion is that the speedup is ENTIRELY target-latency
+    dependent, and that is the correct mechanism, not a disappointment: the pool
+    overlaps network WAIT. A localhost target has almost none to overlap, so the
+    thread/pool overhead slightly dominates; a slow/filtered remote host (where
+    each tool spends most of its time waiting on the wire) is where overlapping
+    those waits pays off. We do NOT have a clean measurement of that remote case
+    — the one target that would have shown it is the one that degraded. So:
+
+      * concurrency is proven CORRECT (lossless) on a real deepscan,
+      * concurrency is proven to add no overhead worth worrying about on a fast
+        target,
+      * the size of the win on a slow remote target is UNMEASURED. Claiming
+        "3x faster" would be dishonest.
+
+3. testssl.sh in compliance ............. DONE, verified LIVE (badssl.com)
+   Complements sslyze (accepts-vs-vulnerable), same finding shape, same TLS
+   family. Live: sslyze found 5 (legacy protocols, weak ciphers), testssl found
+   3 that sslyze structurally cannot (BREACH, BEAST, 3DES). apt-packaged
+   (verified 3.2.2+dfsg-1); git-clone fallback added. NOTE: on this box apt
+   needs sudo we don't have, so live runs used a scratch git clone of 3.2.4 on
+   PATH — the wrapper resolves it identically. See BUG #2.
+
+4. Multi-target (--targets) ............. DONE, verified LIVE
+   scanme.nmap.org + pentest-ground.com, quickscan: 2/2 completed, 200.0s wall
+   for 367.6s of summed work. Per-target isolation confirmed: separate output
+   dirs, separate scan_errors.log, zero cross-contamination, findings correctly
+   attributed per scan. 16-thread same-target get_logger() race -> exactly 1
+   handler (the lock holds).
+
+5. Auth-based scanning .................. DONE, verified LIVE (DVWA)
+   Real DVWA session cookie: gobuster's /index.php and /phpinfo.php went
+   302(->login) UNAUTH -> 200 AUTH. The cookie reached the tool and the server
+   honoured it. Credential grep across output/ + database/ + logs: ZERO hits —
+   never logged, reported or stored; only the METHOD is recorded. Half a
+   basic-auth pair is refused. whatweb/dirb logged as unauthenticated.
+
+6. CVSS v3.1 engine ..................... DONE, verified LIVE + 66 unit tests
+   Spec §7.1 incl. CVSS Roundup, validated against 15 published NVD/spec scores.
+   Live on the compliance scan: every TLS finding carries a real score AND
+   vector (legacy protocol 7.5 HIGH, weak cipher 6.8 MEDIUM). NVD scores never
+   overwritten. Calibrated to agree with the heuristic (adds a vector, doesn't
+   re-grade); informational types deliberately unscored. This DID surface a real
+   downstream inconsistency — see BUG #4.
+
+7. Compliance mapping ................... DONE, verified LIVE
+   PCI-DSS v4.0 / ISO 27001:2022 / NIST 800-53 Rev.5, gated to compliance only.
+   Live: compliance_refs stored on every mappable finding, COMPLIANCE CONTROL
+   MAPPING section rendered in the report, grouped by framework.
+
+8. Diffing + scheduling ................. DONE, verified LIVE + 29 unit tests
+   --diff A B (new/fixed/unverified/changed/unchanged), stable identity key.
+   Self-diff of a real scan = all-unchanged, 0 churn. scripts/scheduled_scan.sh
+   (cron pattern, exits non-zero only on a delta) — sed parsing verified against
+   real scans both ways. See BUG #1 (the identity key had a real churn bug,
+   found and fixed here).
+
+9. Containerize ZAP ..................... DONE, verified LIVE (container built+run)
+   docker/zap/Dockerfile + docker-compose.yml. Built (2.47GB), started, API-ready
+   in ~120s. THE key check: 61 passive scan rules loaded AND enabled on a fresh
+   container — the pscanrules bug from WRITEUP §3.1 cannot occur, and
+   `docker-compose restart zap` gives a guaranteed-fresh profile. Ran a real
+   baseline through ZAP_HOST against example.com: 4 alerts. Both guards held
+   live: the shared daemon SURVIVED two scans (shutdown guard), and auth replacer
+   rules were REMOVED afterward (0 aegis-auth-* left). See BUG #3 (a real
+   invisible-failure bug found doing this).
+   NOTE: docker-compose v1 here, not `docker compose` v2.
+
+10. Rate-limit tuning ................... DONE
+    PROFILE_RATE_LIMITS -> gobuster -t / dirb -z / nikto -Pause / nuclei
+    -rate-limit. Every default reproduces current behaviour (gobuster argv proven
+    identical; the other three resolve to flag-omitted). Surfaced in -v.
+
+--------------------------------------------------------------------------------
+ BUGS FOUND AND FIXED DURING VERIFICATION  (the important part)
+--------------------------------------------------------------------------------
+
+These were NOT in the plan. They were found by actually running the thing, and
+three of the four are the same shape as this project's signature failure mode: a
+tool that could not reach its target reporting a clean-looking "nothing found".
+
+#1  diff phantom churn (found: item 8 live run)
+    --diff 137 168 reported 1 new + 1 fixed for ONE nikto finding whose allowed-
+    methods list came back in a different order ("OPTIONS, GET, ..." vs "GET,
+    ..., OPTIONS"). The description-fallback key didn't normalise set ordering.
+    Fixed: _normalise_enumeration() sorts a trailing enumeration; prose with a
+    comma is left alone. Re-diff: 0 churn. 29 assertions pin it.
+
+#2  testssl invisible failure (found: item 3 live run)   [same class as scan 97]
+    badssl.com began refusing connections mid-verification. testssl.sh exits
+    non-zero AND writes a valid JSON file containing {scanProblem, FATAL}. The
+    wrapper salvages non-zero exits on purpose (testssl exits non-zero when it
+    FINDS things), so it salvaged this too -> "scan completed, no TLS issue
+    found" about a host it never reached. Reproduced deterministically (closed
+    port, exit 246, 766 bytes valid JSON, 0 findings, reported success). Fixed:
+    scanProblem/FATAL is now a tool FAILURE. 18 assertions pin it.
+
+#3  ZAP invisible failure (found: item 9 live run)       [same class as scan 97]
+    The container could not route to the DVWA lab's Docker network. ZAP reported
+    a complete 100% spider and zero alerts — byte-identical to "target is clean".
+    This matters MORE now that ZAP_HOST exists: a remote daemon has its own
+    routing, so "the scanner can reach it" no longer implies "ZAP can". Fixed:
+    the wrapper checks ZAP's own site tree (core.urls), not the spider's
+    attempted-URL list (which is non-empty even on total failure), and reports a
+    reachable-nothing scan as a FAILURE. Verified both ways: unreachable ->
+    failed; example.com through the same container -> 4 alerts, ran.
+
+#4  deepscan sqlmap NameError (found: item 2b A/B run)
+    run_sqlmap(..., auth=auth) was added inside _check_conditional_tools(), which
+    had no `auth` parameter. A NameError that only fires when a target's content
+    produces an injectable candidate — which the finding-sparse smoke targets
+    never did, so the checkpoint commit shipped it. Caught the moment a deepscan
+    ran against injectable DVWA. Fixed: auth threaded through. Now verified live
+    firing — 2 CRITICAL SQLi findings across the two DVWA A/B runs, sqlmap
+    outcome=ran.
+
+    (#4 also incidentally fixed the field-signature inconsistency #4b: summary.py
+    declared sslyze_finding/missing_security_header CVSS-inapplicable, which item
+    6 makes false. _NOT_APPLICABLE["cvss"] and cvss_display() updated; the
+    attribution audit flagged it the day the engine landed, which is the check
+    doing its job.)
+
+--------------------------------------------------------------------------------
+ WHAT WAS NOT DONE / COULD NOT BE VERIFIED LIVE  (honesty)
+--------------------------------------------------------------------------------
+
+- The remote-target deepscan speedup is UNMEASURED (see item 2b). We have "no
+  loss" and "no overhead on localhost"; we do NOT have a trustworthy remote
+  speedup figure, because the target that would show it degraded mid-test.
+
+- testssl live runs used a scratch git clone, not the apt package, because apt
+  needs sudo unavailable in this environment. The wrapper's binary resolution
+  and JSON parsing are identical either way, and the install.sh apt+fallback
+  path is code-reviewed but was not executed on a clean machine here.
+
+- The ZAP container was verified against example.com and (negatively) the local
+  lab. It was not run against the lab POSITIVELY, because that needs the compose
+  network wiring documented in docker-compose.yml — which is documented but not
+  applied to the running container in this pass.
+
+- stealthscan was verified by its regression guard (15 assertions) and a live
+  96.9s run, not by a full findings comparison — by design, it produces only
+  open-port findings and the guard covers its config exactly.
+
+--------------------------------------------------------------------------------
+ HOW TO REPRODUCE THE LIVE CHECKS
+--------------------------------------------------------------------------------
+
+  # gate
+  python3 tests/db_sweep.py
+  for t in t_stealth_guard t_cvss t_diff t_testssl t_phase2 t_phase3 t_phase4 \
+           t_phase8 t_phase9 t_phase10 t_pty; do python3 tests/$t.py; done
+
+  # multi-target (approved targets)
+  python3 aegis.py --targets scanme.nmap.org,pentest-ground.com --profile quickscan
+
+  # auth (needs the local DVWA lab: cd test-targets && docker-compose up -d)
+  #   grab a DVWA cookie, then:
+  python3 aegis.py 127.0.0.1 --profile webaudit --auth-cookie 'PHPSESSID=...; security=low'
+
+  # compliance + testssl (needs testssl.sh on PATH)
+  python3 aegis.py badssl.com --profile compliance
+
+  # diff
+  python3 aegis.py --diff 198 201
+
+  # ZAP container
+  docker-compose up -d zap        # wait ~120s for healthy
+  #   set ZAP_HOST=127.0.0.1 in .env, then run a deepscan
+
+================================================================================
+ END SMOKE TEST 11
+================================================================================

@@ -140,6 +140,7 @@ implementations, same data shape) — `compliance`, which passes `--script` dire
 | `sqlmap_wrap.py` | `run_sqlmap(target, url)` | `sqlmap --batch --random-agent --level 1 --risk 1 --banner --current-db --dbs` | `{injectable: bool, findings: [{parameter, method, type, title, payload, techniques}], metadata: {dbms, banner, current_db, databases}, raw_output, error, skipped}` — see below |
 | `xss_wrap.py` | `run_xss(target, url)` | `nuclei -dast -tags xss -jsonl -silent` | `{vulnerable: bool, findings: [{template_id, name, severity, parameter, method, payload, endpoint, matched_at, evidence, reference}], raw_output, error, skipped}` — records itself in `tool_results` under the name **`nuclei-xss`**. Rejects a URL with no `?` up front (see below) |
 | `sslyze_wrap.py` | `run_sslyze(target, port=443)` | `sslyze --json_out=<tmpfile>` | `{findings: [{issue, detail}], raw_output, error, skipped}` |
+| `testssl_wrap.py` | `run_testssl(target, port=443)` | `testssl.sh --jsonfile-pretty <tmpfile> -U -p -s --warnings batch --color 0 --quiet` | `{findings: [{issue, detail}], raw_output, error, skipped}` — **the same shape sslyze emits, on purpose**: both map into the `sslyze_finding` family so reports/severity/compliance mapping need one TLS vocabulary, not two. Complements sslyze rather than replacing it — sslyze inventories what the endpoint *accepts*, testssl tests whether it is *vulnerable* (Heartbleed, ROBOT, CCS, renegotiation, BREACH, BEAST, Sweet32, ...), which sslyze does not check at all. Walks **every** list-valued section of the JSON (11 in 3.2.4), not a hardcoded subset. A `scanProblem`/`FATAL` entry is reported as a tool FAILURE, never salvaged as "no issues found" — see §5 |
 | `wpscan_wrap.py` | `run_wpscan(target, port=80, use_https=False, api_token=None)` | `wpscan --format json` | `{findings: [{component, title, reference, severity}], raw_output, error, skipped}` — surfaces both known-vuln matches (HIGH, only populated with an API token) **and** token-less enumeration evidence (identified version, enumerated theme/plugins, `interesting_findings` like xmlrpc/readme/wp-cron exposure) graded LOW/MEDIUM. Before this it only read the empty `vulnerabilities[]` arrays and reported nothing on a real WordPress site. |
 | `zap_wrap.py` | `run_zap_baseline(target, port=80, use_https=False)` | ZAP daemon + `zapv2` REST client (see below) | `{findings: [{rule_id, name, status, severity, confidence, description, solution, reference, url, param, evidence, attack, method, cwe, url_count}], raw_output, error, skipped}` — all ZAP's own fields; `attack` is `""` on every alert of a passive baseline scan, `param`/`evidence` on the rules that report neither. `cwe` drops ZAP's `-1`/`0` "not applicable" sentinel rather than rendering `CWE--1`. ZAP emits one alert per matching URL, so alerts are collapsed per `(pluginId, alert)` with `url_count` recording how many URLs matched |
 
@@ -430,7 +431,7 @@ profile+target (§3.3).
 | `stealthscan` | nslookup, nmap | curated ~20-port list (`-T2 -Pn --randomize-hosts`) | **no** (deliberately, to avoid doubling probe traffic) | no |
 | `webaudit` | nslookup, nmap, header check, nikto, gobuster, dirb, whatweb, banner grab (non-web ports only), sslyze (if https), **XSS pass (nuclei `-dast -tags xss`)** | 80/443/8080/8443 only | no | web findings + nmap-script findings + `Server` banner CVE lookup |
 | `deepscan` | nslookup, subfinder, amass, theharvester, nmap (bare discovery sweep, **no** -sV/-sC), nmap -sV -sC (2nd targeted pass — nmap-script findings come from here now), banner grab (non-web ports only), header check, nikto, gobuster, dirb, whatweb, nuclei, **XSS pass**, ZAP baseline, + conditionally sqlmap, hydra, wpscan, enum4linux | discovery: all ports; web module on any detected web port | yes | yes, on every finding |
-| `compliance` | nmap (`--script ssl-enum-ciphers,http-headers`), **sslyze + whatweb** (on the port(s) ssl-enum-ciphers identified) | 80/443/8443 (script-targeted) | no | nmap-script + sslyze + whatweb findings, scored/remediated |
+| `compliance` | nmap (`--script ssl-enum-ciphers,http-headers`), **sslyze + testssl.sh + whatweb** (on the port(s) ssl-enum-ciphers identified) | 80/443/8443 (script-targeted) | no | nmap-script + sslyze + testssl + whatweb findings, scored/remediated, **plus PCI-DSS/ISO 27001/NIST 800-53 `compliance_refs` (this profile only)** |
 
 `compliance` is the only profile that skips DNS resolution — `"nslookup"` isn't in
 `PROFILES['compliance']['tools']`, and the orchestrator follows that config literally.
@@ -476,6 +477,104 @@ A condition that ISN'T met is now logged (`condition '<flag>' not met — skippi
 level) rather than silently producing no log line at all.
 
 ---
+
+## 4a. Commercial-upgrade subsystems (2026-07-31)
+
+Ten items were added in one batch on `feature/commercial-upgrade`. The four that
+introduce genuinely new machinery are described here; the rest are noted in §4/§7.
+
+### Concurrency — two independent layers
+
+They compose, and the real outbound request rate is roughly their product, which
+is why both defaults are small and `PROFILE_RATE_LIMITS` exists.
+
+| Layer | Knob | Default | What it overlaps |
+|---|---|---|---|
+| within a scan, per port | `PARALLEL_WEB_TOOLS`, `MAX_CONCURRENT_WEB_TOOLS`, `PARALLEL_WEB_TOOL_PROFILES` | on, 5, {webaudit, deepscan} | nikto / gobuster / dirb / whatweb / sslyze against ONE port |
+| within a scan, port sweep | `MAX_CONCURRENT_NMAP_CHUNKS` | 3 | deepscan's 32 `-p-` chunks |
+| across scans | `MAX_CONCURRENT_TARGETS` | 2 | whole targets (`--targets`) |
+
+Set any of them to `1`/`False` for the previous fully-sequential behaviour.
+
+**Deliberately NOT parallelised**, and this is load-bearing rather than
+incidental: nuclei's DAST XSS pass (it consumes gobuster/dirb's discovered
+paths — a real data dependency), ZAP (one daemon, one session), and all four
+`CONDITIONAL_TOOLS` (sqlmap/hydra/wpscan/enum4linux — two active-injection tools
+racing one host is both louder and less interpretable than running them in
+order). **`stealthscan` is excluded from every layer** and
+`tests/t_stealth_guard.py` fails the build if that changes.
+
+Two prerequisites had to be fixed before any of this was safe:
+
+- **`_SkipKeyListener` was built on "only one tool runs at a time"** and
+  saved/restored termios per `run_tool()` call. Concurrent listeners would each
+  restore settings captured *after* another had already switched to cbreak,
+  leaving the terminal with echo off after the scan. It is now a refcounted
+  process-wide singleton, and the skip flag became a **timestamp**
+  (`_skip_press_time`) so a keypress means "skip the tools running right now"
+  rather than one arbitrary member of the batch.
+- **`logger.get_logger()` was not thread-safe.** Two threads reaching it for the
+  same target could both attach a `FileHandler` and double every log line. Now
+  lock-guarded with a double-check.
+
+`run_web_tools()` returns results in **task order, never completion order** —
+finding rows are persisted in the order that list is walked, so completion order
+would make row ordering vary run to run on network timing alone, and every
+diff/comparison downstream would see phantom changes.
+
+The chunked nmap sweep runs in **waves** rather than one pool, to preserve the
+stop-on-first-failure contract: a failure lets its wave finish (those results are
+real and already paid for) and then stops. Chunks merge in port-range order.
+
+### CVSS (`modules/enrichment/cvss.py`)
+
+A local CVSS v3.1 base-score calculator (spec §7.1, including CVSS's own
+`Roundup` — Python's `round()` is off by 0.1 on real vectors), plus
+finding_type -> vector templates so non-CVE findings carry an auditable score.
+Validated against 15 published NVD/spec scores in `tests/t_cvss.py`.
+
+Three rules make this safe to have turned on:
+
+1. **NVD-sourced scores are never overwritten.** `apply_local_cvss()` no-ops for
+   anything that already has a score, and for anything CVE-backed.
+2. **Templates were calibrated to AGREE with the existing heuristic**, so this
+   adds a number and a vector rather than silently re-grading the corpus. The
+   only intentional divergences are `sqlmap_finding` and `weak_credentials`,
+   which the heuristic graded LOW because it had no rule for "a tool positively
+   confirmed exploitation".
+3. **Informational types are deliberately left unscored** (`UNSCORED_TYPES`).
+   A defensible "version disclosed" vector is 5.3 = MEDIUM, and applying it
+   would have promoted ~5,600 banner/fingerprint/path rows from LOW to MEDIUM —
+   a report where the real findings are buried, not a more accurate one.
+
+The vector string is rendered next to the score (`cvss_display()`), because a
+locally computed score without one is just a differently-spelled bucket.
+
+### Compliance mapping (`modules/enrichment/compliance_map.py`)
+
+PCI-DSS v4.0 / ISO 27001:2022 / NIST 800-53 Rev.5, cited to revision (ISO's
+Annex A was renumbered wholesale in 2022, so a bare `A.10.1.1` is ambiguous).
+**Gated to `profile == "compliance"`** — every other profile leaves
+`compliance_refs` NULL and its reports are byte-identical to before. A finding
+type with no honest mapping gets NONE rather than a loosely-related control.
+
+### Diffing (`modules/reporting/diff.py`)
+
+`diff_scans(a, b)` -> new / fixed / **unverified** / changed / unchanged.
+
+Two design points that are the whole value of it:
+
+- Findings are matched on a **stable identity key** `(finding_type, port,
+  identifier)` — never a dict hash. Descriptions carry byte counts, status
+  codes, timings and re-rated CVSS scores that drift between runs of an
+  unchanged target, and hashing them reports churn that did not happen. A diff
+  that invents changes teaches the reader to ignore it, which costs the real
+  changes too. Set-valued facts are order-normalised (`_normalise_enumeration`)
+  after nikto was observed reporting the same allowed-methods list in two
+  different orders across two scans.
+- **"Fixed" is not claimed when it cannot be.** A finding absent from scan B
+  whose producing tool did not RUN in B is reported as `unverified`, not fixed —
+  a crashed nikto must not read as "everything nikto found is remediated".
 
 ## 5. Known gaps (intentional — read before "fixing")
 

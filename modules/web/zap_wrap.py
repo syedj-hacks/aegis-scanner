@@ -401,6 +401,59 @@ def run_zap_baseline(target: str, port: int = 80, use_https: bool = False,
                 raise TimeoutError(f"ZAP spider exceeded the {timeout:.0f}s budget")
             time.sleep(_POLL_INTERVAL)
 
+        # A spider that reached NOTHING is a failed scan, not a clean one.
+        #
+        # ZAP reports a spider against an unreachable host as a normal,
+        # 100%-complete scan and then returns zero alerts, which is
+        # byte-identical to "this target has no issues". Caught live: with
+        # ZAP_HOST pointed at the container, the daemon could not route to
+        # the target's Docker network, and this wrapper reported
+        # "scan completed, no alerts" with error=None about a host it never
+        # fetched a single page from. ZAP's own site tree was empty.
+        #
+        # This matters far more now that ZAP_HOST exists. A local daemon
+        # shares the scanner's network view, so "the scanner can reach it"
+        # implied "ZAP can reach it"; a remote or containerised daemon has
+        # its own routing, firewall and DNS, and that implication is simply
+        # gone. The check is applied to both paths because an unreachable
+        # target is worth reporting either way.
+        # core.urls(baseurl=...) — the URLs ZAP actually HAS for this target,
+        # i.e. ones it received a response for and put in its site tree.
+        #
+        # Deliberately not spider.results(): that lists the URLs the spider
+        # ATTEMPTED, including the seed, so it comes back non-empty (3 URLs,
+        # measured) even when every request was refused. Distinguishing
+        # "tried" from "fetched" is the entire point of this check, and only
+        # the site tree makes that distinction — verified against the
+        # unreachable container: spider.results()=3, core.urls()=[] ,
+        # core.sites=[].
+        spidered = []
+        try:
+            spidered = zap.core.urls(baseurl=url) or []
+        except Exception:
+            # An older client without core.urls must not turn a working scan
+            # into a failure — fall back to the whole site tree.
+            try:
+                spidered = zap.core.sites or []
+            except Exception:
+                # No way to tell: assume reachable rather than invent a
+                # failure. A false "unreachable" would be its own bad bug.
+                spidered = ["<unknown>"]
+
+        if not spidered:
+            raise RuntimeError(
+                f"ZAP spidered 0 URLs at {url} — the daemon reached nothing, so "
+                f"'no alerts' would describe a target that was never scanned. "
+                + (
+                    f"The daemon at {host}:{zap_port} is remote (ZAP_HOST is set): "
+                    "check it can route to this target — a container needs to be "
+                    "on the same Docker network as the host it scans."
+                    if remote_host else
+                    "Check the target is reachable and answering HTTP."
+                )
+            )
+
+        print_info(f"[ZAP] Spidered {len(spidered)} URL(s)")
         print_info(f"[ZAP] Passive-scanning {url}")
         while int(zap.pscan.records_to_scan) > 0:
             if time.time() - start > timeout:

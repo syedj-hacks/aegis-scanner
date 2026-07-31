@@ -65,7 +65,15 @@ print("\n=== D. field_display: N/A vs not-determined vs value ===")
 cases = [
     ({"finding_type": "missing_security_header"}, "cve_id", "N/A (config finding)"),
     ({"finding_type": "discovered_path"}, "cve_id", "N/A (path discovery)"),
-    ({"finding_type": "missing_security_header"}, "cvss", "N/A (no CVE to score)"),
+    # CVSS on a missing_security_header is no longer declared inapplicable —
+    # item 6 (modules/enrichment/cvss.py) computes a local vector for it, so
+    # summary._NOT_APPLICABLE["cvss"] no longer lists it. The CVSS cell is
+    # rendered by cvss_display(), not field_display() (which is why
+    # report_txt calls cvss_display for that column); cvss_display's own
+    # None-path is asserted in section D2 below. field_display on a bare
+    # `cvss` key with no value now correctly falls through to
+    # "not determined", since it has no _NOT_APPLICABLE reason to give.
+    ({"finding_type": "open_port"}, "cvss", "N/A (left unscored — exposure, not an assessed weakness)"),
     ({"finding_type": "nuclei_finding"}, "cve_id", "not determined by nuclei"),
     ({"finding_type": "nuclei_finding"}, "service", "not determined by nuclei"),
     ({"finding_type": "nikto_finding"}, "cve_id", "not determined by nikto"),
@@ -81,6 +89,29 @@ cases = [
 for finding, field, expected in cases:
     got = field_display(finding, field)
     check(f"{finding.get('finding_type')}/{field} -> {expected!r}", got == expected, repr(got))
+
+print("\n=== D2. cvss_display: the CVSS column report_txt actually calls ===")
+# A locally-scored finding shows the score, the source, and the vector — a
+# score with no vector is just a differently-spelled severity bucket.
+scored = {"finding_type": "missing_security_header", "cvss": 4.7,
+          "severity_source": "cvss",
+          "cvss_vector": "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:C/C:L/I:L/A:N"}
+disp = cvss_display(scored)
+check("a scored finding shows score + source + vector",
+      disp == "4.7 (source: cvss) [CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:C/C:L/I:L/A:N]", repr(disp))
+# An unscored-but-scorable type (an ordinary path) is honest that it was
+# graded heuristically — NOT "not determined by gobuster", which would
+# misattribute the absence to a tool that never scores CVSS.
+disp2 = cvss_display({"finding_type": "discovered_path"})
+check("an unscored scorable type says 'graded heuristically', not a tool name",
+      disp2 == "N/A (graded heuristically — see Severity)", repr(disp2))
+# A deliberately-unscored type keeps its specific reason.
+disp3 = cvss_display({"finding_type": "open_port"})
+check("a deliberately-unscored type keeps its reason",
+      disp3.startswith("N/A (left unscored"), repr(disp3))
+# Never a bare dash.
+check("cvss_display never returns a bare dash",
+      cvss_display({"finding_type": "banner"}).strip() not in ("-", "", "None"))
 
 print("\n=== E. NO bare dash anywhere, for EVERY finding_type in the DB ===")
 import sqlite3

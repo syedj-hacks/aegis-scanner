@@ -624,12 +624,19 @@ def _detect_smb_services(open_ports: list) -> bool:
     return any(p.get("port") in _SMB_PORTS for p in open_ports)
 
 
-def _check_conditional_tools(target: str, flags: dict, context: dict) -> tuple:
+def _check_conditional_tools(target: str, flags: dict, context: dict, auth=None) -> tuple:
     """
     Evaluate config.CONDITIONAL_TOOLS against whatever flags this run
     actually produced, dispatch to the real wrapper for each tool whose
     condition was met, and return (raw_findings, tool_results) for the
     caller to score/insert.
+
+    `auth` is threaded through to sqlmap (the one conditional tool that
+    takes a credential — injection testing behind a login is the case that
+    most needs it). It was previously referenced here without being a
+    parameter, which was a NameError waiting for a target whose gobuster/dirb
+    output produced an injectable candidate; it never fired on the
+    finding-free targets the earlier passes happened to use.
     """
     new_findings = []
     new_tool_results = []
@@ -955,7 +962,7 @@ def run_deepscan(target: str, non_interactive: bool = False, auth=None):
         "login_service": login_service,
         "login_port": login_port,
     }
-    conditional_findings, conditional_tool_results = _check_conditional_tools(target, flags, context)
+    conditional_findings, conditional_tool_results = _check_conditional_tools(target, flags, context, auth=auth)
     tool_results.extend(conditional_tool_results)
     conditional_scored = _score_and_remediate(conditional_findings)
 

@@ -72,6 +72,51 @@ _VOLATILE = re.compile(
     re.IGNORECASE,
 )
 
+# The longest comma-separated fragment still treated as a list ITEM rather
+# than prose. An enumeration of HTTP methods, cipher names or header names
+# has short items; a sentence that happens to contain a comma does not.
+# Keeps the normalisation below from reordering prose it does not
+# understand.
+_MAX_LIST_ITEM_LEN = 24
+
+
+def _normalise_enumeration(text: str) -> str:
+    """
+    Sort a trailing comma-separated enumeration into a stable order.
+
+    Tools report set-valued facts in whatever order they happened to
+    observe them, and that order is not stable between runs. Verified on
+    real data: nikto reported the same finding as
+
+        [999990] OPTIONS: Allowed HTTP Methods: OPTIONS, GET, HEAD, POST .
+        [999990] OPTIONS: Allowed HTTP Methods: GET, HEAD, POST, OPTIONS .
+
+    in two scans of an unchanged target, and the diff duly announced one
+    finding fixed and one new. The set is identical; only the order moved.
+    A diff that reports that is not trustworthy on the occasions when
+    something genuinely did change, which is the entire point of having one.
+
+    Scoped deliberately narrowly. Only the text after the LAST colon is
+    considered (that is where these enumerations live, after a "…Methods:"
+    style label), and only when every comma-separated fragment is short
+    enough to be a list item — so an ordinary sentence containing a comma is
+    left exactly as it is rather than being silently reordered.
+    """
+    if "," not in text:
+        return text
+
+    head, sep, tail = text.rpartition(":")
+    if not sep:
+        head, tail = "", text
+
+    # A trailing full stop is nikto's, not part of the last item.
+    tail = tail.strip().rstrip(".").strip()
+    items = [item.strip() for item in tail.split(",")]
+    if len(items) < 2 or not all(0 < len(item) <= _MAX_LIST_ITEM_LEN for item in items):
+        return text
+
+    return f"{head}{sep} " + ", ".join(sorted(items))
+
 
 def _identifier(finding: dict) -> str:
     """The most specific stable label this finding carries."""
@@ -80,11 +125,13 @@ def _identifier(finding: dict) -> str:
         if value:
             return value.lower()
 
-    # Fall back to the description with volatile numbers removed. Truncated
-    # so a description that grows a trailing clause still matches.
+    # Fall back to the description with volatile numbers removed and any
+    # trailing enumeration sorted. Truncated so a description that grows a
+    # trailing clause still matches.
     description = str(finding.get("description") or "").strip().lower()
     description = _VOLATILE.sub("", description)
     description = " ".join(description.split())
+    description = _normalise_enumeration(description)
     return description[:160]
 
 

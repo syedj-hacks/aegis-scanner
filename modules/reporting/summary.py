@@ -232,22 +232,32 @@ _NOT_APPLICABLE = {
         "xss_finding": "injection class, not a CVE",
     },
     "cvss": {
-        # CVSS is a score *of a CVE*; where a CVE cannot apply, neither can
-        # a published score. Findings that carry a CVE keep CVSS
-        # applicable, and severity.py's heuristic grade is reported
-        # separately as the Severity field.
-        "banner": "no CVE to score",
-        "discovered_path": "no CVE to score",
-        "fingerprint_header": "no CVE to score",
-        "missing_security_header": "no CVE to score",
-        "open_port": "no CVE to score",
-        "service_version": "no CVE to score",
-        "smb_share": "no CVE to score",
-        "smb_user": "no CVE to score",
-        "sslyze_finding": "no CVE to score",
-        "technology_fingerprint": "no CVE to score",
-        "weak_credentials": "no CVE to score",
-        "wordpress_fingerprinted": "no CVE to score",
+        # This table used to say CVSS was "a score of a CVE", so any non-CVE
+        # finding type was declared CVSS-inapplicable. That premise no longer
+        # holds: modules/enrichment/cvss.py computes a local CVSS v3.1 vector
+        # for exactly these types (missing headers, weak TLS, exposed paths,
+        # confirmed injection), so a populated `cvss` on one of them is now a
+        # correct, intended value — not a field-signature violation. The
+        # attribution audit (t_phase9 §H) flagged the contradiction the day
+        # the scoring engine landed, which is the check doing its job.
+        #
+        # Only the types cvss.py leaves in UNSCORED_TYPES remain
+        # CVSS-inapplicable, and for those the reason is no longer "no CVE"
+        # but a deliberate scoping decision: scoring pure information
+        # disclosure at its defensible 5.3 would promote thousands of LOW
+        # rows to MEDIUM and bury the real findings (see cvss.py).
+        "banner": "left unscored — informational disclosure (see cvss.UNSCORED_TYPES)",
+        "fingerprint_header": "left unscored — informational disclosure",
+        "technology_fingerprint": "left unscored — informational disclosure",
+        "wordpress_fingerprinted": "left unscored — not a flaw in itself",
+        "smb_share": "left unscored — enumeration evidence",
+        "smb_user": "left unscored — enumeration evidence",
+        "open_port": "left unscored — exposure, not an assessed weakness",
+        "service_version": "left unscored — version evidence",
+        # Deliberately ABSENT now, because cvss.py DOES score them:
+        #   discovered_path (sensitive paths), missing_security_header,
+        #   sslyze_finding (incl. testssl), weak_credentials, sqlmap_finding,
+        #   xss_finding — a populated cvss on any of these is expected.
     },
     "service": {
         # enum4linux findings are about SMB accounts and shares rather than
@@ -536,7 +546,18 @@ def cvss_display(finding: dict) -> str:
     """
     cvss = finding.get("cvss")
     if cvss is None:
-        return field_display(finding, "cvss")
+        # No score, from NVD or the local engine. That is not a gap to
+        # apologise for and it is not "not determined by <some tool>" — no
+        # tool was ever going to CVSS-score this row. It was graded on
+        # severity.py's heuristic rules, which the Severity cell already
+        # shows. Say exactly that rather than routing through
+        # field_display(), whose tool-based fallback would misattribute the
+        # absence to gobuster/nikto/etc.
+        finding_type = str(finding.get("finding_type") or "").strip().lower()
+        reason = _NOT_APPLICABLE.get("cvss", {}).get(finding_type)
+        if reason:
+            return f"N/A ({reason})"
+        return "N/A (graded heuristically — see Severity)"
 
     source = finding.get("severity_source", "heuristic")
     vector = str(finding.get("cvss_vector") or "").strip()

@@ -223,6 +223,60 @@ Internals / data flow / known gaps: [BACKEND_STRUCTURE.md](BACKEND_STRUCTURE.md)
   failed/skipped counts (previously always zero, because that data only existed inside the
   profile orchestrator and was never passed back up to the panel that displays it).
 
+### 5.x The commercial-upgrade batch (2026-07-31)
+
+Ten items added on `feature/commercial-upgrade`. The design decisions worth
+carrying forward:
+
+- **Concurrency is two independent layers that MULTIPLY.** Within a scan,
+  independent per-port web tools run in a pool; across scans, whole targets run
+  in a pool. The real outbound rate is roughly their product, so both defaults
+  are small and `PROFILE_RATE_LIMITS` exists to throttle further. What is *not*
+  parallel is deliberate: nuclei DAST (consumes gobuster/dirb's paths), ZAP (one
+  session), and the four active-injection conditional tools. `stealthscan` is
+  excluded from all of it and a regression test enforces that.
+
+- **Two latent bugs had to be fixed before concurrency was safe**, and both are
+  the kind that only appear under load: the skip-key listener saved/restored the
+  terminal per-tool (fine for one tool, corrupts the terminal for five), and
+  `get_logger()` could attach two file handlers to one target's logger from two
+  threads. Called out because they are the sort of thing a future "add more
+  concurrency" change can reintroduce.
+
+- **CVSS was added as EXPLANATION, not re-grading.** Every non-CVE finding now
+  carries a v3.1 vector and score, but the templates were calibrated to land in
+  the same severity band the existing heuristic already assigned — the value is
+  the auditable vector next to the number, not a reshuffle. Informational
+  findings are left deliberately unscored, because a defensible "version
+  disclosed" score is MEDIUM and applying it would have promoted thousands of
+  LOW rows and buried the real findings. NVD scores are never overwritten.
+
+- **Compliance mapping and testssl are compliance-profile-only**, and gated so
+  every other profile's output is byte-identical. testssl COMPLEMENTS sslyze
+  (accepts-vs-vulnerable) rather than replacing it.
+
+- **Two invisible-failure bugs were found and fixed DURING this batch's own live
+  verification**, both the same shape as the historical scan-97 zero-ports bug —
+  a tool that could not reach its target writing a clean-looking "nothing found"
+  result. testssl.sh writes a valid JSON report with a `scanProblem`/`FATAL`
+  entry on a refused connection; ZAP reports a complete spider and zero alerts
+  when its (possibly containerised) daemon cannot route to the target. Both now
+  classify as tool failures. The ZAP one matters more precisely because
+  `ZAP_HOST` now exists: a remote daemon has its own network view, so "the
+  scanner can reach it" no longer implies "ZAP can".
+
+- **A NameError in deepscan's sqlmap dispatch shipped in the checkpoint commit
+  and was caught by live A/B testing**, not by the test suite — the conditional
+  path only fires against a target whose content produces an injectable
+  candidate, which the finding-sparse smoke targets never did. A reminder that
+  "the tests pass" and "the conditional tools were exercised" are different
+  claims, exactly as the note below already says.
+
+- **Scheduling is cron + a shell script, not a daemon.** `--non-interactive`
+  plus `--diff` plus `scripts/scheduled_scan.sh` (which exits non-zero only on a
+  delta, so cron mails you only when something changed) does the whole job
+  without a process to supervise.
+
 ## 6. Known gaps / honesty notes
 
 - **ZAP's passive-scanner add-on** (`pscanrules` — without it ZAP scans complete cleanly and
@@ -244,9 +298,14 @@ Internals / data flow / known gaps: [BACKEND_STRUCTURE.md](BACKEND_STRUCTURE.md)
   project's two default *internet* smoke-test targets don't meet any of the four trigger
   conditions on their own, so everyday smoke-test runs against those don't exercise the dispatch
   path — bring up the lab (`cd test-targets && docker-compose up -d`) to see it.
-- **The tools-run record has live coverage on deepscan and quickscan only.** The other three
-  profiles wire it identically (the same one line in the same place) and compile clean, but were
-  not exercised live in the pass that added it. Low risk; not the same as a live run.
+- **The tools-run record has live coverage on deepscan, quickscan, webaudit and compliance.**
+  The 2026-07-31 pass ran webaudit and compliance live as well; `stealthscan` is still verified
+  by its regression guard and structure, not a fresh timed run in that pass.
+- **The deepscan concurrency speedup was measured against the LOCAL LAB, not an internet host.**
+  The first attempt against scanme.nmap.org was discarded: the host degraded between the two
+  halves (it stopped answering entirely), so the "after" run lost findings from the sequential
+  tools and the number measured target decay as much as concurrency. The clean figure comes from
+  the DVWA container — see smoke_test11 for both the number and why the first one was thrown out.
 - **Two historical attribution mismatches are reported and allowlisted, not rewritten.** Old rows
   have not been edited to make the audit quiet. Likewise, the one historical data repair that was
   done (`tools/backfill_nuclei_identity.py`) deliberately restored only values recoverable from

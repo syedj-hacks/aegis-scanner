@@ -51,7 +51,7 @@ import tempfile
 
 from modules.utils.error_handler import run_tool
 from modules.utils.config import get_timeout
-from modules.utils.logger import log_finding
+from modules.utils.logger import log_finding, log_tool_failure
 from modules.utils.display import (
     print_info, print_success, print_warning, print_error,
 )
@@ -69,6 +69,32 @@ _TESTSSL_CANDIDATES = (
 # above is reported as a finding; LOW/INFO/OK/WARN are configuration facts
 # rather than weaknesses and would drown the real signal.
 _REPORTABLE_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM")
+
+# How testssl.sh reports that the SCAN ITSELF failed, as opposed to
+# reporting something about the target. It emits
+#
+#   {"id": "scanProblem", "severity": "FATAL",
+#    "finding": "Can't connect to '<host>:<port>' ..."}
+#
+# and exits non-zero, but it STILL WRITES A WELL-FORMED JSON FILE.
+#
+# That combination is the trap. This wrapper salvages partial output on a
+# non-zero exit on purpose — testssl.sh exits non-zero when it FINDS
+# vulnerabilities, so treating every non-zero exit as failure would discard
+# exactly the runs that found something. But a refused connection also
+# leaves a readable JSON file, one containing no results at all, so the
+# naive salvage rule turns "we never reached the target" into "scan
+# completed, no TLS issue found" — a clean-looking report about a host that
+# was never tested.
+#
+# Reproduced deterministically against a closed port: exit 246, 766 bytes
+# of valid JSON, zero parsed findings, wrapper reported success. This is
+# the same invisible-failure class as the zero-open-ports result in scan 97
+# and the ZAP pscanrules add-on that silently uninstalled itself; the rule
+# this codebase settled on is that a failure must be counted AND reported
+# by the same code path, never inferred from an absence.
+_FATAL_SEVERITY = "FATAL"
+_SCAN_PROBLEM_ID = "scanproblem"
 
 # testssl.sh check ids that are vulnerability tests rather than inventory,
 # mapped to the human name of the attack. Keys are lowercased because
@@ -131,6 +157,75 @@ def _resolve_binary():
     return None
 
 
+def _scan_problem(raw_json: str):
+    """
+    testssl.sh's own reason the scan could not run, or None.
+
+    Returned separately from the findings rather than folded into them: a
+    scan that never reached the target has not produced a finding of any
+    severity, and rendering it as one would put "Can't connect to host" in
+    a report's TLS findings section as though it were a property of the
+    target's TLS configuration. It is a tool failure, and the caller raises
+    it as one.
+    """
+    entries, _ = _entries(raw_json)
+    for entry in entries:
+        severity = str(entry.get("severity") or "").strip().upper()
+        check_id = str(entry.get("id") or "").strip().lower()
+        if severity == _FATAL_SEVERITY or check_id == _SCAN_PROBLEM_ID:
+            return " ".join(str(entry.get("finding") or "scan problem").split())
+    return None
+
+
+def _entries(raw_json: str):
+    """
+    Every finding object in a testssl.sh report, and whether the document
+    parsed at all.
+
+    Returns (entries, parsed). `parsed` distinguishes "valid JSON with no
+    entries" from "not JSON" — the caller needs to tell an empty report
+    apart from an unreadable one.
+    """
+    try:
+        data = json.loads(raw_json) if raw_json else None
+    except (json.JSONDecodeError, TypeError):
+        return [], False
+
+    if data is None:
+        return [], False
+
+    # Two shapes, both handled:
+    #
+    #   --jsonfile         a flat array of finding objects
+    #   --jsonfile-pretty  {..., "scanResult": [ {per-host, with findings
+    #                      grouped into named sections} ]}
+    #
+    # For the pretty shape every LIST-valued key on the host object is
+    # walked, rather than a hardcoded list of section names. Verified
+    # against testssl.sh 3.2.4, which emits eleven of them (pretest,
+    # protocols, grease, ciphers, serverPreferences, fs, serverDefaults,
+    # vulnerabilities, cipherTests, browserSimulations, rating) — an earlier
+    # draft of this parser named four and silently dropped the findings in
+    # the other seven, including every cipherTests result.
+    entries = []
+    if isinstance(data, list):
+        entries = [v for v in data if isinstance(v, dict)]
+    elif isinstance(data, dict):
+        scan_result = data.get("scanResult") or data.get("findings") or []
+        if isinstance(scan_result, list):
+            for host_block in scan_result:
+                if not isinstance(host_block, dict):
+                    continue
+                # A scanProblem entry sits directly in scanResult, not
+                # inside a per-host section — so the block itself counts.
+                if host_block.get("id") or host_block.get("severity"):
+                    entries.append(host_block)
+                for value in host_block.values():
+                    if isinstance(value, list):
+                        entries.extend(v for v in value if isinstance(v, dict))
+    return entries, True
+
+
 def _parse_testssl_json(raw_json: str) -> list:
     """
     Parse testssl.sh's --jsonfile-pretty output into a list of:
@@ -142,41 +237,7 @@ def _parse_testssl_json(raw_json: str) -> list:
     """
     findings = []
 
-    try:
-        data = json.loads(raw_json) if raw_json else []
-    except (json.JSONDecodeError, TypeError):
-        return findings
-
-    # Two shapes, both handled:
-    #
-    #   --jsonfile         a flat array of finding objects
-    #   --jsonfile-pretty  {..., "scanResult": [ {per-host, with findings
-    #                      grouped into named sections} ]}
-    #
-    # For the pretty shape every LIST-valued key on the host object is
-    # walked, rather than a hardcoded list of section names. Verified against
-    # testssl.sh 3.2.4, which emits eleven of them (pretest, protocols,
-    # grease, ciphers, serverPreferences, fs, serverDefaults, vulnerabilities,
-    # cipherTests, browserSimulations, rating) — an earlier draft of this
-    # parser named four and silently dropped the findings in the other seven,
-    # including every cipherTests result. Walking whatever sections are
-    # present means a testssl.sh version that adds or renames one cannot
-    # quietly cost us findings.
-    entries = []
-    if isinstance(data, list):
-        entries = data
-    elif isinstance(data, dict):
-        scan_result = data.get("scanResult") or data.get("findings") or []
-        if isinstance(scan_result, list):
-            for host_block in scan_result:
-                if not isinstance(host_block, dict):
-                    continue
-                for value in host_block.values():
-                    if isinstance(value, list):
-                        entries.extend(v for v in value if isinstance(v, dict))
-        # A flat array under "findings" is already the entry list itself.
-        if not entries and isinstance(scan_result, list):
-            entries = [v for v in scan_result if isinstance(v, dict)]
+    entries, _ = _entries(raw_json)
 
     for entry in entries or []:
         if not isinstance(entry, dict):
@@ -306,6 +367,21 @@ def run_testssl(target: str, port: int = 443) -> dict:
                 tool_result.get("error") or tool_result.get("stderr") or "testssl.sh failed"
             )
             print_error(f"[Testssl] testssl.sh failed for {host_port} — {result['error']}")
+            return result
+
+        # ...but testssl.sh ALSO writes a well-formed JSON file when it
+        # could not reach the target at all, and that file contains a
+        # scanProblem/FATAL entry instead of results. Salvaging it as
+        # "completed, nothing found" would report a host that was never
+        # tested as a host with no TLS problems. Checked before the findings
+        # are parsed, because the distinction is not visible in the parsed
+        # output — both cases yield zero findings.
+        problem = _scan_problem(raw_json)
+        if problem:
+            result["error"] = f"testssl.sh could not scan {host_port}: {problem}"
+            result["skipped"] = tool_result.get("skipped", False)
+            log_tool_failure(target, "testssl", result["error"])
+            print_error(f"[Testssl] {result['error']}")
             return result
 
         findings = _parse_testssl_json(raw_json)

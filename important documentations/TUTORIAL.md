@@ -50,8 +50,35 @@ hidden, like a password field). You can always add it later — see Step 6.
 > `-addoninstall <id>` — that specific sequence is the leading suspect for how this add-on gets
 > silently uninstalled in the first place (a broken marketplace-catalog lookup can cause the
 > updater to remove the old version and fail to reinstall the replacement, with no error). The
-> real fix is to back up and delete `~/.ZAP` and either re-run `install.sh` or re-run its ZAP
-> bootstrap block by hand — see [BACKEND_STRUCTURE.md](BACKEND_STRUCTURE.md) §5.
+> real fix is to get a guaranteed-fresh profile.
+>
+> **The recommended way to do that is now the container** (added 2026-07-31):
+>
+> ```bash
+> docker compose restart zap      # or: docker-compose restart zap
+> ```
+>
+> `docker/zap/` builds ZAP with the add-on bootstrap already done and with **no
+> volume mounted over `~/.ZAP`** — the profile lives in the container's own
+> writable layer, so a restart discards whatever the last run did to it and
+> comes back with the exact profile the image was built with. Verified: a fresh
+> container reports **61 passive scan rules loaded and enabled**. That turns a
+> debugging session into a one-liner.
+>
+> To use it: `docker compose up -d zap`, then put `ZAP_HOST=127.0.0.1` and
+> `ZAP_PORT=8090` in `.env`. With `ZAP_HOST` unset, nothing changes — the
+> scanner spawns a local `zap.sh` exactly as before.
+>
+> One gotcha worth knowing before you hit it: **ZAP runs in the container's
+> network namespace, not yours.** A target you can `curl` from the host may be
+> unroutable from inside the container. `zap_wrap.py` detects that (it checks
+> ZAP's own site tree, not the spider's attempted-URL list) and reports it as a
+> tool **failure** rather than "0 alerts", but the fix is in
+> `docker-compose.yml` — see the REACHING YOUR TARGETS comment there.
+>
+> Without the container, the manual fix is still: back up and delete `~/.ZAP`,
+> then re-run `install.sh` or its ZAP bootstrap block by hand — see
+> [BACKEND_STRUCTURE.md](BACKEND_STRUCTURE.md) §5.
 
 ## Step 2 — Activate the environment
 
@@ -88,10 +115,21 @@ menu to pick a profile from. This only kicks in when the target is omitted entir
 
 **Stuck on a slow tool?** Press `s` while a scan is running to skip just the tool currently
 running and move on to the next one (nmap and DNS resolution can't be skipped — they're load-
-bearing for everything downstream, and the key is acknowledged but ignored for those). A single
-Ctrl+C does the same thing; press it twice within about two seconds to abort the whole scan
-instead. This only works when Aegis is run in a real interactive terminal — piped/non-
-interactive runs simply never see a keypress.
+bearing for everything downstream, and the key is acknowledged but ignored for those). This
+only works when Aegis is run in a real interactive terminal — piped/non-interactive runs
+simply never see a keypress.
+
+**Use `s`, not Ctrl+C, to skip.** Ctrl+C *usually* skips the running tool too, but only while
+a tool is actually running: it is `run_tool()`/`safe_call()` that intercept the interrupt.
+Press it in one of the gaps between tools — during CVE enrichment, a database write, or report
+generation — and there is nothing there to catch it, so it ends the whole scan. (Measured, not
+theorised: Ctrl+C during a subprocess returns a normal skipped result and the scan continues;
+Ctrl+C between tools exits.) Two presses within about two seconds always end the scan
+deliberately. The `s` key has no such gap — it is only ever read while a tool is running, so it
+means exactly one thing at every moment of a scan.
+
+While several targets are running (`--targets`), the skip key is disabled entirely — see
+Step 9.
 
 ## Step 4 — Read the report
 
@@ -241,6 +279,11 @@ Common entries you'll see there and what they mean:
 - `Tool skipped by user: <tool>` — you pressed the skip key (`s`) or Ctrl+C once while that tool
   was running; not a failure, and it's reflected in the final summary's "Tools skipped" count,
   not "Tools failed".
+  > Fixed 2026-07-31: this was only true of the `s` key. `run_tool()`'s Ctrl+C path set the
+  > error string but never the `skipped` flag, so a deliberate Ctrl+C skip was classified as a
+  > tool **failure** — printed as `[Failed] nikto: skipped by user (Ctrl+C)` and counted in
+  > "Tools failed". If you are reading an older scan's summary, that is what an inflated
+  > failure count next to a normal-looking scan means.
 - `condition '<flag>' not met — skipping <tool>` — one of `deepscan`'s conditional tools
   (sqlmap/hydra/wpscan/enum4linux) didn't fire because its trigger wasn't detected on this
   target (no injectable-looking path, no login-service port open, no WordPress fingerprint, no
@@ -270,7 +313,100 @@ Two more things worth knowing while debugging:
   python3 tests/db_sweep.py 150      # just one
   ```
 
-## Step 9 — Next steps
+## Step 9 — Scan several hosts at once
+
+```bash
+python3 aegis.py --targets a.example.com,b.example.com --profile quickscan
+python3 aegis.py --targets targets.txt --profile webaudit        # one host per line, # comments ok
+python3 aegis.py --targets targets.txt --max-concurrent-targets 3
+```
+
+Each target gets its own `output/<target>/` directory and its own
+`scan_errors.log` — nothing is shared, and one unreachable host does not affect
+the others.
+
+Two things deliberately change while several targets are running: the live Rich
+progress bar is replaced by one plain line per event (a single live-updating bar
+cannot represent three interleaved scans), and the `s` skip key is disabled
+(it has no single referent when six tools across three targets are running).
+Ctrl+C still stops the run.
+
+The default is 2 at a time and that is intentionally conservative — each target
+is *also* running its web tools concurrently, so the real request rate is
+roughly `targets x tools`. If you need to be gentler on a set of hosts, use the
+per-profile throttles in `config.PROFILE_RATE_LIMITS` (gobuster threads, dirb
+delay, nikto pause, nuclei rate limit) rather than only lowering this number.
+
+## Step 10 — Scan behind a login (authenticated scans)
+
+Opt-in. With nothing configured, every command is built exactly as before.
+
+```bash
+# preferred: put it in .env, so the credential is not in your shell history
+echo 'AEGIS_AUTH_COOKIE=PHPSESSID=abc123; security=low' >> .env
+python3 aegis.py 127.0.0.1 --profile webaudit
+
+# or per-run
+python3 aegis.py 127.0.0.1 --profile webaudit --auth-cookie 'PHPSESSID=abc123'
+python3 aegis.py api.example.com --profile webaudit --auth-header 'Authorization: Bearer <token>'
+```
+
+Basic auth uses `AEGIS_AUTH_BASIC_USER` + `AEGIS_AUTH_BASIC_PASS` — **both**, or
+neither; half a pair is refused with a warning rather than sent as `user:None`.
+
+The credential reaches nikto (basic auth only), gobuster, nuclei, sqlmap and ZAP.
+**whatweb and dirb do not support custom auth cleanly and run unauthenticated** —
+the scan says so out loud rather than letting their findings quietly describe the
+anonymous view of a target you believe you scanned as a logged-in user.
+
+The credential value is never written to `scan_errors.log`, a report, or the
+database. Only the *method* is recorded ("session cookie", "basic auth").
+
+To check it actually worked, compare a path's status code with and without: an
+endpoint that redirects (302) to a login page anonymously should return 200 when
+the session is being sent.
+
+## Step 11 — Track what changed between scans, on a schedule
+
+Diff any two finished scans:
+
+```bash
+python3 aegis.py --diff 137 168             # summary of new / fixed / unchanged
+python3 aegis.py --diff 137 168 --diff-verbose   # also list the unchanged ones
+```
+
+Read `UNVERIFIED` carefully: those findings are absent from the later scan, but
+the tool that would have found them did not run in it. They are **not**
+remediated — that distinction is the difference between a diff you can act on
+and one you cannot.
+
+For scheduling, use cron rather than a daemon — `--non-interactive` exists for
+exactly this, and cron already solves restarts, logging and mail:
+
+```bash
+crontab -e
+```
+
+```cron
+# nightly quick check; mails you ONLY when something new or changed appears
+30 2 * * * cd /home/jafar/aegis-scanner && scripts/scheduled_scan.sh example.com quickscan
+
+# weekly deep scan
+0 3 * * 0 cd /home/jafar/aegis-scanner && scripts/scheduled_scan.sh example.com deepscan
+```
+
+`scripts/scheduled_scan.sh` runs the scan, diffs it against the previous scan of
+the same target, prints only the delta, and **exits non-zero when something is
+new or changed** — which is what makes cron mail you. It stays quiet otherwise,
+because a job that mails a full report every night is a job nobody reads by week
+three.
+
+> cron runs with a minimal `PATH` and no virtualenv. Either set `PATH=` at the
+> top of your crontab or let the script use `venv/bin/python3` (it prefers that
+> automatically when present). Otherwise every tool fails with "binary not found
+> on PATH", which looks like a scanner bug and is not one.
+
+## Step 12 — Next steps
 
 - Read [WRITEUP.md](WRITEUP.md) for the "why" behind the architecture.
 - Read [BACKEND_STRUCTURE.md](BACKEND_STRUCTURE.md) if you're going to modify or extend a
