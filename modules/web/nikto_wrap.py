@@ -29,12 +29,20 @@ from modules.utils.display import (
 )
 
 # Suppress nikto's interactive prompts so it can never block on stdin
-# inside a subprocess with no TTY.
-_NIKTO_BASE_ARGS = ["-nointeractive"]
+# inside a subprocess with no TTY. `-ask no` is the important one: after a
+# scan that hit unknown server strings, nikto 2.6 prints a "submit this to
+# CIRT.net? (y/n)" prompt and — even under -nointeractive — was observed
+# blocking on stdin waiting for the answer until run_tool()'s hard timeout
+# killed it (a full 600s wasted, all output discarded). `-ask no` answers it
+# up front so the scan phase's -maxtime is the only thing that bounds nikto.
+_NIKTO_BASE_ARGS = ["-nointeractive", "-ask", "no"]
 
 # Seconds shaved off the configured tool timeout so nikto self-terminates
-# and flushes its report before run_tool() would hard-kill it.
-_MAXTIME_MARGIN = 30
+# and flushes its report before run_tool() would hard-kill it. Kept
+# generous (nikto checks -maxtime only between tests, so a slow batch can
+# overshoot the deadline) — the whole point is that nikto stops itself and
+# we keep its findings, rather than run_tool() SIGKILLing it at the wire.
+_MAXTIME_MARGIN = 90
 
 # Lines that start with "+ " but are scan metadata, not findings.
 _METADATA_PREFIXES = (
@@ -305,9 +313,26 @@ def run_nikto(target: str, port: int = 80, use_https: bool = False) -> dict:
     result["skipped"] = tool_result.get("skipped", False)
 
     if not tool_result.get("success"):
-        result["error"] = tool_result.get("error") or tool_result.get("stderr") or "nikto failed"
-        print_error(f"[Nikto] nikto failed for {target}:{port} — {result['error']}")
-        return result
+        error = tool_result.get("error") or tool_result.get("stderr") or "nikto failed"
+        # run_tool() preserves whatever the child printed before it was
+        # terminated. A -maxtime overshoot that got SIGKILLed on the hard
+        # timeout has, by then, usually already printed most of its findings,
+        # so a timeout with usable output is salvaged (findings kept, error
+        # recorded) instead of thrown away as a bare failure. Any other
+        # failure — a missing binary, a target that never connected — has no
+        # findings to keep and still returns empty.
+        timed_out = str(error).lower().startswith("timed out")
+        if timed_out and "+ " in result["raw_output"]:
+            result["error"] = error
+            print_warning(
+                f"[Nikto] {target}:{port} — {error}; keeping the findings "
+                "nikto reported before it was stopped"
+            )
+            # fall through to parse the partial output below
+        else:
+            result["error"] = error
+            print_error(f"[Nikto] nikto failed for {target}:{port} — {result['error']}")
+            return result
 
     # Exit code 0 is not proof the scan happened — check nikto's own text.
     # This is new information run_tool() couldn't have logged (it saw a

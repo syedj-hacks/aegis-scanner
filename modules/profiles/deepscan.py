@@ -96,12 +96,25 @@ _HTTPS_PORTS = (443, 8443)
 # --- Lightweight param-probe (injectable_param_found producer) -----------
 # Neither gobuster nor dirb discovers query-string parameters — they only
 # brute-force paths. This heuristic treats any discovered script endpoint
-# (.php/.asp/.aspx/.jsp/.cgi) as a *candidate* and appends a common
+# (.php/.asp/.aspx/.jsp/.cgi) as a *candidate* and appends a common injection
 # parameter name to build a probe URL; sqlmap_wrap.run_sqlmap() below does
 # the actual confirmation. Added here specifically to give
 # CONDITIONAL_TOOLS['sqlmap'] ("injectable_param_found") a real producer.
-_SCRIPT_EXTENSIONS = (".php", ".asp", ".aspx", ".jsp", ".cgi")
+#
+# Candidates are built with the shared, ranked web_param_candidates() helper
+# (same one the XSS pass uses) so sqlmap probes a promising endpoint
+# (info/search/sqli/...) before a site root (index/home/...) and, crucially,
+# tries MORE than one: the old probe stopped at the first discovered .php,
+# which is almost always /index.php — usually a 302 redirect and not
+# injectable — so a genuinely injectable endpoint discovered later in the
+# same run (e.g. /info.php) was never handed to sqlmap at all.
 _PROBE_PARAM = "id"
+# Cap on how many discovered endpoints sqlmap probes in one deepscan run.
+# sqlmap returns fast on a non-injectable candidate under --batch/level1/
+# risk1, and the loop stops as soon as one confirms injectable, so this only
+# bounds the worst case (a target with many discovered scripts, none
+# injectable).
+_MAX_SQLMAP_CANDIDATES = 5
 
 # --- Login-service detection (login_service_found producer) --------------
 # Maps an nmap/service-detect service name to the hydra module name that
@@ -456,11 +469,17 @@ def _findings_from_zap(zap_result: dict) -> list:
 
 
 def _findings_from_wpscan(wpscan_result: dict, port) -> list:
+    # Severity is per-finding now: a known-vulnerability match comes back
+    # HIGH, while identified-version / enumerated-component / interesting-
+    # finding evidence (the only thing a token-less wpscan run produces)
+    # comes back LOW/MEDIUM. wpscan_wrap._parse_wpscan_json() sets it; the
+    # severity scorer's default branch honours a finding's own label, so
+    # forcing HIGH here would have mis-graded all of that as critical.
     return [
         {
             "type": "wpscan_finding", "port": port,
-            "component": f["component"], "reference": f["reference"],
-            "severity": "HIGH",
+            "component": f["component"], "reference": f.get("reference", ""),
+            "severity": f.get("severity", "MEDIUM"),
             "description": f"{f['component']}: {f['title']}",
         }
         for f in wpscan_result.get("findings") or []
@@ -566,25 +585,24 @@ def _findings_from_enum4linux(enum_result: dict) -> list:
     return findings
 
 
-def _detect_injectable_candidates(gobuster_results: list, dirb_results: list) -> tuple:
+def _detect_injectable_candidates(gobuster_results: list, dirb_results: list) -> list:
     """
-    Lightweight param-probe: look for a script-extension path already
-    discovered by gobuster/dirb, and build a candidate URL by appending a
-    common parameter name. Not a crawl or a confirmed vulnerability —
-    sqlmap_wrap.run_sqlmap() does the actual confirmation.
+    Lightweight param-probe: build a ranked, bounded list of candidate URLs
+    (one injection probe parameter appended to each discovered script
+    endpoint) for sqlmap to confirm. Not a crawl or a confirmed
+    vulnerability — sqlmap_wrap.run_sqlmap() does the actual confirmation.
 
-    Returns (found: bool, candidate_url: str | None, port: int | None).
+    Returns a list of (url, port) tuples, most-promising first, e.g.
+        [("http://host:80/info.php?id=1", 80),
+         ("http://host:80/index.php?id=1", 80)]
+    Empty when no 2xx/3xx script endpoint was discovered. Reuses the shared
+    web_param_candidates() ranker so /info.php is probed before /index.php.
     """
-    for result in list(gobuster_results) + list(dirb_results):
-        port = result.get("port")
-        for entry in result.get("discovered_paths") or []:
-            path = entry.get("path", "")
-            if entry.get("status_code") not in (200, 301, 302):
-                continue
-            if path.lower().endswith(_SCRIPT_EXTENSIONS):
-                url = f"http://{result.get('target')}:{port}{path}?{_PROBE_PARAM}=1"
-                return True, url, port
-    return False, None, None
+    return web_param_candidates(
+        gobuster_results, dirb_results,
+        max_candidates=_MAX_SQLMAP_CANDIDATES,
+        probe_params=(_PROBE_PARAM,),
+    )
 
 
 def _detect_login_services(services: list) -> tuple:
@@ -646,12 +664,19 @@ def _check_conditional_tools(target: str, flags: dict, context: dict) -> tuple:
             new_findings.extend(_findings_from_wpscan(wp_result, wp_port))
 
         elif tool == "sqlmap":
-            candidate_url = context.get("injectable_url")
-            if not candidate_url:
+            candidates = context.get("injectable_candidates") or []
+            if not candidates:
                 continue
-            sqlmap_result = run_sqlmap(target, candidate_url)
-            new_tool_results.append(sqlmap_result)
-            new_findings.extend(_findings_from_sqlmap(sqlmap_result, context.get("injectable_port")))
+            # Probe candidates in ranked order and STOP at the first one
+            # sqlmap confirms injectable. Testing only the first discovered
+            # .php (the old behaviour) meant a non-injectable /index.php shut
+            # the whole pass down before /info.php was ever tried.
+            for candidate_url, candidate_port in candidates:
+                sqlmap_result = run_sqlmap(target, candidate_url)
+                new_tool_results.append(sqlmap_result)
+                new_findings.extend(_findings_from_sqlmap(sqlmap_result, candidate_port))
+                if sqlmap_result.get("injectable"):
+                    break
 
         elif tool == "hydra":
             login_service = context.get("login_service")
@@ -873,7 +898,7 @@ def run_deepscan(target: str, non_interactive: bool = False):
             wordpress_https = _is_https_port({"port": wordpress_port})
             break
 
-    injectable_found, injectable_url, injectable_port = _detect_injectable_candidates(
+    injectable_candidates = _detect_injectable_candidates(
         gobuster_results, dirb_results,
     )
     login_found, login_service, login_port = _detect_login_services(services)
@@ -881,15 +906,14 @@ def run_deepscan(target: str, non_interactive: bool = False):
 
     flags = {
         "wordpress_fingerprinted": wordpress_port is not None,
-        "injectable_param_found": injectable_found,
+        "injectable_param_found": bool(injectable_candidates),
         "login_service_found": login_found,
         "smb_service_found": smb_found,
     }
     context = {
         "wordpress_port": wordpress_port,
         "wordpress_https": wordpress_https,
-        "injectable_url": injectable_url,
-        "injectable_port": injectable_port,
+        "injectable_candidates": injectable_candidates,
         "login_service": login_service,
         "login_port": login_port,
     }

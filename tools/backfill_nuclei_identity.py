@@ -64,7 +64,7 @@ from datetime import datetime, timedelta
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(ROOT, "database", "aegis.db")
 OUTPUT_DIR = os.path.join(ROOT, "output")
-DUMP_DIR = os.path.join(ROOT, "smoke_test")
+DUMP_DIR = os.path.join(ROOT, "important documentations")
 
 CVE_SHAPED = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 LOG_TS = "%Y-%m-%d %H:%M:%S"

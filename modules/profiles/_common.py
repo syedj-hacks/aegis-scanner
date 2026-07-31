@@ -82,16 +82,25 @@ def _endpoint_rank(path: str) -> int:
 
 
 def web_param_candidates(gobuster_results, dirb_results,
-                         max_candidates: int = _DEFAULT_MAX_XSS_CANDIDATES) -> list:
+                         max_candidates: int = _DEFAULT_MAX_XSS_CANDIDATES,
+                         probe_params=XSS_PROBE_PARAMS) -> list:
     """
     Build a bounded list of fuzzable parameter URLs from discovered script
-    endpoints, for the XSS pass to fuzz.
+    endpoints, for the XSS pass to fuzz (and the sqlmap pass to probe).
 
     Returns a list of (url, port) tuples, e.g.
         ("http://host:80/search.php?q=1", 80)
     capped at `max_candidates` so a target with many discovered scripts does
-    not spawn an unbounded number of nuclei DAST runs. Only 2xx/3xx script
-    endpoints are used (a 404/403 path is not worth fuzzing). Deduplicated.
+    not spawn an unbounded number of nuclei DAST / sqlmap runs. Only 2xx/3xx
+    script endpoints are used (a 404/403 path is not worth fuzzing).
+    Deduplicated.
+
+    `probe_params` is the set of query-string parameter names appended to
+    each endpoint. It defaults to the reflected-XSS shortlist; the sqlmap
+    pass passes its own single injection probe param instead, so both passes
+    share this one ranked/bounded endpoint-selection logic rather than each
+    re-implementing (and one of them getting the discovery-order fix and the
+    other not).
 
     Endpoint coverage before parameter depth
     ----------------------------------------
@@ -139,7 +148,7 @@ def web_param_candidates(gobuster_results, dirb_results,
 
     candidates = []
     seen_urls = set()
-    for param in XSS_PROBE_PARAMS:
+    for param in probe_params:
         for host, port, path in endpoints:
             url = f"http://{host}:{port}{path}?{param}=1"
             if url in seen_urls:

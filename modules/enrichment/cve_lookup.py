@@ -230,6 +230,139 @@ def _cve_matches_product(cve: dict, cpe_products) -> bool:
     return bool(cve_products & cpe_products)
 
 
+# ---------------------------------------------------------------------
+# Version-range filtering
+# ---------------------------------------------------------------------
+# The product filter above answers "is this a CVE for the right software?"
+# but says nothing about "does the DETECTED version actually fall in the
+# vulnerable range?". Without that second check, NVD's keywordSearch (a
+# plain AND-of-words match) reports a CVE described "before 10.3" against a
+# host running exactly 10.3 — the *fixed* release — because the string
+# "10.3" appears in the description. This was found live: an OpenSSH 10.3
+# host was credited with five "before 10.3" CVEs, and an Apache 2.4.25 host
+# with two CVEs fixed in 2.4.25. The CVEs are real; they simply don't apply
+# to the version detected.
+#
+# The rule below drops a CVE ONLY when the detected version is *definitively*
+# outside every vulnerable CPE range NVD attached for the accepted product.
+# Anything it cannot prove out-of-range — no CPE data, a version wildcard, or
+# a detected version too imprecise to compare (e.g. a bare "4" against a
+# "before 4.1.22" bound) — is kept, on the same "cannot verify != does not
+# match" principle as _cve_matches_product(). It therefore never trades a
+# false positive for a false negative on an ambiguous version.
+
+def _version_tuple(v) -> tuple:
+    """
+    Parse a version string into a comparable tuple of (int, str) components.
+
+    "2.4.25" -> ((2,''),(4,''),(25,'')); "6.6.1p1" -> ((6,''),(6,''),(1,'p1')).
+    Splits on the usual separators, and within a component peels a leading
+    integer off any alpha suffix so "1f"/"1p1" sort after "1". Returns () for
+    anything without a leading numeric token (unparseable -> caller treats as
+    "cannot compare").
+    """
+    token = str(v or "").strip().split()[0] if str(v or "").strip() else ""
+    if not token:
+        return ()
+    parts = []
+    for comp in re.split(r"[._\-+~:]", token):
+        if not comp:
+            continue
+        m = re.match(r"^(\d+)([A-Za-z].*)?$", comp)
+        if m:
+            parts.append((int(m.group(1)), (m.group(2) or "").lower()))
+        else:
+            parts.append((-1, comp.lower()))
+    # Reject a token that produced no numeric-led component at all.
+    return tuple(parts) if any(p[0] >= 0 for p in parts) else ()
+
+
+def _version_cmp(a: tuple, b: tuple):
+    """
+    Compare two _version_tuple()s. Returns -1/0/1, or **None** when one is a
+    proper prefix of the other with equal shared components — i.e. the
+    comparison is genuinely ambiguous ("4" vs "4.1.22" could be 4.0 or 4.9).
+    Ambiguity is never used as a reason to drop a CVE.
+    """
+    n = min(len(a), len(b))
+    for i in range(n):
+        if a[i] < b[i]:
+            return -1
+        if a[i] > b[i]:
+            return 1
+    if len(a) == len(b):
+        return 0
+    return None
+
+
+def _cpe_covers_version(match: dict, dv: tuple):
+    """
+    For one vulnerable cpeMatch, is version `dv` inside it?
+    True = covered, False = definitively outside, None = cannot determine.
+    """
+    start_incl = match.get("versionStartIncluding")
+    start_excl = match.get("versionStartExcluding")
+    end_incl = match.get("versionEndIncluding")
+    end_excl = match.get("versionEndExcluding")
+
+    fields = (match.get("criteria") or "").split(":")
+    explicit = fields[5] if len(fields) > 5 else "*"
+
+    if not any((start_incl, start_excl, end_incl, end_excl)):
+        # No range bounds: the CPE names either a single version or a wildcard.
+        if explicit in ("*", "-", ""):
+            return True  # applies to all versions of the product
+        c = _version_cmp(dv, _version_tuple(explicit))
+        if c is None:
+            return None
+        return c == 0
+
+    for bound, op in ((end_excl, "lt"), (end_incl, "le"),
+                      (start_incl, "ge"), (start_excl, "gt")):
+        if not bound:
+            continue
+        bt = _version_tuple(bound)
+        if not bt:
+            continue
+        c = _version_cmp(dv, bt)
+        if c is None:
+            return None  # too imprecise to place against this bound
+        if op == "lt" and c >= 0:   # dv >= versionEndExcluding
+            return False
+        if op == "le" and c > 0:    # dv >  versionEndIncluding
+            return False
+        if op == "ge" and c < 0:    # dv <  versionStartIncluding
+            return False
+        if op == "gt" and c <= 0:   # dv <= versionStartExcluding
+            return False
+    return True
+
+
+def _cve_version_applicable(cve: dict, dv: tuple, cpe_products) -> bool:
+    """
+    Keep this CVE for detected version `dv`? True unless every vulnerable CPE
+    NVD attached for the accepted product is *definitively* outside `dv`'s
+    range. No product CPE data, or any ambiguous/covering CPE, keeps it.
+    """
+    saw_product_cpe = False
+    for node in (cve.get("configurations") or []):
+        for inner in (node.get("nodes") or []):
+            for match in (inner.get("cpeMatch") or []):
+                if not match.get("vulnerable", False):
+                    continue
+                fields = (match.get("criteria") or "").split(":")
+                prod = fields[4].lower() if len(fields) > 4 else ""
+                if cpe_products is not None and prod not in cpe_products:
+                    continue
+                saw_product_cpe = True
+                covers = _cpe_covers_version(match, dv)
+                if covers is None or covers is True:
+                    return True
+    if not saw_product_cpe:
+        return True  # no CPE data to judge against -> cannot verify -> keep
+    return False
+
+
 _BANNER_TOKEN_RE = re.compile(r"^([A-Za-z][\w.+-]*)/([\w.+-]+)$")
 _VERSION_LIKE_RE = re.compile(r"^\d")
 
@@ -427,6 +560,8 @@ def _parse_cves(payload, product: str = "", version=None, cpe_products=None) -> 
     """
     cves = []
     dropped = 0
+    dropped_version = 0
+    dv = _version_tuple(version) if version is not None else ()
     for item in (payload or {}).get("vulnerabilities") or []:
         cve = (item or {}).get("cve") or {}
         cve_id = cve.get("id")
@@ -435,6 +570,13 @@ def _parse_cves(payload, product: str = "", version=None, cpe_products=None) -> 
 
         if not _cve_matches_product(cve, cpe_products):
             dropped += 1
+            continue
+
+        # Version-range gate: drop a CVE only when the detected version is
+        # provably outside every vulnerable CPE range (see _cve_version_
+        # applicable). Skipped entirely when no version was detected.
+        if dv and not _cve_version_applicable(cve, dv, cpe_products):
+            dropped_version += 1
             continue
 
         score, severity, cvss_version = _extract_metric(cve.get("metrics"))
@@ -456,6 +598,11 @@ def _parse_cves(payload, product: str = "", version=None, cpe_products=None) -> 
         print_warning(
             f"[CVE] filtered {dropped} CVE(s) whose CPE data names a different "
             f"product than '{product}' (same-vendor false-positive guard)"
+        )
+    if dropped_version:
+        print_warning(
+            f"[CVE] filtered {dropped_version} CVE(s) whose vulnerable version "
+            f"range does not include '{version}' (version-range guard)"
         )
     return cves
 
