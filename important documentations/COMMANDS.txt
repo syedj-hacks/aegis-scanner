@@ -79,9 +79,16 @@ recon/scan/audit toolset and can trip IDS/WAF alerts or lock out accounts.
                    [--diff SCAN_A SCAN_B] [--diff-verbose]
                    [--version] [-h | --help]
 
-  # target        hostname or IP address (validated before anything runs); now OPTIONAL --
+  # target        hostname, IP address or URL (validated before anything runs); now OPTIONAL --
   #               omit it entirely and you'll be interactively prompted for one, then for
   #               a profile from a numbered menu (defaults to quickscan on empty input)
+  #               a pasted URL is reduced to its host and the substitution is printed, so
+  #               https://www.example.com/login?x=1 scans www.example.com; the scheme, port
+  #               and path are dropped because ports come from the profile's scan range.
+  #               CIDR ranges (10.0.0.0/24) are still rejected — ranges are not supported,
+  #               and scanning just 10.0.0.0 instead would be worse than an error.
+  #               Applies to --targets entries too, which are de-duplicated after the
+  #               reduction (http:// and https:// of one site collapse to a single scan).
   # --profile     quickscan (default) | stealthscan | webaudit | deepscan | compliance
   #               omitting this with a target given still silently defaults to quickscan
   #               (unchanged behavior); the profile menu only appears in interactive mode

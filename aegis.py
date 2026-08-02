@@ -15,6 +15,7 @@ import ipaddress
 import re
 import sys
 import time
+import urllib.parse
 
 from rich.prompt import Prompt
 
@@ -64,6 +65,9 @@ _HOSTNAME_RE = re.compile(
     r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$"
 )
 
+# "10.0.0.0/24", "2001:db8::/32" — a prefix length, not a URL path.
+_CIDR_RE = re.compile(r"^[^/]+/\d{1,3}$")
+
 
 def is_valid_target(target: str) -> bool:
     """True if `target` is a syntactically plausible hostname or IP address."""
@@ -75,6 +79,71 @@ def is_valid_target(target: str) -> bool:
     except ValueError:
         pass
     return bool(_HOSTNAME_RE.match(target))
+
+
+def normalize_target(raw: str) -> str:
+    """
+    Reduce whatever the user typed to the bare host the scanner works with.
+
+    A scan is host-centric, not URL-centric: nmap needs a hostname or IP,
+    and the web wrappers rebuild their own URLs from the host plus whichever
+    ports actually turned out to be open. So a pasted URL — the single most
+    natural thing to paste — has to lose its scheme, credentials, port, path
+    and fragment before it can be validated:
+
+        Https://www.example.com/login?next=/  ->  www.example.com
+        http://user:pw@10.0.0.5:8080/admin    ->  10.0.0.5
+        https://[2001:db8::1]/                ->  2001:db8::1
+
+    Dropping the port is intentional and not a loss: ports come from the
+    profile's scan range, so an explicit :8443 is still reached if it is
+    open. The caller echoes the normalised host so the change is visible
+    rather than silent.
+
+    Anything that isn't URL-shaped is returned stripped and otherwise
+    untouched, leaving is_valid_target() to reject it with the usual
+    message — this function never turns bad input into good.
+    """
+    if not raw:
+        return ""
+
+    candidate = raw.strip().strip("\"'")
+    if not candidate:
+        return ""
+
+    # A bare IPv6 literal must short-circuit: it is full of colons, so the
+    # authority parse below would read "2001:db8::1" as host "2001" with a
+    # port, silently scanning the wrong thing. Bracketed-but-bare form is
+    # unwrapped here too, since urlsplit needs a scheme-or-"//" to do it.
+    for form in (candidate, candidate.strip("[]")):
+        try:
+            ipaddress.ip_address(form)
+            return form
+        except ValueError:
+            pass
+
+    # A scheme-less "host/24" is a CIDR range, not a URL with a path, and
+    # the scanner has never supported ranges. Left untouched so validation
+    # rejects it: quietly scanning 10.0.0.0 when the user asked for
+    # 10.0.0.0/24 would be worse than an error.
+    if "//" not in candidate and _CIDR_RE.match(candidate):
+        return candidate
+
+    # urlsplit only fills in .hostname when it sees an authority, so give a
+    # bare "example.com:8080" the "//" that marks one. Guarded on "//"
+    # rather than on a scheme because "example.com:8080" would otherwise
+    # parse as scheme "example.com".
+    probe = candidate if "//" in candidate else "//" + candidate
+    try:
+        host = urllib.parse.urlsplit(probe).hostname or ""
+    except ValueError:
+        # Malformed authority (e.g. an unclosed IPv6 bracket). Hand the
+        # original back and let validation produce the error.
+        return candidate
+
+    # A trailing dot is legal DNS (the root anchor) but breaks the hostname
+    # regex and several tools' URL builders.
+    return (host or candidate).rstrip(".")
 
 
 # Short, plain-language gloss per profile for the --help table. Deliberately
@@ -142,7 +211,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "target", nargs="?", default=None,
         metavar="target",
-        help="hostname or IP to scan — leave it out and you'll be asked for one",
+        help="hostname, IP or URL to scan (a URL is reduced to its host) — "
+             "leave it out and you'll be asked for one",
     )
     parser.add_argument(
         "--profile",
@@ -246,13 +316,18 @@ def _prompt_target() -> str:
     """
     while True:
         try:
-            candidate = Prompt.ask("[bold]Enter target (hostname/IP)[/bold]").strip()
+            candidate = Prompt.ask(
+                "[bold]Enter target (hostname, IP or URL)[/bold]"
+            ).strip()
         except (EOFError, KeyboardInterrupt):
             print_warning("No target provided — exiting.")
             sys.exit(130)
 
-        if is_valid_target(candidate):
-            return candidate
+        host = normalize_target(candidate)
+        if is_valid_target(host):
+            if host != candidate:
+                print_info(f"Scanning host '{host}' (from '{candidate}').")
+            return host
 
         print_error(
             f"'{candidate}' is not a valid hostname or IP address — "
@@ -327,13 +402,27 @@ def _run_multi_target(args, targets) -> int:
     if args.profile is None:
         args.profile = "quickscan"
 
+    # Normalise first, then validate, so a target list pasted out of a
+    # browser or a spreadsheet full of URLs is usable as-is. Normalising can
+    # collapse two entries onto one host (http:// and https:// of the same
+    # site), so de-duplicate again afterwards — parse_targets already did it
+    # once, on the raw strings.
+    normalized, seen = [], set()
     for target in targets:
-        if not is_valid_target(target):
+        host = normalize_target(target)
+        if not is_valid_target(host):
             print_error(
                 f"'{target}' in --targets is not a valid hostname or IP address "
                 "— fix or remove it and re-run. Nothing has been scanned."
             )
             return 1
+        if host not in seen:
+            seen.add(host)
+            normalized.append(host)
+
+    if normalized != targets:
+        print_info(f"Scanning {len(normalized)} host(s): {', '.join(normalized)}")
+    targets = normalized
 
     try:
         init_db()
@@ -405,6 +494,14 @@ def main() -> int:
 
     if interactive:
         args.target = _prompt_target()
+    else:
+        # A URL pasted on the command line is normalised to its host, and
+        # the substitution is announced so the report header ("Target: ...")
+        # is never a surprise. The interactive path does its own echo.
+        host = normalize_target(args.target)
+        if host and host != args.target:
+            print_info(f"Scanning host '{host}' (from '{args.target}').")
+        args.target = host
 
     if not is_valid_target(args.target):
         print_error(
