@@ -1,5 +1,5 @@
 # Aegis Scanner
-Kali Linux vulnerability assessment framework — Cyber404 Academy 2026.
+Kali Linux vulnerability assessment framework — 
 
 ## Setup
 ```bash

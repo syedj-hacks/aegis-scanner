@@ -1,0 +1,719 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aegis Scanner — Project Presentation</title>
+<style>
+  :root{
+    --bg:#0d1117; --bg2:#161b22; --panel:#1c2430; --ink:#e6edf3;
+    --muted:#8b949e; --accent:#58a6ff; --accent2:#3fb950; --warn:#d29922;
+    --crit:#f85149; --border:#30363d; --code:#0b0f14;
+    --mono:"SF Mono",ui-monospace,"Cascadia Code",Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{background:var(--bg);color:var(--ink);font-family:var(--sans);overflow:hidden}
+
+  .deck{height:100vh;width:100vw;position:relative}
+  .slide{
+    position:absolute;inset:0;display:none;flex-direction:column;
+    padding:4.5vh 6vw 8vh;overflow:auto;
+  }
+  .slide.active{display:flex;animation:fade .35s ease}
+  @keyframes fade{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+
+  h1{font-size:clamp(28px,5vw,58px);line-height:1.08;letter-spacing:-.5px}
+  h2{font-size:clamp(22px,3.4vw,40px);color:var(--accent);margin-bottom:.6em;letter-spacing:-.3px;
+     border-bottom:1px solid var(--border);padding-bottom:.3em}
+  h3{font-size:clamp(16px,2vw,22px);color:var(--accent2);margin:.8em 0 .3em}
+  p,li{font-size:clamp(14px,1.7vw,21px);line-height:1.5;color:var(--ink)}
+  ul,ol{margin-left:1.3em}
+  li{margin:.35em 0}
+  li::marker{color:var(--accent)}
+  .muted{color:var(--muted)}
+  .accent{color:var(--accent)}
+  .kicker{color:var(--accent);font-family:var(--mono);font-size:clamp(12px,1.4vw,16px);
+          text-transform:uppercase;letter-spacing:3px;margin-bottom:1em}
+  strong{color:#fff}
+
+  .center{justify-content:center;align-items:flex-start}
+  .cols{display:grid;grid-template-columns:1fr 1fr;gap:2.2em;align-items:start}
+  .cols3{display:grid;grid-template-columns:repeat(3,1fr);gap:1.4em}
+  .fill{flex:1}
+
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;
+        padding:1.1em 1.3em;height:100%}
+  .card h3{margin-top:0}
+
+  code,pre{font-family:var(--mono)}
+  pre{background:var(--code);border:1px solid var(--border);border-radius:10px;
+      padding:1em 1.2em;overflow:auto;font-size:clamp(11px,1.35vw,16px);line-height:1.5}
+  pre .c{color:#8b949e}      /* comment */
+  pre .k{color:#ff7b72}      /* keyword */
+  pre .s{color:#a5d6ff}      /* string  */
+  pre .f{color:#d2a8ff}      /* func    */
+  pre .n{color:#79c0ff}      /* name    */
+  .inline{background:var(--code);border:1px solid var(--border);border-radius:5px;
+          padding:.05em .4em;font-family:var(--mono);font-size:.9em;color:var(--accent)}
+
+  table{border-collapse:collapse;width:100%;font-size:clamp(12px,1.5vw,18px)}
+  th,td{border:1px solid var(--border);padding:.5em .7em;text-align:left;vertical-align:top}
+  th{background:var(--bg2);color:var(--accent)}
+  tr:nth-child(even) td{background:rgba(255,255,255,.02)}
+
+  /* screenshot placeholder */
+  .shot{border:2px dashed var(--warn);border-radius:12px;background:repeating-linear-gradient(
+        45deg,rgba(210,153,34,.05),rgba(210,153,34,.05) 12px,transparent 12px,transparent 24px);
+        display:flex;flex-direction:column;align-items:center;justify-content:center;
+        text-align:center;padding:1.5em;min-height:180px;color:var(--warn);gap:.4em}
+  .shot .ico{font-size:2em}
+  .shot .lbl{font-family:var(--mono);font-size:clamp(12px,1.5vw,17px);color:var(--warn)}
+  .shot .hint{color:var(--muted);font-size:.8em;max-width:80%}
+
+  .pipeline{display:flex;flex-wrap:wrap;gap:.5em;align-items:center;margin:.6em 0}
+  .stage{background:var(--panel);border:1px solid var(--border);border-radius:8px;
+         padding:.5em .9em;font-family:var(--mono);font-size:clamp(11px,1.4vw,16px)}
+  .arrow{color:var(--accent);font-size:1.3em}
+
+  .pill{display:inline-block;background:var(--bg2);border:1px solid var(--border);
+        border-radius:999px;padding:.2em .8em;margin:.2em;font-family:var(--mono);
+        font-size:clamp(11px,1.3vw,15px);color:var(--accent)}
+  .tag-crit{color:var(--crit);border-color:var(--crit)}
+  .tag-warn{color:var(--warn);border-color:var(--warn)}
+  .tag-ok{color:var(--accent2);border-color:var(--accent2)}
+
+  /* chrome */
+  .nav{position:fixed;bottom:14px;right:22px;display:flex;gap:10px;align-items:center;z-index:20}
+  .nav button{background:var(--panel);border:1px solid var(--border);color:var(--ink);
+              border-radius:8px;padding:.4em .8em;cursor:pointer;font-size:16px}
+  .nav button:hover{border-color:var(--accent)}
+  .counter{position:fixed;bottom:18px;left:22px;font-family:var(--mono);color:var(--muted);
+           font-size:14px;z-index:20}
+  .brand{position:fixed;top:16px;right:26px;font-family:var(--mono);color:var(--muted);
+         font-size:13px;letter-spacing:1px;z-index:20}
+  .progress{position:fixed;top:0;left:0;height:3px;background:var(--accent);z-index:30;transition:width .3s}
+
+  .big-num{font-size:clamp(30px,4vw,52px);color:var(--accent);font-family:var(--mono);font-weight:700}
+  .stat{ text-align:center}
+  .stat .lbl2{color:var(--muted);font-size:clamp(12px,1.4vw,16px)}
+
+  @media (max-width:820px){
+    .cols,.cols3{grid-template-columns:1fr}
+  }
+</style>
+</head>
+<body>
+<div class="brand">AEGIS SCANNER · Cyber404 Academy 2026</div>
+<div class="progress" id="prog"></div>
+<div class="deck" id="deck">
+
+  <!-- 1 TITLE -->
+  <section class="slide active center">
+    <div class="kicker">Cyber404 Academy · 2026</div>
+    <h1>Aegis Scanner</h1>
+    <p style="font-size:clamp(18px,2.6vw,30px);margin-top:.4em" class="muted">
+      A modular vulnerability-assessment framework for Kali Linux</p>
+    <div style="margin-top:2em">
+      <span class="pill">Python 3</span>
+      <span class="pill">SQLite</span>
+      <span class="pill">18+ security tools</span>
+      <span class="pill">5 scan profiles</span>
+      <span class="pill">TXT + PDF reports</span>
+    </div>
+    <p class="muted" style="margin-top:2.4em;font-size:clamp(13px,1.5vw,18px)">
+      Presented by <strong>[YOUR NAME]</strong> · Team project · <span class="inline">github.com/syedj-hacks/aegis-scanner</span></p>
+  </section>
+
+  <!-- 2 WHAT IS IT -->
+  <section class="slide">
+    <h2>What is Aegis Scanner?</h2>
+    <div class="cols">
+      <div>
+        <p>You give it a <strong>target</strong> (hostname or IP) and a <strong>profile</strong>.
+           It runs a full assessment pipeline and produces a report — with severity, CVEs, and
+           remediation advice.</p>
+        <h3>The key idea</h3>
+        <p>It is <strong>not</strong> a single scanner. It is an <span class="accent">orchestration
+           layer</span> that drives ~18 existing Kali tools, normalises their messy output into
+           one consistent shape, and enriches it.</p>
+        <ul>
+          <li>One command instead of 18</li>
+          <li>One consistent report instead of 18 output formats</li>
+          <li>Findings that carry CVE + severity + how to fix</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>The tools it drives</h3>
+        <p class="muted" style="font-size:.9em">Recon → Scan → Web → Exploit-check → Enrich</p>
+        <div>
+          <span class="pill">nmap</span><span class="pill">nikto</span><span class="pill">gobuster</span>
+          <span class="pill">dirb</span><span class="pill">whatweb</span><span class="pill">nuclei</span>
+          <span class="pill">sqlmap</span><span class="pill">hydra</span><span class="pill">wpscan</span>
+          <span class="pill">enum4linux</span><span class="pill">sslyze</span><span class="pill">testssl</span>
+          <span class="pill">OWASP ZAP</span><span class="pill">nslookup</span><span class="pill">subfinder</span>
+          <span class="pill">amass</span><span class="pill">theHarvester</span>
+        </div>
+        <h3>Plus our own engines</h3>
+        <p>NVD CVE lookup · severity grading · remediation advice</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3 THE PROBLEM -->
+  <section class="slide">
+    <h2>The problem we set out to solve</h2>
+    <div class="cols">
+      <div>
+        <h3>Doing an assessment by hand is painful</h3>
+        <ul>
+          <li>Every tool has its <strong>own syntax</strong> and its own output format</li>
+          <li>You run them one-by-one and copy-paste results together</li>
+          <li>A crashed tool or a Ctrl+C loses <strong>everything</strong></li>
+          <li>No single record of "what did we find on this host, and when?"</li>
+          <li>Raw output tells you <em>what</em> — not <em>how bad</em> or <em>how to fix it</em></li>
+        </ul>
+      </div>
+      <div>
+        <h3>What Aegis gives instead</h3>
+        <ul>
+          <li>One command, one profile, one report</li>
+          <li><strong>Never crashes</strong> — every tool failure degrades gracefully</li>
+          <li>Results saved <strong>incrementally</strong> to a database — an interrupt keeps what was already found</li>
+          <li>Findings graded (CRITICAL→LOW) and paired with remediation text</li>
+          <li>Every scan is history you can <strong>diff</strong> against later</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4 ARCHITECTURE PIPELINE -->
+  <section class="slide">
+    <h2>How a scan flows</h2>
+    <div class="pipeline">
+      <span class="stage">Target in</span><span class="arrow">→</span>
+      <span class="stage">Recon<br><span class="muted">DNS · subdomains · OSINT</span></span><span class="arrow">→</span>
+      <span class="stage">Port scan<br><span class="muted">nmap</span></span><span class="arrow">→</span>
+      <span class="stage">Web audit<br><span class="muted">nikto · gobuster · nuclei…</span></span>
+    </div>
+    <div class="pipeline">
+      <span class="arrow">↓</span>
+    </div>
+    <div class="pipeline">
+      <span class="stage">Injection checks<br><span class="muted">sqlmap · XSS</span></span><span class="arrow">→</span>
+      <span class="stage">Conditional exploit<br><span class="muted">hydra · wpscan · enum4linux</span></span><span class="arrow">→</span>
+      <span class="stage">Enrich<br><span class="muted">CVE · severity · fix</span></span><span class="arrow">→</span>
+      <span class="stage">Persist<br><span class="muted">SQLite</span></span><span class="arrow">→</span>
+      <span class="stage tag-ok">Report<br><span class="muted">TXT + PDF</span></span>
+    </div>
+    <p style="margin-top:1.4em">Each stage is one <strong>layer</strong> (a directory under
+      <span class="inline">modules/</span>). Every module takes a target, calls a real tool,
+      parses it into a small dict, and <strong>never raises</strong>. That one rule is why the
+      whole pipeline survives any single tool failing.</p>
+  </section>
+
+  <!-- 5 DIRECTORY STRUCTURE -->
+  <section class="slide">
+    <h2>Project structure</h2>
+    <div class="cols">
+      <div>
+<pre>
+aegis.py            <span class="c"># CLI entry point (argparse)</span>
+modules/
+  utils/            <span class="c"># logger, error_handler, config, display</span>
+  recon/            <span class="c"># dns, subdomain, osint</span>
+  scanning/         <span class="c"># port_scanner, service_detect, banner…</span>
+  web/              <span class="c"># nikto, gobuster, nuclei, sqlmap, zap…</span>
+  enrichment/       <span class="c"># cve_lookup, severity, remediation, cvss</span>
+  reporting/        <span class="c"># summary, report_txt, report_pdf, diff…</span>
+  profiles/         <span class="c"># one orchestrator per scan profile</span>
+database/
+  db.py             <span class="c"># SQLite CRUD + schema</span>
+  aegis.db          <span class="c"># the scan-history database</span>
+tests/              <span class="c"># assertion scripts + db_sweep gate</span>
+install.sh          <span class="c"># apt tools + venv + setup</span>
+</pre>
+      </div>
+      <div>
+        <h3>Organised by <span class="accent">layer / phase</span></h3>
+        <p>The team split the work by layer — each directory is one phase, owned end-to-end. Every
+          module in a phase follows the <strong>same shape</strong>:</p>
+        <ol>
+          <li>Take a target as input</li>
+          <li>Call a real tool via <span class="inline">run_tool()</span></li>
+          <li>Parse output → small predictable dict</li>
+          <li>Never raise — always return a result</li>
+        </ol>
+        <p class="muted" style="margin-top:.8em">17,000+ lines of Python across ~45 modules.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 6 PROFILES -->
+  <section class="slide">
+    <h2>The 5 scan profiles</h2>
+    <table>
+      <tr><th>Profile</th><th>What it does</th><th>Speed</th></tr>
+      <tr><td><strong>quickscan</strong> <span class="muted">(default)</span></td>
+          <td>DNS → fast top-port nmap → service detect → whatweb + high-severity nuclei</td><td class="tag-ok">Fast</td></tr>
+      <tr><td><strong>stealthscan</strong></td>
+          <td>Quiet <span class="inline">-T2</span> scan of a curated ~20-port list, minimal footprint</td><td class="tag-ok">Fast</td></tr>
+      <tr><td><strong>webaudit</strong></td>
+          <td>Headers + Nikto + gobuster + dirb + whatweb + sslyze + XSS pass + CVE lookup</td><td class="tag-warn">Medium</td></tr>
+      <tr><td><strong>deepscan</strong></td>
+          <td>Everything: recon + all 65535 ports + full web audit + ZAP + conditional sqlmap/hydra/wpscan/enum4linux + full enrichment</td><td class="tag-crit">Slowest</td></tr>
+      <tr><td><strong>compliance</strong></td>
+          <td>TLS ciphers + security-header nmap scripts + sslyze + whatweb — a compliance baseline</td><td class="tag-warn">Medium</td></tr>
+    </table>
+    <p style="margin-top:1.2em"><strong>Same engine, different scope.</strong> A profile is just a
+      list of which tools to run and how aggressively. All five write both a TXT and a PDF report.</p>
+  </section>
+
+  <!-- 7 CLI ENTRY -->
+  <section class="slide">
+    <h2>The entry point — <span class="inline">aegis.py</span></h2>
+    <div class="cols">
+      <div>
+        <p>Argparse CLI. Target and profile are both optional — a bare
+          <span class="inline">python3 aegis.py</span> drops into an interactive guided mode.</p>
+<pre>
+<span class="k">def</span> <span class="f">is_valid_target</span>(target: <span class="n">str</span>) -> <span class="n">bool</span>:
+    <span class="s">"""Hostname or IP, validated before we scan."""</span>
+    <span class="k">if</span> <span class="k">not</span> target <span class="k">or</span> len(target) > <span class="n">253</span>:
+        <span class="k">return</span> <span class="n">False</span>
+    <span class="k">try</span>:
+        ipaddress.ip_address(target)   <span class="c"># it's an IP</span>
+        <span class="k">return</span> <span class="n">True</span>
+    <span class="k">except</span> ValueError:
+        <span class="k">pass</span>
+    <span class="k">return</span> bool(_HOSTNAME_RE.match(target))
+</pre>
+      </div>
+      <div>
+        <h3>What it wires together</h3>
+        <ul>
+          <li><span class="inline">PROFILE_DISPATCH</span> — maps a profile name to its orchestrator function</li>
+          <li>Validates the target, then <span class="inline">init_db()</span></li>
+          <li>Dispatches, then prints a final summary panel with real tool counts</li>
+          <li>Flags: <span class="inline">--targets</span>, <span class="inline">--diff</span>,
+              <span class="inline">--auth-cookie</span>, <span class="inline">--non-interactive</span></li>
+        </ul>
+        <div class="shot" style="margin-top:1em">
+          <div class="ico">📷</div>
+          <div class="lbl">[ SCREENSHOT: aegis.py running a live scan ]</div>
+          <div class="hint">Terminal capture of the banner + "Scan Configuration" panel</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 8 GOLDEN RULE -->
+  <section class="slide">
+    <h2>The one rule that holds it together</h2>
+    <p style="font-size:clamp(16px,2.1vw,26px)"><strong>No module ever calls <span class="inline">subprocess</span>
+       directly.</strong> Every external tool goes through one gateway: <span class="inline">run_tool()</span>.</p>
+    <div class="cols" style="margin-top:.6em">
+      <div>
+<pre>
+<span class="c"># modules/utils/error_handler.py</span>
+<span class="k">def</span> <span class="f">run_tool</span>(target, tool_name, command, timeout=<span class="n">None</span>):
+    <span class="s">"""Run a CLI tool. Never raises.
+    Always returns a structured dict."""</span>
+    <span class="k">return</span> {
+      <span class="s">"tool"</span>: tool_name,
+      <span class="s">"success"</span>: ...,   <span class="c"># did it work?</span>
+      <span class="s">"skipped"</span>: ...,   <span class="c"># user pressed 's'?</span>
+      <span class="s">"returncode"</span>: ...,
+      <span class="s">"stdout"</span>: ..., <span class="s">"stderr"</span>: ...,
+      <span class="s">"error"</span>: ...,     <span class="c"># human-readable reason</span>
+      <span class="s">"duration"</span>: ...,
+    }
+</pre>
+      </div>
+      <div>
+        <h3>Why it matters</h3>
+        <ul>
+          <li>One place handles <strong>timeouts</strong>, the <strong>skip key</strong>, and <strong>Ctrl+C</strong> — not 18 copies</li>
+          <li>Popen-based, so a hung tool can be <strong>killed mid-flight</strong> (SIGTERM → SIGKILL)</li>
+          <li>Pure-Python I/O (sockets, requests) uses the sibling <span class="inline">safe_call()</span></li>
+          <li>A missing binary, unreachable host, or timeout all become the <strong>same clean dict</strong> — never a stack trace</li>
+        </ul>
+        <p class="muted" style="margin-top:.6em">This is why "never raise, always degrade" is the
+          single most important convention in the codebase.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 9 RECON -->
+  <section class="slide">
+    <h2>Layer 1 — Recon <span class="muted">/modules/recon</span></h2>
+    <div class="cols3">
+      <div class="card"><h3>dns.py</h3><p>Resolves the target — IPs, records. The foundation every later step builds on.</p></div>
+      <div class="card"><h3>subdomain.py</h3><p>Enumerates subdomains (subfinder / amass) to widen the attack surface.</p></div>
+      <div class="card"><h3>osint.py</h3><p>Harvests public intel — certificate-transparency hosts, emails (theHarvester / crt.sh).</p></div>
+    </div>
+    <p style="margin-top:1.4em">Recon answers <em>"what does this target actually expose?"</em> before
+      we spend time scanning. Only <span class="inline">deepscan</span> runs the full recon set; lighter
+      profiles just resolve DNS.</p>
+    <div class="shot" style="margin-top:1em">
+      <div class="ico">📷</div>
+      <div class="lbl">[ SCREENSHOT: modules/recon/dns.py — resolve_dns() ]</div>
+      <div class="hint">Show the function signature and the returned dict shape</div>
+    </div>
+  </section>
+
+  <!-- 10 SCANNING -->
+  <section class="slide">
+    <h2>Layer 2 — Scanning <span class="muted">/modules/scanning</span></h2>
+    <div class="cols">
+      <div>
+        <h3>port_scanner.py</h3>
+        <p>Drives nmap. A full 65535-port sweep (<span class="inline">-p-</span>) is transparently
+          split into <strong>32 sequential chunks</strong>.</p>
+        <p class="muted">Why? A killed nmap doesn't reliably flush partial results — so a chunk
+          boundary becomes the real recovery unit. A slow, filtered target still yields <em>partial
+          real</em> results instead of every scan timing out.</p>
+        <h3>service_detect.py</h3>
+        <p>The targeted <span class="inline">nmap -sV -sC</span> pass — versions + default NSE scripts.
+          This is where script findings come from.</p>
+      </div>
+      <div>
+        <h3>banner.py</h3>
+        <p>Grabs service banners on non-web ports (a web server sends no unsolicited banner).</p>
+        <h3>hydra_wrap.py</h3>
+        <p>Credential brute-force check — fires <strong>only</strong> when a login service is detected.</p>
+        <h3>enum4linux_wrap.py</h3>
+        <p>SMB enumeration — shares, users, OS info — when port 445 is open.</p>
+        <div class="shot" style="margin-top:.8em">
+          <div class="ico">📷</div>
+          <div class="lbl">[ SCREENSHOT: nmap port-scan output in a report ]</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 11 WEB -->
+  <section class="slide">
+    <h2>Layer 3 — Web audit <span class="muted">/modules/web</span></h2>
+    <p>The biggest layer — 12 wrappers. Each takes a web port and returns a normalised findings list.</p>
+    <div class="cols3">
+      <div class="card"><h3>Discovery</h3>
+        <p><span class="inline">gobuster</span> · <span class="inline">dirb</span> — hidden paths<br>
+           <span class="inline">whatweb</span> — tech fingerprint<br>
+           <span class="inline">header_check</span> — security headers</p></div>
+      <div class="card"><h3>Vulnerability</h3>
+        <p><span class="inline">nikto</span> — misconfig scan<br>
+           <span class="inline">nuclei</span> — template engine<br>
+           <span class="inline">ZAP</span> — driven via its own daemon API</p></div>
+      <div class="card"><h3>Injection & scripting</h3>
+        <p><span class="inline">sqlmap</span> — read-only SQLi enum<br>
+           <span class="inline">xss_wrap</span> — nuclei DAST, XSS tag<br>
+           <span class="inline">sslyze/testssl</span> — TLS · <span class="inline">wpscan</span> — WordPress</p></div>
+    </div>
+    <h3 style="margin-top:1em">Two things worth calling out</h3>
+    <ul>
+      <li><strong>sqlmap is metadata-only</strong> — <span class="inline">--banner --current-db --dbs</span>, never
+          <span class="inline">--dump</span>/<span class="inline">--os-shell</span>. We prove the injection without exfiltrating data.</li>
+      <li><strong>ZAP was rewritten</strong> — Kali's apt package doesn't ship <span class="inline">zap-baseline.py</span>,
+          so we start ZAP's daemon and drive it over its REST API.</li>
+    </ul>
+  </section>
+
+  <!-- 12 ENRICHMENT -->
+  <section class="slide">
+    <h2>Layer 4 — Enrichment <span class="muted">/modules/enrichment</span></h2>
+    <p>This is where raw tool output becomes an <strong>actionable finding</strong>. It's what makes
+       Aegis more than a wrapper script.</p>
+    <div class="cols">
+      <div>
+        <h3>cve_lookup.py</h3>
+        <p>Takes a <span class="inline">Server: Apache/2.4.7</span> banner, splits it into product +
+           version, queries <strong>NVD</strong>, and returns matching CVEs.</p>
+        <p class="muted">Two hard-won filters: <br>
+          1) <em>product disambiguation</em> — a bare "Apache" banner won't match a Groovy RCE.<br>
+          2) <em>version-range filtering</em> — a CVE fixed "before 10.3" is dropped for a host on 10.3.<br>
+          Rule: <strong>"cannot verify" never means "drop"</strong> — it over-reports before it hides.</p>
+      </div>
+      <div>
+        <h3>severity.py</h3>
+        <p>Grades every finding CRITICAL → HIGH → MEDIUM → LOW, preferring a real CVSS score,
+           falling back to keyword heuristics (<strong>word-boundary</strong> matching, so "rce"
+           doesn't match inside "brute-fo<u>rce</u>").</p>
+        <h3>remediation.py</h3>
+        <p>Attaches a plain-language <strong>"how to fix this"</strong> line to each finding.</p>
+        <h3>cvss.py</h3>
+        <p>The scoring engine behind severity grading.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 13 REPORTING -->
+  <section class="slide">
+    <h2>Layer 5 — Reporting <span class="muted">/modules/reporting</span></h2>
+    <div class="cols">
+      <div>
+        <ul>
+          <li><span class="inline">summary.py</span> — the <strong>shared vocabulary</strong> both report
+              writers read from, so TXT and PDF can never describe the same row differently</li>
+          <li><span class="inline">report_txt.py</span> — the plain-text report</li>
+          <li><span class="inline">report_pdf.py</span> — WeasyPrint PDF, with a severity-donut cover
+              drawn as inline SVG (no external assets, no network)</li>
+          <li><span class="inline">retention.py</span> — reports named per-scan and capped, so a new
+              scan never silently overwrites an old one</li>
+          <li><span class="inline">diff.py</span> — compare two scans: what's <span class="tag-crit">new</span>,
+              <span class="tag-ok">fixed</span>, unchanged</li>
+          <li><span class="inline">attribution.py</span> — the audit layer (next slide)</li>
+        </ul>
+      </div>
+      <div class="shot">
+        <div class="ico">📄</div>
+        <div class="lbl">[ SCREENSHOT: a generated PDF report cover ]</div>
+        <div class="hint">output/&lt;target&gt;/report_deepscan_*.pdf — show the severity donut + findings table</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 14 DATABASE -->
+  <section class="slide">
+    <h2>The database — <span class="inline">aegis.db</span></h2>
+    <div class="cols">
+      <div>
+        <p>A single SQLite file that <strong>persists scan history across clones</strong>. Three tables:</p>
+<pre>
+<span class="k">CREATE TABLE</span> scans (          <span class="c">-- one row per run</span>
+  id, target, timestamp, profile);
+
+<span class="k">CREATE TABLE</span> findings (       <span class="c">-- what was found</span>
+  scan_id, port, service, version,
+  cve_id, cvss, severity,
+  description, remediation, finding_type,
+  parameter, payload, evidence, endpoint,
+  reference);
+
+<span class="k">CREATE TABLE</span> scan_tools_run ( <span class="c">-- which tools ran</span>
+  scan_id, tool_name, port, outcome);
+</pre>
+      </div>
+      <div>
+        <h3>Design choices</h3>
+        <ul>
+          <li>Findings are written <strong>incrementally</strong> — an interrupt keeps what was already found</li>
+          <li>Schema migrates <strong>idempotently</strong> on every start (add-column-if-missing)</li>
+          <li><span class="inline">scan_tools_run</span> records every tool's outcome so we can later
+              audit: <em>"did the tool this finding is credited to actually run?"</em></li>
+        </ul>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6em;margin-top:1em">
+          <div class="stat card"><div class="big-num">208</div><div class="lbl2">scans recorded</div></div>
+          <div class="stat card"><div class="big-num">8.9k</div><div class="lbl2">findings stored</div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 15 RELIABILITY -->
+  <section class="slide">
+    <h2>Reliability engineering</h2>
+    <p>A scanner that crashes on a bad target is useless. Three ways a long tool can end early — all
+       handled in one place:</p>
+    <div class="cols3">
+      <div class="card"><h3>⏱ Timeout</h3><p>Each tool has a budget. SIGTERM (let nmap flush a
+          partial result) then SIGKILL if it ignores us.</p></div>
+      <div class="card"><h3>⌨ Skip key</h3><p>Press <span class="inline">s</span> to kill just the
+          current tool and move on. Compulsory tools (nmap, DNS) refuse the skip.</p></div>
+      <div class="card"><h3>✋ Ctrl+C</h3><p>Once = skip current tool. Twice within 2s = deliberately
+          abort the whole scan.</p></div>
+    </div>
+    <h3 style="margin-top:1em">Plus a profile-level wall-clock budget</h3>
+    <p><span class="inline">webaudit</span> caps its per-port loop at 30 min, <span class="inline">deepscan</span>
+       at 1 hour. When the budget runs out it stops starting new work and finishes with the
+       <strong>partial-but-real</strong> findings it already has.</p>
+  </section>
+
+  <!-- 16 ATTRIBUTION / TRUST -->
+  <section class="slide">
+    <h2>Making the output <em>trustworthy</em></h2>
+    <p>Making a scan <em>work</em> and making its output <em>believable</em> turned out to be two
+       different problems. A report is only useful if you can trust every line.</p>
+    <div class="cols">
+      <div>
+        <h3>Every finding says who found it — and we check it</h3>
+        <p>A finding is credited to the tool that <strong>produced</strong> it. An automated audit
+           (<span class="inline">attribution.py</span> + <span class="inline">db_sweep.py</span>) re-renders
+           <strong>every scan in the database</strong> and verifies the credited tool actually ran.</p>
+      </div>
+      <div>
+        <h3>A blank cell is never ambiguous</h3>
+        <p>The report distinguishes <em>"not applicable to this kind of finding"</em> from
+           <em>"a tool should have filled this in and didn't."</em> An empty CVE column on a TLS
+           finding is expected; an empty one on a service finding is a gap.</p>
+      </div>
+    </div>
+    <p class="muted" style="margin-top:1em">This caught a real regression where a stealthscan
+       open-port finding was told to "review this nikto finding" — naming a tool that never ran.</p>
+  </section>
+
+  <!-- 17 COMMERCIAL UPGRADE -->
+  <section class="slide">
+    <h2>Beyond the basics — the "commercial" features</h2>
+    <div class="cols">
+      <div>
+        <ul>
+          <li><strong>Parallelism</strong> — web tools and nmap chunks run concurrently; multiple
+              targets scanned at once (proven lossless)</li>
+          <li><strong>Authenticated scanning</strong> — <span class="inline">--auth-cookie</span> /
+              <span class="inline">--auth-header</span> to scan behind a login</li>
+          <li><strong>Multi-target</strong> — <span class="inline">--targets a.com,b.com</span> or a file,
+              each with its own output dir</li>
+        </ul>
+      </div>
+      <div>
+        <ul>
+          <li><strong>Scan diffing</strong> — <span class="inline">--diff 41 57</span> shows what changed
+              between two runs (perfect for re-tests)</li>
+          <li><strong>CVSS scoring engine</strong> + <strong>compliance mapping</strong></li>
+          <li><strong>Rate limiting</strong> — per-profile throttles so we stay polite / stealthy</li>
+          <li><strong>ZAP in Docker</strong> — a reproducible container for the heavy scanner</li>
+        </ul>
+      </div>
+    </div>
+    <p class="muted" style="margin-top:1em">All shipped on the <span class="inline">feature/commercial-upgrade</span>
+       branch with 549 test assertions.</p>
+  </section>
+
+  <!-- 18 TESTING -->
+  <section class="slide">
+    <h2>How we know it works</h2>
+    <div class="cols">
+      <div>
+        <h3>Automated gate</h3>
+        <ul>
+          <li><span class="inline">tests/db_sweep.py</span> — renders <strong>every</strong> scan and checks
+              4 defect classes: crashes, ambiguous cells, duplicate lines, attribution. Exits 0 only
+              when all pass.</li>
+          <li><span class="inline">tests/t_phase*.py</span> — stdlib assertion scripts, one per work pass</li>
+          <li><span class="inline">tests/fixtures/</span> — real captured tool output, so parser changes
+              are tested against what tools <em>actually</em> print</li>
+          <li><span class="inline">t_pty.py</span> — the skip-key / Ctrl+C paths under a real terminal</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Live verification</h3>
+        <p>A local Docker lab (<span class="inline">test-targets/</span>) of intentionally vulnerable
+           services — a real WordPress install, an SMB host, a SQLi app — was used to fire the
+           conditional tools with <strong>real evidence</strong>.</p>
+        <p>Each verification pass is written up in <span class="inline">smoke_test/</span>, ending with
+           an explicit "what's still open" list the next pass opens with.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 19 DEMO -->
+  <section class="slide center">
+    <div class="kicker">Live demo</div>
+    <h1>Let's run it</h1>
+    <div style="margin-top:1.4em;width:100%">
+<pre>
+$ python3 aegis.py scanme.nmap.org --profile quickscan
+$ python3 aegis.py 192.168.56.101 --profile deepscan
+$ python3 aegis.py --diff 41 57            <span class="c"># compare two scans</span>
+</pre>
+    </div>
+    <div class="shot" style="margin-top:1.4em;width:100%">
+      <div class="ico">🎬</div>
+      <div class="lbl">[ SCREENSHOT / SCREEN-RECORDING: a full scan + the generated report ]</div>
+      <div class="hint">Show the progress bars, the final summary panel, and open the PDF</div>
+    </div>
+  </section>
+
+  <!-- 20 CHALLENGES -->
+  <section class="slide">
+    <h2>Hard problems we hit (and solved)</h2>
+    <table>
+      <tr><th>Problem</th><th>Fix</th></tr>
+      <tr><td>A killed nmap doesn't flush partial results on a slow target → every scan timed out</td>
+          <td>Split full-port sweeps into 32 chunks; a chunk boundary is the recovery unit</td></tr>
+      <tr><td>Kali's ZAP package doesn't ship the baseline script</td>
+          <td>Rewrote the wrapper to drive ZAP's own daemon over its REST API</td></tr>
+      <tr><td>A bare "Apache" banner returned an unrelated Apache Groovy RCE</td>
+          <td>Product disambiguation + CPE allowlist in CVE lookup</td></tr>
+      <tr><td>CVEs "fixed before 10.3" reported against a host on 10.3</td>
+          <td>A CVE is dropped only when definitively outside every vulnerable version range</td></tr>
+      <tr><td>A user skip was miscounted as a tool <em>failure</em> in every profile</td>
+          <td>Every wrapper now threads the <span class="inline">skipped</span> flag through</td></tr>
+      <tr><td>Reports silently overwrote each other</td>
+          <td>Per-scan filenames, history capped per profile+target</td></tr>
+    </table>
+  </section>
+
+  <!-- 21 FUTURE -->
+  <section class="slide">
+    <h2>Limits & future work</h2>
+    <div class="cols">
+      <div>
+        <h3>Known, intentional limits</h3>
+        <ul>
+          <li><span class="inline">deepscan</span>'s full-port phase has wide, target-dependent runtime — not a 2-minute demo</li>
+          <li>Conditional tools only fire when their trigger is met (WordPress, SMB, a SQLi param)</li>
+          <li>ZAP isn't reliably interruptible mid-scan — a property of ZAP itself</li>
+          <li>CVE lookup <em>over-reports</em> by design rather than risk hiding a real one</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Where it could go next</h3>
+        <ul>
+          <li>A web dashboard over the SQLite history</li>
+          <li>Scheduled recurring scans + alerting on new findings (diff-driven)</li>
+          <li>More authenticated-scan flows (OAuth, form login)</li>
+          <li>Export to SARIF / ticketing integrations</li>
+          <li>Plugin API so new tools are drop-in wrappers</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- 22 CONCLUSION -->
+  <section class="slide center">
+    <div class="kicker">In summary</div>
+    <h1>One target in.<br>One trustworthy report out.</h1>
+    <ul style="margin-top:1.2em;font-size:clamp(15px,1.9vw,23px)">
+      <li>An <strong>orchestration layer</strong> over 18 Kali tools + our own enrichment</li>
+      <li>Built to <strong>never crash</strong> and to <strong>never lose</strong> a finding</li>
+      <li>Output you can <strong>trust</strong> — every finding audited to its source</li>
+      <li>5 profiles, 45 modules, a live-verified Docker lab, and a test gate</li>
+    </ul>
+    <p style="margin-top:2em;font-size:clamp(18px,2.4vw,28px)" class="accent">Thank you — questions?</p>
+    <p class="muted" style="margin-top:.4em">[YOUR NAME] · Cyber404 Academy 2026</p>
+  </section>
+
+</div>
+
+<div class="counter"><span id="cur">1</span> / <span id="tot">22</span></div>
+<div class="nav">
+  <button id="prev" title="Previous (←)">◀</button>
+  <button id="next" title="Next (→)">▶</button>
+</div>
+
+<script>
+  const slides=[...document.querySelectorAll('.slide')];
+  let i=0; const tot=slides.length;
+  document.getElementById('tot').textContent=tot;
+  function show(n){
+    i=Math.max(0,Math.min(tot-1,n));
+    slides.forEach((s,x)=>s.classList.toggle('active',x===i));
+    document.getElementById('cur').textContent=i+1;
+    document.getElementById('prog').style.width=((i+1)/tot*100)+'%';
+  }
+  document.getElementById('next').onclick=()=>show(i+1);
+  document.getElementById('prev').onclick=()=>show(i-1);
+  document.addEventListener('keydown',e=>{
+    if(['ArrowRight','PageDown',' '].includes(e.key)){show(i+1);e.preventDefault();}
+    else if(['ArrowLeft','PageUp'].includes(e.key)){show(i-1);e.preventDefault();}
+    else if(e.key==='Home'){show(0);}
+    else if(e.key==='End'){show(tot-1);}
+    else if(e.key==='f'){document.documentElement.requestFullscreen?.();}
+  });
+  show(0);
+</script>
+</body>
+</html>
