@@ -187,6 +187,14 @@ FINDING_TYPE_TOOL = {
     "nmap_script": "nmap NSE",
     "nuclei_finding": "nuclei",
     "open_port": "nmap",
+    # The recon mapper's three types. recon_subdomain names several tools
+    # because it genuinely has several producers — crt.sh, subfinder/amass
+    # and theHarvester all find subdomains and the profile merges them —
+    # and the finding's own text names the specific source(s) that found
+    # that particular name.
+    "recon_bucket": "cloud_enum",
+    "recon_leak": "HIBP",
+    "recon_subdomain": "crt.sh/subfinder/amass",
     "service_version": "nmap -sV",
     "smb_share": "enum4linux",
     "smb_user": "enum4linux",

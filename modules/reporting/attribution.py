@@ -99,6 +99,13 @@ FINDING_TYPE_PRODUCERS = {
     "nmap_script": {"nmap"},
     "nuclei_finding": {"nuclei"},
     "open_port": {"nmap"},
+    # Recon mapper. recon_subdomain has four legitimate producers because
+    # the recon profile merges all four sources into one deduplicated list
+    # — a name found only by crt.sh is credited to crt.sh, and a scan where
+    # amass was the only one that ran still attributes correctly.
+    "recon_bucket": {"cloud_enum"},
+    "recon_leak": {"hibp"},
+    "recon_subdomain": {"crtsh", "subfinder", "amass", "theharvester"},
     "service_version": {"nmap"},
     "smb_share": {"enum4linux"},
     "smb_user": {"enum4linux"},
@@ -128,7 +135,17 @@ FINDING_TYPE_PRODUCERS = {
 # every _WIRED_TOOLS entry appears here, so the two cannot silently diverge.
 PROFILE_PRODUCERS = {
     "quickscan": {"nmap", "whatweb", "nuclei"},
-    "stealthscan": {"nmap"},
+    # whatweb, but deliberately not nuclei: stealthscan runs one whatweb
+    # fingerprint and stops there, because nuclei would cost this profile
+    # the quietness that is its entire reason to exist. See
+    # modules/profiles/stealth.py.
+    "stealthscan": {"nmap", "whatweb"},
+    # The recon mapper. subfinder/amass/theharvester appear here — unlike in
+    # every other profile, where they are NON_FINDING_TOOLS — because this
+    # profile is the one that turns their output into persisted
+    # recon_subdomain rows instead of log lines. Same tools, genuinely
+    # different role.
+    "recon": {"crtsh", "subfinder", "amass", "theharvester", "cloud_enum", "hibp"},
     "compliance": {"nmap", "sslyze", "testssl", "whatweb"},
     "webaudit": {
         "nmap", "nikto", "gobuster", "dirb", "whatweb", "sslyze",
@@ -161,9 +178,16 @@ NON_FINDING_TOOLS = {"nslookup", "subfinder", "amass", "theharvester"}
 #     nuclei invocation ran.
 # Normalised when building a scan's ran-set so those findings are credited to
 # the right producer whichever wrapper-named step actually ran.
+#   - modules/recon/subdomain.py drives subfinder AND amass under one
+#     wrapper and reports itself as "subdomain_enum", so its record names a
+#     tool that is not a producer of anything. It maps to BOTH producers:
+#     the wrapper's merged output genuinely came from whichever of the two
+#     succeeded, and crediting only one of them would be a guess.
+# An alias value may therefore be a single producer name or a set of them.
 _PRODUCER_ALIASES = {
     "nmap_service_detect": "nmap",
     "nuclei-xss": "nuclei",
+    "subdomain_enum": {"subfinder", "amass"},
 }
 
 # Producers that never flow through tool_results and so can never be recorded
@@ -228,12 +252,25 @@ def ran_producer_set(records: list, profile: str) -> set:
     via _PRODUCER_ALIASES, and the in-process producers that never appear in
     tool_results (UNTRACKED_PRODUCERS, i.e. nvd) are added when the scan's
     profile does that enrichment — see the module docstring.
+
+    Tool names are lowercased before matching. Wrappers stamp their own
+    spelling and the producer names here are lowercase, so "theHarvester"
+    (the binary's actual capitalisation, and what osint.py records) did not
+    match producer "theharvester" — the finding it produced was reported as
+    credited to a tool that never ran. That was latent until the recon
+    profile made theharvester a real producer of a persisted finding type
+    rather than one of the NON_FINDING_TOOLS.
     """
-    ran = {
-        _PRODUCER_ALIASES.get(r["tool_name"], r["tool_name"])
-        for r in (records or [])
-        if r.get("outcome") == "ran"
-    }
+    ran = set()
+    for record in records or []:
+        if record.get("outcome") != "ran":
+            continue
+        name = str(record.get("tool_name") or "").strip().lower()
+        if not name:
+            continue
+        alias = _PRODUCER_ALIASES.get(name, name)
+        # A wrapper that drives several tools maps to several producers.
+        ran |= {alias} if isinstance(alias, str) else set(alias)
     prof = profile_producers(profile) or set()
     ran |= (prof & UNTRACKED_PRODUCERS)
     return ran

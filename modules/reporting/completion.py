@@ -19,6 +19,7 @@ answers the three questions someone actually has at the end of a run:
     | Notable: 2 CVEs, 7 ZAP alerts, 13 discovered paths
     | TXT: output/.../report_deepscan_scanme.nmap.org_115.txt
     | PDF: output/.../report_deepscan_scanme.nmap.org_115.pdf
+    | HTML: output/.../report.html
     +------------------------------------------------------------
 
 Paths are emitted as OSC 8 terminal hyperlinks over a file:// URI, so a
@@ -199,7 +200,8 @@ def file_link(path: str) -> str:
 
 
 def print_report_summary(target: str, profile: str, scan_id, summary: dict,
-                         txt_path: str = None, pdf_path: str = None) -> None:
+                         txt_path: str = None, pdf_path: str = None,
+                         html_path: str = None) -> None:
     """
     Render the end-of-scan REPORT GENERATED block.
 
@@ -209,10 +211,16 @@ def print_report_summary(target: str, profile: str, scan_id, summary: dict,
                counts and the finding list, so this never re-queries the
                database and never disagrees with the report it points at.
     txt_path,
-    pdf_path : what the writers returned. Either may be None if that
-               writer failed; the block says so explicitly rather than
-               omitting the line, because a missing report is exactly the
-               thing an operator needs told.
+    pdf_path,
+    html_path: what the writers returned. Any may be None if that writer
+               failed; the block says so explicitly rather than omitting
+               the line, because a missing report is exactly the thing an
+               operator needs told.
+
+               html_path is listed for the same reason it is generated: a
+               report nobody is told about is a report nobody opens, and
+               the HTML one is the only sortable, filterable view of the
+               findings.
 
     Never raises. This is the last thing a scan does; a formatting problem
     here must not turn a completed scan into a failed one.
@@ -240,7 +248,8 @@ def print_report_summary(target: str, profile: str, scan_id, summary: dict,
         if notable:
             lines.append(f"[bold]Notable:[/bold] {notable}")
 
-        for label, path in (("TXT", txt_path), ("PDF", pdf_path)):
+        for label, path in (("TXT", txt_path), ("PDF", pdf_path),
+                            ("HTML", html_path)):
             if path:
                 lines.append(f"[bold]{label}:[/bold] {file_link(path)}")
             else:
@@ -268,7 +277,8 @@ def print_report_summary(target: str, profile: str, scan_id, summary: dict,
         logger.info(
             f"[Report] scan {scan_id} ({profile}/{target}) complete: "
             f"{total} finding(s) [{breakdown or 'none'}]; "
-            f"txt={txt_path or 'FAILED'} pdf={pdf_path or 'FAILED'}"
+            f"txt={txt_path or 'FAILED'} pdf={pdf_path or 'FAILED'} "
+            f"html={html_path or 'FAILED'}"
         )
     except Exception as exc:
         logger.warning(f"[Report] could not render the completion summary: {exc}")

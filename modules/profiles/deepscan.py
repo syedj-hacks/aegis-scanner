@@ -50,11 +50,13 @@ from modules.utils.display import (
     scan_progress_bar, print_phase, print_warning, print_success, print_error, print_info,
 )
 from modules.utils.logger import log_scan_start, log_scan_end, log_tool_failure, get_logger
+from modules.reporting.dashboard_live import update_live_data
 from modules.profiles._common import (
     warn_unavailable_tools, GLOBAL_AVAILABLE_TOOLS,
     count_and_report_tool_failures, persist_tool_run, web_param_candidates,
     finalise_reports, run_web_tools, web_tool_concurrency,
     nuclei_description, nuclei_port, nuclei_service, named_description,
+    is_web_port as _is_web_port, is_https_port as _is_https_port,
 )
 from modules.utils.auth import load_auth, announce as announce_auth
 from modules.recon.dns import resolve_dns
@@ -88,11 +90,9 @@ PROFILE_NAME = "deepscan"
 # profiles' sets (Known Issue #8's residual gap).
 _AVAILABLE_TOOLS = GLOBAL_AVAILABLE_TOOLS
 
-# Ports/service-name hints used to decide which open ports are worth
-# running the web module against.
-_WEB_PORTS = (80, 443, 8080, 8443)
-_WEB_SERVICE_HINTS = ("http", "https", "ssl")
-_HTTPS_PORTS = (443, 8443)
+# The "is this a web port / does it speak TLS" predicates now come from
+# _common.py (imported above under their previous private names) — see the
+# note there. quickscan and stealthscan use the same two.
 
 # --- Lightweight param-probe (injectable_param_found producer) -----------
 # Neither gobuster nor dirb discovers query-string parameters — they only
@@ -131,20 +131,6 @@ _LOGIN_SERVICE_MAP = {
 # --- SMB detection (smb_service_found producer) ---------------------------
 # Added to give CONDITIONAL_TOOLS['enum4linux'] a real producer.
 _SMB_PORTS = (139, 445)
-
-
-def _is_web_port(port_entry: dict) -> bool:
-    port = port_entry.get("port")
-    service = str(port_entry.get("service") or "").lower()
-    if port in _WEB_PORTS:
-        return True
-    return any(hint in service for hint in _WEB_SERVICE_HINTS)
-
-
-def _is_https_port(port_entry: dict) -> bool:
-    port = port_entry.get("port")
-    service = str(port_entry.get("service") or "").lower()
-    return port in _HTTPS_PORTS or "ssl" in service or "https" in service
 
 
 def _score_and_remediate(findings: list) -> list:
@@ -732,11 +718,13 @@ def run_deepscan(target: str, non_interactive: bool = False, auth=None):
         )
 
     scan_id = insert_scan(target, PROFILE_NAME)
+    update_live_data(target, [], current_tool="recon (DNS, subdomains, OSINT)", progress_pct=5)
 
     tool_results = []
     findings = []
     gobuster_results = []
     dirb_results = []
+    whatweb_results = []
 
     # (cve_id, port) pairs already recorded, shared by BOTH of this
     # profile's CVE-enrichment paths — the service-detect lookup below and
@@ -803,6 +791,8 @@ def run_deepscan(target: str, non_interactive: bool = False, auth=None):
             f"nmap script {script['script_id']}: {script['output'][:300]}"
         ))]))
     insert_findings_bulk(scan_id, findings)
+    update_live_data(target, findings, current_tool="recon + service detection",
+                     progress_pct=35)
 
     # --- Web -----------------------------------------------------------
     print_phase("WEB")
@@ -885,6 +875,11 @@ def run_deepscan(target: str, non_interactive: bool = False, auth=None):
 
                 whatweb_result = by_tool["whatweb"]
                 tool_results.append(whatweb_result)
+                # Collected, not just consumed: whatweb's cms_detected is a
+                # second, independent producer of the WordPress signal that
+                # gates wpscan below, and it used to be dropped at the end of
+                # this loop iteration.
+                whatweb_results.append(whatweb_result)
                 port_findings.extend(_score_and_remediate(_findings_from_whatweb(whatweb_result)))
                 advance(f"WhatWeb :{port}")
 
@@ -906,6 +901,8 @@ def run_deepscan(target: str, non_interactive: bool = False, auth=None):
                 # phase — a later port timing out or the budget cutting in
                 # never costs an earlier port's findings.
                 insert_findings_bulk(scan_id, port_findings)
+                update_live_data(target, port_findings,
+                                 current_tool=f"web audit :{port}", progress_pct=70)
                 findings.extend(port_findings)
     else:
         print_info(f"[{PROFILE_NAME}] no web port found among open ports — skipping web module")
@@ -928,6 +925,8 @@ def run_deepscan(target: str, non_interactive: bool = False, auth=None):
                 advance(f"XSS {candidate_url}")
         xss_scored = _score_and_remediate(xss_findings)
         insert_findings_bulk(scan_id, xss_scored)
+        update_live_data(target, xss_scored, current_tool="nuclei DAST (XSS)",
+                         progress_pct=85)
         findings.extend(xss_scored)
     else:
         print_info(
@@ -936,12 +935,40 @@ def run_deepscan(target: str, non_interactive: bool = False, auth=None):
         )
 
     # --- Conditional tools ------------------------------------------
-    wordpress_port, wordpress_https = None, False
+    # Two independent producers of the WordPress signal, and they catch
+    # different sites. gobuster infers it from brute-forced paths, so it
+    # only fires on an installation that exposes /wp-admin, /wp-content or
+    # friends at guessable locations — miss those (a renamed content
+    # directory, a 403 on wp-admin, a wordlist without the right entries)
+    # and wpscan never ran on a WordPress site. whatweb reads the signal
+    # straight out of the response: generator meta tag, wp-* asset paths,
+    # cookies. Either is sufficient evidence to point wpscan at the host,
+    # so either triggers it.
+    #
+    # gobuster is checked first only because its result carries the port it
+    # found the paths on; whatweb's cms_detected is checked second and
+    # supplies its own port the same way.
+    wordpress_port, wordpress_https, wordpress_source = None, False, None
     for gobuster_result in gobuster_results:
         if gobuster_result.get("wordpress_fingerprinted"):
             wordpress_port = gobuster_result.get("port")
             wordpress_https = _is_https_port({"port": wordpress_port})
+            wordpress_source = "gobuster path fingerprint"
             break
+
+    if wordpress_port is None:
+        for whatweb_result in whatweb_results:
+            if str(whatweb_result.get("cms_detected") or "").strip().lower() == "wordpress":
+                wordpress_port = whatweb_result.get("port")
+                wordpress_https = _is_https_port({"port": wordpress_port})
+                wordpress_source = "whatweb CMS detection"
+                break
+
+    if wordpress_port is not None:
+        print_info(
+            f"[{PROFILE_NAME}] WordPress detected on port {wordpress_port} "
+            f"via {wordpress_source} — wpscan is applicable"
+        )
 
     injectable_candidates = _detect_injectable_candidates(
         gobuster_results, dirb_results,
@@ -970,6 +997,8 @@ def run_deepscan(target: str, non_interactive: bool = False, auth=None):
     # scanning-phase and per-port web findings above were already persisted
     # incrementally as soon as they existed, not held until this point.
     insert_findings_bulk(scan_id, conditional_scored)
+    update_live_data(target, conditional_scored,
+                     current_tool="conditional tools", progress_pct=95)
     findings.extend(conditional_scored)
 
     stats = {
@@ -987,7 +1016,7 @@ def run_deepscan(target: str, non_interactive: bool = False, auth=None):
     print_phase("REPORTING")
     # Writes both reports, prunes the capped history and prints the
     # end-of-scan REPORT GENERATED banner — see _common.finalise_reports().
-    txt_path, pdf_path = finalise_reports(
+    txt_path, pdf_path, html_path = finalise_reports(
         target, PROFILE_NAME, scan_id, non_interactive=non_interactive
     )
 
@@ -995,7 +1024,7 @@ def run_deepscan(target: str, non_interactive: bool = False, auth=None):
         f"[{PROFILE_NAME}] scan {scan_id} complete — {len(findings)} finding(s), "
         f"txt={txt_path}, pdf={pdf_path}"
     )
-    return scan_id, txt_path, pdf_path, stats
+    return scan_id, txt_path, pdf_path, html_path, stats
 
 
 if __name__ == "__main__":
@@ -1005,5 +1034,5 @@ if __name__ == "__main__":
         print_error("Usage: python -m modules.profiles.deepscan <target>")
         sys.exit(1)
 
-    sid, txt, pdf, _stats = run_deepscan(sys.argv[1])
+    sid, txt, pdf, _html, _stats = run_deepscan(sys.argv[1])
     print_success(f"Deepscan complete — scan_id={sid} txt={txt} pdf={pdf}")

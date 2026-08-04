@@ -23,6 +23,8 @@ from modules.utils.logger import log_tool_failure
 from modules.utils.display import print_info, print_warning, print_error
 from modules.reporting.report_txt import generate_txt_report
 from modules.reporting.report_pdf import generate_pdf_report
+from modules.reporting.report_html import generate_html_report
+from modules.reporting.dashboard_live import finalize_live_dashboard
 from modules.reporting.retention import retain_reports
 from modules.reporting.completion import print_report_summary
 from modules.reporting.summary import build_summary
@@ -46,6 +48,11 @@ GLOBAL_AVAILABLE_TOOLS = {
     "nslookup", "nmap", "nikto", "gobuster", "dirb", "whatweb", "nuclei",
     "sslyze", "testssl", "zaproxy", "banner_grab", "subfinder", "amass",
     "theharvester", "wpscan", "sqlmap", "hydra", "enum4linux",
+    # Recon mapper. crtsh and hibp are HTTP APIs rather than subprocesses,
+    # but they are wrapped, named, timed and failure-reported exactly like a
+    # binary is, so "does a wrapper exist for this" is the same question for
+    # them and they belong in the same set.
+    "crtsh", "cloud_enum", "hibp",
 }
 
 # --- Web-parameter candidate discovery (shared by XSS fuzzing) ------------
@@ -172,6 +179,52 @@ def web_param_candidates(gobuster_results, dirb_results,
             if len(candidates) >= max_candidates:
                 return candidates
     return candidates
+
+
+# --- Which open ports are worth pointing a web tool at --------------------
+# quickscan, deepscan and now stealthscan all have to answer "is this open
+# port a web port, and does it speak TLS". The three had byte-identical
+# private copies of this, which is one copy per profile of a rule that is
+# not per-profile — and the copies are exactly the kind that go stale
+# silently, since a profile whose copy is wrong still runs, just against the
+# wrong ports.
+_WEB_PORTS = (80, 443, 8080, 8443)
+_WEB_SERVICE_HINTS = ("http", "https", "ssl")
+_HTTPS_PORTS = (443, 8443)
+
+
+def is_web_port(port_entry: dict) -> bool:
+    """True if this scan_ports() entry is worth running a web tool against."""
+    port = port_entry.get("port")
+    service = str(port_entry.get("service") or "").lower()
+    if port in _WEB_PORTS:
+        return True
+    return any(hint in service for hint in _WEB_SERVICE_HINTS)
+
+
+def is_https_port(port_entry: dict) -> bool:
+    """True if this port should be addressed as https:// rather than http://."""
+    port = port_entry.get("port")
+    service = str(port_entry.get("service") or "").lower()
+    return port in _HTTPS_PORTS or "ssl" in service or "https" in service
+
+
+def findings_from_whatweb(whatweb_result: dict) -> list:
+    """
+    whatweb's technology list as finding dicts. Shared for the same reason
+    as the port predicates above: quickscan, stealthscan and deepscan each
+    need it and none of them needs its own version of it.
+    """
+    port = whatweb_result.get("port")
+    return [
+        {
+            "type": "technology_fingerprint", "port": port,
+            "name": tech["name"], "value": tech["value"],
+            "description": f"Technology fingerprinted: {tech['name']}"
+                            + (f" ({tech['value']})" if tech["value"] else ""),
+        }
+        for tech in whatweb_result.get("technologies") or []
+    ]
 
 
 # --- nuclei finding description ------------------------------------------
@@ -391,9 +444,15 @@ def web_tool_concurrency(profile: str) -> int:
 def finalise_reports(target: str, profile: str, scan_id,
                      non_interactive: bool = False):
     """
-    Write both reports for a finished scan, prune the history, and print
-    the end-of-scan banner. Returns (txt_path, pdf_path); either may be
-    None if that writer failed.
+    Write every report for a finished scan, prune the history, close out the
+    live dashboard, and print the end-of-scan banner. Returns
+    (txt_path, pdf_path, html_path); any of the three may be None if that
+    writer failed.
+
+    The HTML report is generated here, in the one place all six profiles
+    already funnel through, rather than being added to each of them
+    separately — six copies of "and now also write the HTML" is six places
+    for a profile to be forgotten when a seventh report format arrives.
 
     Every profile ends the same way, so the sequence lives here once rather
     than five times. The order matters and is deliberate:
@@ -416,10 +475,11 @@ def finalise_reports(target: str, profile: str, scan_id,
     """
     txt_path = generate_txt_report(scan_id)
     pdf_path = generate_pdf_report(scan_id)
+    html_path = generate_html_report(scan_id)
 
     try:
         retain_reports(
-            target, profile, [txt_path, pdf_path],
+            target, profile, [txt_path, pdf_path, html_path],
             scan_id=scan_id, non_interactive=non_interactive,
         )
     except Exception as exc:
@@ -434,12 +494,18 @@ def finalise_reports(target: str, profile: str, scan_id,
         summary = build_summary(scan_id, quiet=True)
         print_report_summary(
             target, profile, scan_id, summary,
-            txt_path=txt_path, pdf_path=pdf_path,
+            txt_path=txt_path, pdf_path=pdf_path, html_path=html_path,
         )
+        # Hand the live dashboard the database's own severity counts and
+        # switch it to "complete", so a browser left open on the live view
+        # ends showing the same numbers as the report rather than whatever
+        # the in-flight tally happened to reach. No-ops when no dashboard
+        # was started for this target, which is the usual case.
+        finalize_live_dashboard(target, summary)
     except Exception as exc:
         print_warning(f"[{profile}] could not print the report summary: {exc}")
 
-    return txt_path, pdf_path
+    return txt_path, pdf_path, html_path
 
 
 def count_and_report_tool_failures(target: str, tool_results: list) -> int:

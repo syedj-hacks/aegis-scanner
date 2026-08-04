@@ -43,6 +43,7 @@ from modules.enrichment.cve_lookup import lookup_cves_from_banner
 from modules.enrichment.severity import score_finding
 from modules.enrichment.remediation import get_remediation
 from database.db import insert_scan, insert_findings_bulk
+from modules.reporting.dashboard_live import update_live_data
 from modules.profiles._common import (
     warn_unavailable_tools, count_and_report_tool_failures, web_param_candidates,
     persist_tool_run, finalise_reports, run_web_tools, web_tool_concurrency,
@@ -306,6 +307,7 @@ def run_webaudit(target: str, non_interactive: bool = False, auth=None):
         )
 
     scan_id = insert_scan(target, PROFILE_NAME)
+    update_live_data(target, [], current_tool="nmap port scan", progress_pct=10)
 
     tool_results = []
     findings = []
@@ -334,7 +336,10 @@ def run_webaudit(target: str, non_interactive: bool = False, auth=None):
         if non_web_ports:
             banner_result = grab_banners(target, non_web_ports)
             tool_results.append(banner_result)
-            insert_findings_bulk(scan_id, _score_and_remediate(_findings_from_banners(banner_result)))
+            banner_findings = _score_and_remediate(_findings_from_banners(banner_result))
+            insert_findings_bulk(scan_id, banner_findings)
+            update_live_data(target, banner_findings,
+                             current_tool="banner grab", progress_pct=30)
         else:
             print_info(f"[{PROFILE_NAME}] all open ports are web ports — banner_grab skipped (nmap/headers already cover them)")
 
@@ -424,6 +429,8 @@ def run_webaudit(target: str, non_interactive: bool = False, auth=None):
                 # batched across the whole port loop — so a later port's
                 # interrupt/budget cutoff never costs this one's findings.
                 insert_findings_bulk(scan_id, port_findings)
+                update_live_data(target, port_findings,
+                                 current_tool=f"web audit :{port}", progress_pct=75)
                 findings.extend(port_findings)
 
         # --- XSS fuzzing (dedicated) ---------------------------------
@@ -442,6 +449,8 @@ def run_webaudit(target: str, non_interactive: bool = False, auth=None):
                     advance(f"XSS {candidate_url}")
             xss_scored = _score_and_remediate(xss_findings)
             insert_findings_bulk(scan_id, xss_scored)
+            update_live_data(target, xss_scored, current_tool="nuclei DAST (XSS)",
+                             progress_pct=92)
             findings.extend(xss_scored)
         else:
             print_info(
@@ -461,11 +470,11 @@ def run_webaudit(target: str, non_interactive: bool = False, auth=None):
 
     # Writes both reports, prunes the capped history and prints the
     # end-of-scan REPORT GENERATED banner — see _common.finalise_reports().
-    txt_path, pdf_path = finalise_reports(
+    txt_path, pdf_path, html_path = finalise_reports(
         target, PROFILE_NAME, scan_id, non_interactive=non_interactive
     )
     print_success(f"[{PROFILE_NAME}] scan {scan_id} complete — {len(findings)} finding(s)")
-    return scan_id, txt_path, pdf_path, stats
+    return scan_id, txt_path, pdf_path, html_path, stats
 
 
 if __name__ == "__main__":
@@ -475,5 +484,5 @@ if __name__ == "__main__":
         print_error("Usage: python -m modules.profiles.webaudit <target>")
         sys.exit(1)
 
-    sid, path, _stats = run_webaudit(sys.argv[1])
+    sid, path, _pdf, _html, _stats = run_webaudit(sys.argv[1])
     print_success(f"Webaudit complete — scan_id={sid} report={path}")

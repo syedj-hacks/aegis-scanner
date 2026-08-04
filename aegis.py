@@ -12,12 +12,14 @@ the primary error handling path.
 
 import argparse
 import ipaddress
+import os
 import re
 import sys
 import time
 import urllib.parse
 
-from rich.prompt import Prompt
+from rich.prompt import Prompt, Confirm
+from rich.table import Table
 
 from modules.utils.config import (
     PROFILES, get_profile, SKIP_KEY, get_rate_limits,
@@ -27,7 +29,7 @@ from modules.utils.auth import load_auth
 from modules.profiles._common import web_tool_concurrency
 from modules.profiles.multi_target import parse_targets
 from modules.utils.display import (
-    print_banner, print_panel, print_info, print_success,
+    console, print_banner, print_panel, print_info, print_success,
     print_warning, print_error, print_summary,
 )
 from database.db import init_db
@@ -38,6 +40,7 @@ from modules.profiles.stealth import run_stealthscan
 from modules.profiles.webaudit import run_webaudit
 from modules.profiles.deepscan import run_deepscan
 from modules.profiles.compliance import run_compliance
+from modules.profiles.recon import run_recon
 
 __version__ = "1.0.0"
 
@@ -49,6 +52,7 @@ PROFILE_DESCRIPTIONS = {
     "webaudit": "Web-focused audit — headers, Nikto, gobuster/dirb, whatweb, sslyze + CVE enrichment on web ports.",
     "deepscan": "Full assessment — recon, all ports, web audit, CVE/severity/remediation, TXT+PDF reports.",
     "compliance": "TLS cipher + HTTP header nmap scripts, sslyze and whatweb on TLS ports for a compliance-oriented baseline.",
+    "recon": "Passive attack-surface map — certificate transparency, subdomains, OSINT, cloud buckets, breach check. Never touches the target.",
 }
 
 PROFILE_DISPATCH = {
@@ -57,6 +61,7 @@ PROFILE_DISPATCH = {
     "webaudit": run_webaudit,
     "deepscan": run_deepscan,
     "compliance": run_compliance,
+    "recon": run_recon,
 }
 
 # RFC 1123 hostname: 1-63 char labels, alnum/hyphen, no leading/trailing
@@ -158,11 +163,15 @@ _PROFILE_HELP_BLURB = {
     "webaudit":    "web-focused",
     "deepscan":    "full assessment, slowest",
     "compliance":  "TLS + security headers",
+    "recon":       "passive — maps what a name exposes, never touches it",
 }
 
 # Ordered so the help table reads shortest-scan-first rather than
 # alphabetically — the order someone choosing a profile actually cares about.
-_PROFILE_HELP_ORDER = ("quickscan", "stealthscan", "webaudit", "deepscan", "compliance")
+# recon sits last because it is the odd one out: it is the only profile that
+# sends nothing to the target, and the only one that accepts a company name.
+_PROFILE_HELP_ORDER = ("quickscan", "stealthscan", "webaudit", "deepscan",
+                       "compliance", "recon")
 
 
 def _build_epilog() -> str:
@@ -189,6 +198,13 @@ def _build_epilog() -> str:
         "  python3 aegis.py scanme.nmap.org --profile deepscan   full scan",
         "  python3 aegis.py --targets a.com,b.com                scan several hosts",
         "  python3 aegis.py --diff 41 57                         compare two finished scans",
+        "  python3 aegis.py example.com --recon                  passive recon, sends nothing",
+        "  python3 aegis.py --recon \"Acme Corp\"                   recon from a company name",
+        "  python3 aegis.py scanme.nmap.org --live               watch it in a browser",
+        "",
+        "every scan writes report.txt, report.pdf and a self-contained",
+        "report.html, and prints a one-line delta against the previous scan",
+        "of the same target.",
         "",
         "while a scan is running (interactive terminal only):",
         f"  {SKIP_KEY}             skip the tool running right now, move to the next one",
@@ -265,6 +281,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="extra request header for an authenticated scan, e.g. "
              "'Authorization: Bearer <token>'. Prefer AEGIS_AUTH_HEADER "
              "in .env.",
+    )
+    parser.add_argument(
+        "--recon",
+        action="store_true",
+        help="passive recon mapper: map what a domain OR a company name "
+             "exposes (subdomains, cloud buckets, breached addresses) "
+             "without sending anything to the target. Same as "
+             "--profile recon, but also accepts a company name.",
+    )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="open a live dashboard in the browser that fills in as the scan "
+             "runs. Served from 127.0.0.1 on a random port. You are asked "
+             "about this anyway when running interactively.",
+    )
+    parser.add_argument(
+        "--no-live",
+        action="store_true",
+        help="never ask about (or open) the live dashboard. For scripts.",
     )
     parser.add_argument(
         "--diff",
@@ -369,6 +405,177 @@ def _prompt_profile() -> str:
         print_error(f"'{choice}' is not a valid profile — enter a number 1-{len(names)} or a profile name.")
 
 
+_MODE_VULN, _MODE_RECON, _MODE_DIFF = "1", "2", "3"
+
+
+def _prompt_mode() -> str:
+    """
+    The top-level "what do you want to do" menu, shown only for a bare
+    `python3 aegis.py` with no arguments at all.
+
+    Every other invocation shape — a target, a --profile, --targets,
+    --recon, --diff — skips this entirely and behaves exactly as it did
+    before the menu existed. That is the whole compatibility contract: the
+    menu is what you get when you have told the tool nothing, not a new step
+    inserted in front of people who have.
+    """
+    print_panel(
+        "  [bold]1[/bold]. Vulnerability scan\n"
+        "     [dim]pick a profile and scan a host — quickscan, deepscan, …[/dim]\n\n"
+        "  [bold]2[/bold]. Recon mapper\n"
+        "     [dim]map what a domain or company name exposes. Passive: it\n"
+        "     sends nothing to the target.[/dim]\n\n"
+        "  [bold]3[/bold]. Scan diff\n"
+        "     [dim]compare two finished scans — what is new, fixed or worse[/dim]",
+        title="Select a Mode",
+        style="cyan",
+    )
+
+    try:
+        return Prompt.ask(
+            "[bold]Mode[/bold]", choices=[_MODE_VULN, _MODE_RECON, _MODE_DIFF],
+            default=_MODE_VULN,
+        ).strip()
+    except (EOFError, KeyboardInterrupt):
+        print_warning("No selection made — exiting.")
+        sys.exit(130)
+
+
+def _prompt_recon_target() -> tuple:
+    """
+    Prompt for the recon mapper's target, which — unlike every other mode —
+    may be free text.
+
+    Returns (target, is_company). No hostname validation is applied and none
+    should be: "Acme Corp" is a legitimate, supported input here, and
+    rejecting it would remove the one thing that makes this mode different.
+    is_company is decided by whether the input parses as a hostname, so the
+    profile knows which steps are even applicable.
+    """
+    while True:
+        try:
+            raw = Prompt.ask(
+                "[bold]Enter a domain (example.com) or a company name "
+                "(Acme Corp)[/bold]"
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print_warning("No target provided — exiting.")
+            sys.exit(130)
+
+        if not raw:
+            print_error("Enter a domain or a company name.")
+            continue
+
+        host = normalize_target(raw)
+        if is_valid_target(host):
+            if host != raw:
+                print_info(f"Mapping domain '{host}' (from '{raw}').")
+            return host, False
+
+        print_info(
+            f"'{raw}' is not a hostname — treating it as a company name. "
+            "Cloud storage and OSINT will run; DNS, certificate transparency "
+            "and subdomain enumeration need a domain and will be skipped."
+        )
+        return raw, True
+
+
+def _prompt_scan_pair() -> tuple:
+    """
+    Interactive scan picker for diff mode: show the most recent scans and
+    ask for two of them by number. Returns (scan_a, scan_b) or (None, None).
+
+    Presented newest-first (get_scan_history's own order) but the pair is
+    normalised to (older, newer) before being returned, because a diff reads
+    as a change over time and "3 new since scan #216" would be backwards if
+    the user happened to pick them the other way round.
+    """
+    from database.db import get_scan_history
+
+    try:
+        history = (get_scan_history() or [])[:10]
+    except Exception as exc:
+        print_error(f"Could not read scan history: {exc}")
+        return None, None
+
+    if len(history) < 2:
+        print_error(
+            f"Only {len(history)} scan(s) on record — a diff needs two. "
+            "Run a scan first."
+        )
+        return None, None
+
+    table = Table(title="Recent scans", header_style="bold magenta")
+    table.add_column("#", justify="right")
+    table.add_column("Scan ID", justify="right")
+    table.add_column("Target")
+    table.add_column("Profile")
+    table.add_column("When")
+    for index, scan in enumerate(history, start=1):
+        table.add_row(
+            str(index), str(scan.get("id")), str(scan.get("target") or "?"),
+            str(scan.get("profile") or "?"),
+            str(scan.get("timestamp") or "?")[:19].replace("T", " "),
+        )
+    console.print(table)
+
+    def _pick(label: str):
+        while True:
+            try:
+                choice = Prompt.ask(f"[bold]{label}[/bold] (row number or scan id)").strip()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if not choice.isdigit():
+                print_error("Enter a number.")
+                continue
+            value = int(choice)
+            if 1 <= value <= len(history):
+                return history[value - 1].get("id")
+            # Not a row number — accept a raw scan id, including one older
+            # than the ten listed, so the table is a convenience and not a
+            # restriction.
+            if any(s.get("id") == value for s in history) or value > 0:
+                return value
+            print_error(f"Enter a row number 1-{len(history)} or a scan id.")
+
+    scan_a = _pick("Baseline scan (the earlier one)")
+    if scan_a is None:
+        return None, None
+    scan_b = _pick("Current scan (the later one)")
+    if scan_b is None:
+        return None, None
+
+    if scan_a == scan_b:
+        print_error("Both selections are the same scan — nothing to compare.")
+        return None, None
+
+    if scan_a > scan_b:
+        print_info(
+            f"Comparing #{scan_b} → #{scan_a} (the lower id is the baseline)."
+        )
+        scan_a, scan_b = scan_b, scan_a
+    return scan_a, scan_b
+
+
+def _run_interactive_diff() -> int:
+    """Mode 3: pick two scans, print the diff, offer to save it."""
+    from modules.reporting.diff import diff_scans, print_diff, generate_diff_report
+
+    scan_a, scan_b = _prompt_scan_pair()
+    if scan_a is None:
+        return 1
+
+    result = diff_scans(scan_a, scan_b)
+    print_diff(result)
+
+    try:
+        if Confirm.ask("\n[cyan]Save this diff as a report?[/cyan]", default=False):
+            generate_diff_report(result)
+    except (EOFError, KeyboardInterrupt):
+        pass
+    return 0
+
+
 def _run_diff(args) -> int:
     """
     --diff: compare two finished scans and print the delta. Runs no scan.
@@ -392,6 +599,227 @@ def _run_diff(args) -> int:
 
     result = diff_scans(scan_a, scan_b)
     print(render_diff(result, verbose=args.diff_verbose))
+    return 0
+
+
+def _maybe_start_live_dashboard(args) -> bool:
+    """
+    Ask about (or, with --live, just start) the live dashboard.
+
+    Returns True if a dashboard is running. The profiles do not need to be
+    told: update_live_data() is keyed on the target and no-ops for a target
+    with no dashboard, so the scan code path is identical either way and
+    there is no use_live flag to thread through six orchestrators.
+
+    Never blocks a scan. A dashboard that fails to start is a warning and
+    the scan proceeds — it is a view onto the scan, not part of it.
+    """
+    if args.no_live:
+        return False
+
+    use_live = args.live
+    if not use_live and not args.non_interactive:
+        try:
+            use_live = Confirm.ask(
+                "[cyan]Open a live dashboard in your browser?[/cyan] "
+                "[dim](fills in as the scan runs)[/dim]",
+                default=False,
+            )
+        except (EOFError, KeyboardInterrupt):
+            use_live = False
+
+    if not use_live:
+        return False
+
+    from modules.reporting.dashboard_live import init_live_dashboard
+
+    url = init_live_dashboard(args.target)
+    if not url:
+        print_warning("Live dashboard could not be started — the scan continues without it.")
+        return False
+
+    print_success(f"Live dashboard: {url}")
+    _open_in_browser(url)
+    return True
+
+
+def _open_in_browser(location: str) -> None:
+    """
+    Best-effort "show this to the user". Never raises and never blocks: a
+    headless box has no browser, and failing to open one must not affect a
+    scan that has already run or is about to.
+    """
+    import subprocess
+
+    try:
+        subprocess.Popen(
+            ["xdg-open", location],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        print_info(f"Open this in a browser: {location}")
+
+
+def _print_attack_surface_delta(target: str, scan_id) -> None:
+    """
+    The one-line "what changed since last time" note printed after a scan.
+
+    Compares against the previous scan OF THE SAME TARGET, and only ever
+    prints the summary line — never the full table, which is what --diff is
+    for. Silent when this is the target's first scan, because "nothing to
+    compare" is not news.
+
+    Never raises: this runs after a completed, fully persisted scan, and a
+    problem building a courtesy line must not change the exit code of a
+    scan that worked.
+    """
+    try:
+        from database.db import get_scan_history
+        from modules.reporting.diff import diff_scans
+
+        history = get_scan_history(target) or []
+        previous = next(
+            (s for s in history if s.get("id") and s["id"] != scan_id), None
+        )
+        if not previous:
+            return
+
+        delta = diff_scans(previous["id"], scan_id)
+        if not delta.get("comparable", True):
+            return
+
+        console.print(
+            f"\n[bold]Attack surface delta:[/bold] {delta.get('delta_summary')}"
+        )
+        console.print(
+            f"[dim]Full comparison: python3 aegis.py --diff "
+            f"{previous['id']} {scan_id}[/dim]"
+        )
+    except Exception:
+        return
+
+
+def _hold_dashboard_open(live: bool, args, report_paths) -> None:
+    """
+    Keep the process (and so the dashboard server) alive after the scan.
+
+    The server runs on a daemon thread, which means it stops the moment
+    this process exits — so without this, the dashboard someone has been
+    watching goes to a connection error at the exact moment it would show
+    the completion banner and the link to the full report. The live view
+    would be live right up until the only part anyone wants to read.
+
+    Interactive runs therefore wait for a keypress. Scripted ones cannot,
+    so they get told plainly that the live view has ended and where the
+    static report is — which is the honest version of the same information.
+    """
+    if not live:
+        return
+
+    html_path = next((p for p in report_paths if str(p).endswith(".html")), None)
+
+    if args.non_interactive:
+        print_info(
+            "The live dashboard stops with this process. The finished report "
+            + (f"is at {html_path}" if html_path else "is in this target's output directory")
+        )
+        return
+
+    try:
+        console.print(
+            "\n[cyan]The live dashboard is still open.[/cyan] "
+            "[dim]It stops when this command exits.[/dim]"
+        )
+        Prompt.ask(
+            "[dim]Press Enter to close it"
+            + (f" (report also saved to {html_path})" if html_path else "")
+            + "[/dim]",
+            default="",
+            show_default=False,
+        )
+    except (EOFError, KeyboardInterrupt):
+        return
+
+
+def _offer_html_report(report_paths, args) -> None:
+    """Offer to open the static HTML report when no live view was used."""
+    html_path = next(
+        (p for p in report_paths if str(p).endswith(".html")), None
+    )
+    if not html_path or args.non_interactive:
+        return
+    try:
+        if Confirm.ask("[cyan]Open the HTML report in your browser?[/cyan]", default=False):
+            _open_in_browser(os.path.abspath(html_path))
+    except (EOFError, KeyboardInterrupt):
+        return
+
+
+def _run_recon_mode(args, is_company: bool) -> int:
+    """
+    Mode 2 / --recon: run the passive recon mapper and report.
+
+    Kept separate from main()'s scan path because the two genuinely differ
+    at the start — no hostname validation, no auth, no rate-limit or
+    concurrency reporting, and a target that may not be a host at all — but
+    it shares the whole tail (delta line, summary panel, HTML offer) through
+    the same helpers.
+    """
+    print_panel(
+        f"[bold]Target:[/bold]  {args.target}\n"
+        f"[bold]Mode:[/bold]    recon mapper "
+        f"({'company name' if is_company else 'domain'})\n\n"
+        "[dim]Passive only — public certificate logs, DNS aggregators, cloud\n"
+        "namespaces and a breach database. Nothing is sent to the target.[/dim]",
+        title="Recon Configuration",
+        style="cyan",
+    )
+
+    try:
+        init_db()
+    except Exception as exc:
+        print_error(f"Failed to initialize the database: {exc}")
+        return 1
+
+    live = _maybe_start_live_dashboard(args)
+
+    start = time.time()
+    try:
+        result = run_recon(
+            args.target,
+            non_interactive=args.non_interactive,
+            is_company=is_company,
+        )
+    except KeyboardInterrupt:
+        print_warning("Recon interrupted by user.")
+        return 130
+    except Exception as exc:
+        print_error(f"Unexpected error during recon: {exc}")
+        return 1
+
+    elapsed = time.time() - start
+    scan_id, report_paths, profile_stats = _normalize_result(result)
+    if scan_id is None:
+        print_error("Recon did not complete — no scan record was created.")
+        return 1
+
+    summary = build_summary(scan_id, quiet=True)
+    stats = summary_stats(summary)
+    stats.update(profile_stats)
+
+    print_panel(
+        f"[bold]Scan ID:[/bold]  {scan_id}\n"
+        f"[bold]Mode:[/bold]     recon\n"
+        f"[bold]Elapsed:[/bold]  {elapsed:.1f}s",
+        title="RECON COMPLETE", style="green",
+    )
+    print_summary(args.target, stats)
+    _print_attack_surface_delta(args.target, scan_id)
+    if not live:
+        _offer_html_report(report_paths, args)
+    else:
+        _hold_dashboard_open(live, args, report_paths)
+    print_success(f"Done — recon scan {scan_id} finished in {elapsed:.1f}s")
     return 0
 
 
@@ -492,6 +920,40 @@ def main() -> int:
     # missing (full backward compatibility for every other invocation shape).
     interactive = args.target is None
 
+    # The top-level mode menu appears for a bare `python3 aegis.py` and
+    # nothing else. Any argument that already states an intent — a target, a
+    # --profile, --recon — answers the menu's question, so asking it would
+    # be asking something the user has already told us.
+    if interactive and args.profile is None and not args.recon:
+        mode = _prompt_mode()
+        if mode == _MODE_DIFF:
+            return _run_interactive_diff()
+        if mode == _MODE_RECON:
+            args.recon = True
+
+    # --recon accepts free text, so it takes its target from its own prompt
+    # and skips the hostname validation below entirely.
+    if args.recon:
+        args.profile = "recon"
+        if args.target is None:
+            args.target, recon_is_company = _prompt_recon_target()
+        else:
+            host = normalize_target(args.target)
+            if is_valid_target(host):
+                if host != args.target:
+                    print_info(f"Mapping domain '{host}' (from '{args.target}').")
+                args.target, recon_is_company = host, False
+            else:
+                # A company name on the command line: quoted free text that
+                # is not a hostname. Accepted rather than rejected — it is
+                # the documented second input shape for this mode.
+                print_info(
+                    f"'{args.target}' is not a hostname — treating it as a "
+                    "company name (cloud storage and OSINT only)."
+                )
+                recon_is_company = True
+        return _run_recon_mode(args, recon_is_company)
+
     if interactive:
         args.target = _prompt_target()
     else:
@@ -580,6 +1042,8 @@ def main() -> int:
         print_error(f"Failed to initialize the database: {exc}")
         return 1
 
+    live = _maybe_start_live_dashboard(args)
+
     dispatch = PROFILE_DISPATCH[args.profile]
     start = time.time()
 
@@ -621,6 +1085,20 @@ def main() -> int:
     print_panel("\n".join(completion_lines), title="SCAN COMPLETE", style="green")
 
     print_summary(args.target, stats)
+
+    # What moved since the last scan of this same target — one line, printed
+    # after every scan rather than only when someone remembers to ask for a
+    # --diff. The full comparison stays behind the flag.
+    _print_attack_surface_delta(args.target, scan_id)
+
+    # Only offered when there was no live view: someone who has had the
+    # dashboard open throughout the scan already has a browser tab on this
+    # target, and it links to the report itself once the scan completes.
+    if not live:
+        _offer_html_report(report_paths, args)
+    else:
+        _hold_dashboard_open(live, args, report_paths)
+
     print_success(f"Done — scan {scan_id} finished in {elapsed:.1f}s")
     return 0
 

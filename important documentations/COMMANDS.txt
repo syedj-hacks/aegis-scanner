@@ -26,6 +26,13 @@ recon/scan/audit toolset and can trip IDS/WAF alerts or lock out accounts.
   # install.sh does, in order:
   #   1. apt install bind9-dnsutils nmap nikto gobuster subfinder amass theharvester dirb
   #                   whatweb nuclei zaproxy sslyze testssl.sh wpscan sqlmap hydra enum4linux
+  #                   cloud-enum
+  #      (cloud-enum is the recon mapper's bucket-discovery tool. Install it from apt or
+  #       from its upstream git repo -- install.sh falls back to a clone into
+  #       /opt/cloud_enum. Do NOT `pip install cloud-enum`: that PyPI name is an empty
+  #       placeholder package whose own description reads "Reserved name placeholder.
+  #       No functionality." It installs successfully and provides nothing, so the tool
+  #       looks installed while the wrapper logs "binary not found" forever.)
   #      (testssl.sh IS packaged on Debian/Kali -- verified 3.2.2+dfsg-1. Where it is not,
   #       install.sh falls back to a git clone into /opt/testssl.sh, which the wrapper probes.)
   #   2. apt install python3-venv python3-pip libpango-1.0-0 libpangocairo-1.0-0
@@ -77,6 +84,7 @@ recon/scan/audit toolset and can trip IDS/WAF alerts or lock out accounts.
                    [--targets FILE|a.com,b.com] [--max-concurrent-targets N]
                    [--auth-cookie COOKIE] [--auth-header 'Name: value']
                    [--diff SCAN_A SCAN_B] [--diff-verbose]
+                   [--recon] [--live | --no-live]
                    [--version] [-h | --help]
 
   # target        hostname, IP address or URL (validated before anything runs); now OPTIONAL --
@@ -89,9 +97,23 @@ recon/scan/audit toolset and can trip IDS/WAF alerts or lock out accounts.
   #               and scanning just 10.0.0.0 instead would be worse than an error.
   #               Applies to --targets entries too, which are de-duplicated after the
   #               reduction (http:// and https:// of one site collapse to a single scan).
-  # --profile     quickscan (default) | stealthscan | webaudit | deepscan | compliance
+  # --profile     quickscan (default) | stealthscan | webaudit | deepscan | compliance | recon
   #               omitting this with a target given still silently defaults to quickscan
   #               (unchanged behavior); the profile menu only appears in interactive mode
+  # --recon       passive recon mapper. Unlike every other mode this accepts a COMPANY
+  #               NAME as well as a domain ("Acme Corp"), because it never contacts the
+  #               target -- it reads crt.sh certificate logs, DNS aggregators, public
+  #               cloud storage namespaces and a breach database. With a bare company
+  #               name there is no domain, so DNS/certificate-transparency/subdomain
+  #               enumeration are reported NOT APPLICABLE rather than run and failed.
+  #               Same as --profile recon, except --profile requires a valid hostname.
+  #               The breach check needs AEGIS_HIBP_API_KEY in .env; WITHOUT a key it
+  #               reports NOT RUN and never reports accounts as clean.
+  # --live        open a live dashboard in the browser that fills in as the scan runs.
+  #               Served from 127.0.0.1 on a random port -- NOT opened as a file:// URL,
+  #               because browsers block fetch() there and the page would sit at
+  #               "waiting for data" forever. It stops when the command exits.
+  # --no-live     never ask about or open the dashboard (for scripts)
   # -v/--verbose  prints the resolved tool list + nmap_args for the chosen profile, PLUS the
   #               concurrency actually in effect for this run (web-tool pool width, nmap chunk
   #               width) and the resolved per-profile rate limits (gobuster -t, dirb -z,
@@ -118,6 +140,17 @@ Examples:
   python3 aegis.py example.com --profile webaudit -v
   python3 aegis.py 10.0.0.5 --profile stealthscan
   python3 aegis.py example.com --profile compliance
+  python3 aegis.py                                    # guided: mode menu, then target/profile
+  python3 aegis.py example.com --recon                # passive recon, domain mode
+  python3 aegis.py --recon "Acme Corp"                # passive recon, company-name mode
+  python3 aegis.py scanme.nmap.org --live             # watch the scan in a browser
+  python3 aegis.py --diff 41 57                       # compare two finished scans
+
+  # Every scan now also writes a self-contained output/<target>/report.html (sortable,
+  # filterable, no external resources) alongside the TXT and PDF, and prints a one-line
+  # attack-surface delta against the previous scan of the same target. In that delta,
+  # "unverified" means a finding is absent from the later scan but the tool that finds
+  # it did not run -- do NOT read those as fixed.
   python3 aegis.py                                      # interactive: prompts for target + profile
   venv/bin/python aegis.py example.com --profile deepscan --non-interactive   # scripted run
 

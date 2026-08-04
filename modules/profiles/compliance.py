@@ -44,6 +44,7 @@ from modules.enrichment.severity import score_finding
 from modules.enrichment.remediation import get_remediation
 from modules.enrichment.compliance_map import apply_compliance_refs
 from database.db import insert_scan, insert_findings_bulk
+from modules.reporting.dashboard_live import update_live_data
 from modules.profiles._common import (
     warn_unavailable_tools, count_and_report_tool_failures, persist_tool_run,
     finalise_reports,
@@ -145,6 +146,7 @@ def run_compliance(target: str, non_interactive: bool = False, auth=None):
     warn_unavailable_tools(target, profile_cfg.get("tools"), PROFILE_NAME, _WIRED_TOOLS)
 
     scan_id = insert_scan(target, PROFILE_NAME)
+    update_live_data(target, [], current_tool="nmap TLS scripts", progress_pct=10)
 
     tool_results = []
     findings = []
@@ -170,6 +172,7 @@ def run_compliance(target: str, non_interactive: bool = False, auth=None):
     # findings) is already complete at this point, so an interrupt during
     # the sslyze/whatweb TLS audit below can never cost it.
     insert_findings_bulk(scan_id, findings)
+    update_live_data(target, findings, current_tool="nmap NSE", progress_pct=50)
 
     tls_ports = _tls_ports(scripts, open_ports)
     if tls_ports:
@@ -205,6 +208,8 @@ def run_compliance(target: str, non_interactive: bool = False, auth=None):
                 # risks losing earlier ports' findings to a later one's
                 # interrupt.
                 insert_findings_bulk(scan_id, port_findings)
+                update_live_data(target, port_findings,
+                                 current_tool=f"TLS audit :{port}", progress_pct=85)
                 findings.extend(port_findings)
 
     stats = {
@@ -217,11 +222,11 @@ def run_compliance(target: str, non_interactive: bool = False, auth=None):
 
     # Writes both reports, prunes the capped history and prints the
     # end-of-scan REPORT GENERATED banner — see _common.finalise_reports().
-    txt_path, pdf_path = finalise_reports(
+    txt_path, pdf_path, html_path = finalise_reports(
         target, PROFILE_NAME, scan_id, non_interactive=non_interactive
     )
     print_success(f"[{PROFILE_NAME}] scan {scan_id} complete — {len(findings)} finding(s)")
-    return scan_id, txt_path, pdf_path, stats
+    return scan_id, txt_path, pdf_path, html_path, stats
 
 
 if __name__ == "__main__":
@@ -231,5 +236,5 @@ if __name__ == "__main__":
         print_error("Usage: python -m modules.profiles.compliance <target>")
         sys.exit(1)
 
-    sid, path, _stats = run_compliance(sys.argv[1])
+    sid, path, _pdf, _html, _stats = run_compliance(sys.argv[1])
     print_success(f"Compliance scan complete — scan_id={sid} report={path}")

@@ -412,6 +412,34 @@ def _heuristic_severity(finding: dict, kind: str) -> str:
     if kind in ("banner", "fingerprint_header", "technology_fingerprint"):
         return _BANNER_SEVERITY
 
+    # --- Recon mapper findings ------------------------------------------
+    # Graded by what each one actually proves, which is the same rule the
+    # rest of this table follows and which puts these three quite far apart:
+    #
+    #   recon_leak      HIGH   — a credential for this address is in a public
+    #                            breach corpus. Given password reuse, that is
+    #                            a live authentication risk right now, and it
+    #                            is the one recon finding a reader should act
+    #                            on today.
+    #   recon_bucket    MEDIUM — a publicly readable cloud bucket matching
+    #                            the target's keyword. Real exposure, but the
+    #                            keyword match is not proof of ownership
+    #                            (the namespace is global), so it needs
+    #                            confirmation before it is anyone's incident.
+    #   recon_subdomain LOW    — a name exists. It may not resolve, may not
+    #                            be reachable, and may be entirely intended.
+    #                            This is a lead to scan, not a weakness; the
+    #                            profile that finds it never even connects to
+    #                            it. Anything higher would flood a recon
+    #                            report with hundreds of MEDIUMs and bury the
+    #                            two findings that matter.
+    if kind == "recon_leak":
+        return "HIGH"
+    if kind == "recon_bucket":
+        return "MEDIUM"
+    if kind == "recon_subdomain":
+        return "LOW"
+
     if kind in ("open_port", "service_version"):
         try:
             port = int(finding.get("port"))

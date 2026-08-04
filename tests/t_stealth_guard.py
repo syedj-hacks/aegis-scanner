@@ -17,10 +17,12 @@ pools, per-profile rate limits — is a change that could plausibly be applied
 to stealthscan "for consistency" by someone who did not read that history.
 This file makes that a test failure rather than a 60-hour scan.
 
-The guard asserts the three properties that define the redesign:
+The guard asserts the four properties that define the redesign:
   1. the port list is a fixed, explicit, small '-p' list (not '-p-')
   2. the timing template is -T2, not -T3/-T4
   3. the profile stays sequential — no concurrency knob applies to it
+  4. it wires in no sweeping tool — whatweb is the single deliberate
+     exception, and nuclei is deliberately excluded (see section E)
 
 Run standalone (python3 tests/t_stealth_guard.py) or via the phase gate.
 """
@@ -140,10 +142,52 @@ def main() -> int:
         "the chunk-parallel sweep path cannot apply to stealthscan (no '-p-')",
         "-p-" not in nmap_args,
     )
+    print("\n--- E. runs no sweeping tool (whatweb is the one exception) ---")
+    # This check used to assert tools == ["nslookup", "nmap"] exactly. That
+    # was the right guard against the wrong thing: what makes a profile loud
+    # is which tools it RUNS, not which its config lists, and the two are
+    # deliberately different here — nuclei is listed so
+    # warn_unavailable_tools() can print an explicit "not run by this
+    # profile, by design" note instead of the tool being invisibly absent.
+    #
+    # whatweb was added deliberately (a handful of requests against one
+    # already-scanned port, in exchange for knowing what is listening).
+    # nuclei was deliberately NOT: it fires thousands of templated requests
+    # per port and would make this the second-loudest profile in the
+    # framework while its nmap half was still pacing at -T2.
+    #
+    # So the guard now checks the property that actually protects the
+    # profile — the wired set contains nothing that sweeps — which is
+    # strictly stronger than the old equality, and would still catch someone
+    # adding nuclei "for consistency".
+    from modules.profiles.stealth import _WIRED_TOOLS  # noqa: E402
+
+    _SWEEPING_TOOLS = {
+        "nuclei", "nikto", "gobuster", "dirb", "feroxbuster", "dirsearch",
+        "zaproxy", "sqlmap", "hydra", "wpscan", "enum4linux", "amass",
+        "masscan", "testssl",
+    }
+    sweeping = sorted(_WIRED_TOOLS & _SWEEPING_TOOLS)
     check(
-        "stealthscan's tool list is still just DNS + nmap (no web/probe tools)",
-        list(cfg.get("tools") or []) == ["nslookup", "nmap"],
-        f"got {cfg.get('tools')}",
+        "stealthscan wires in NO sweeping/brute-forcing tool",
+        not sweeping,
+        f"these would destroy the profile's minimal-footprint intent: {sweeping}",
+    )
+    check(
+        "stealthscan does not run nuclei (listed by design, never wired)",
+        "nuclei" not in _WIRED_TOOLS,
+        "nuclei issues thousands of requests per port — running it here would "
+        "make the quietest profile the second-loudest one",
+    )
+    check(
+        "whatweb is the only web tool stealthscan wires in",
+        _WIRED_TOOLS == {"nslookup", "nmap", "whatweb"},
+        f"got {sorted(_WIRED_TOOLS)}",
+    )
+    check(
+        "every tool stealthscan wires in is also declared in its config list",
+        _WIRED_TOOLS <= set(cfg.get("tools") or []),
+        f"wired {sorted(_WIRED_TOOLS)} vs configured {cfg.get('tools')}",
     )
 
     print("\n" + "=" * 60)

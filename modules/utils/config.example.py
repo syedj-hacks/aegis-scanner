@@ -12,6 +12,16 @@ To use a personal key instead, set AEGIS_NVD_API_KEY (or NVD_API_KEY) in
 your shell or in the gitignored .env — both take priority over the
 default below.
 
+Optional, for the recon profile's breach check:
+    AEGIS_HIBP_API_KEY   Have I Been Pwned API key. There is deliberately
+                         no default — an HIBP key is a paid personal
+                         credential, so baking one in would bill someone
+                         else's account for every clone. Without it the
+                         breach check reports itself as NOT RUN rather than
+                         reporting every address as clean; see
+                         modules/recon/leaked_creds.py for why that
+                         distinction is the whole point.
+
 Keep this file in sync when you add a config key, otherwise teammates get
 an AttributeError on a key they never knew existed.
 """
@@ -73,9 +83,37 @@ NVD_RATE_LIMIT_REQUESTS = 50 if NVD_API_KEY else 5
 # ---- Output ----
 OUTPUT_ROOT = "output"
 
+# Characters that must not reach a path segment. Every profile but recon
+# passes a validated hostname here, where this never fires — but the recon
+# mapper accepts a company NAME as its target, deliberately unvalidated
+# free text ("Acme Corp"), and that text is what names the output
+# directory. Without this, `--recon "../../etc/evil"` resolves to
+# output/../../etc/evil and writes reports outside the project entirely.
+#
+# Replaced rather than stripped, so two different targets cannot collapse
+# onto one directory and silently overwrite each other's reports.
+_UNSAFE_PATH_CHARS = str.maketrans({c: "_" for c in '/\\:*?"<>|\0'})
+
+
+def safe_target_dirname(target: str) -> str:
+    """
+    `target` reduced to a single, safe path segment.
+
+    Preserves spaces and case — "Acme Corp" stays readable as
+    output/Acme Corp/ — and only neutralises what could change where the
+    path points.
+    """
+    name = str(target or "unknown").translate(_UNSAFE_PATH_CHARS).strip()
+    # A segment of pure dots is the traversal case that survives character
+    # replacement: ".." has no unsafe characters in it at all.
+    if not name or set(name) <= {"."}:
+        return "unknown"
+    return name
+
+
 def output_dir(target: str) -> str:
     """Returns (and creates) the per-target output directory."""
-    path = os.path.join(OUTPUT_ROOT, target)
+    path = os.path.join(OUTPUT_ROOT, safe_target_dirname(target))
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -107,6 +145,18 @@ TOOL_TIMEOUTS = {
     "nslookup": 15,
     "zaproxy": 900,
     "dirb": 300,
+    # --- Recon mapper ---
+    # crt.sh is a chronically overloaded volunteer service (three
+    # consecutive 502s while this was written); the wrapper retries inside
+    # this budget rather than treating one 502 as "no subdomains".
+    "crtsh": 90,
+    # cloud_enum --quickscan issues a few thousand DNS/HTTP lookups across
+    # the cloud providers. The full (non-quick) sweep does not fit in any
+    # sane budget, which is why the wrapper pins --quickscan.
+    "cloud_enum": 300,
+    # HIBP paces itself at ~1.7s/request by its own rate limit, capped at 20
+    # addresses — a wall-clock floor of ~34s before any network latency.
+    "hibp": 120,
     "default": 120,
 }
 
@@ -169,7 +219,13 @@ PROFILES = {
         "nuclei_severity": ["critical", "high"],
     },
     "stealthscan": {
-        "tools": ["nslookup", "nmap"],
+        # whatweb is run (a handful of requests against one already-scanned
+        # port, in exchange for knowing WHAT is listening). nuclei is listed
+        # but deliberately not run — see modules/profiles/stealth.py's
+        # docstring; listing it is what makes warn_unavailable_tools() print
+        # the "not run by this profile, by design" note instead of the tool
+        # being invisibly absent.
+        "tools": ["nslookup", "nmap", "whatweb", "nuclei"],
         # REDESIGNED: a full 65535-port '-p-' sweep at any quiet timing
         # template is an architectural dead end — live-measured at ~0.29
         # ports/sec at -T2 against a real filtered target (60+ hours
@@ -200,12 +256,30 @@ PROFILES = {
         "tools": ["nmap", "sslyze", "whatweb"],
         "nmap_args": ["-T4", "-p", "80,443,8443", "--script", "ssl-enum-ciphers,http-headers"],
     },
+    "recon": {
+        # Passive attack-surface discovery. No nmap: this profile never
+        # sends a packet to the target's own infrastructure (see
+        # modules/profiles/recon.py), so nmap_args is empty rather than
+        # merely unused — an empty list is what makes that visible in
+        # `--verbose` output instead of implying a scan that does not happen.
+        "tools": ["nslookup", "crtsh", "subfinder", "amass", "theharvester",
+                  "cloud_enum", "hibp"],
+        "nmap_args": [],
+    },
 }
 
 def get_profile(name: str) -> dict:
     if name not in PROFILES:
         raise ValueError(f"Unknown scan profile: {name}")
     return PROFILES[name]
+
+# ---- Live scan dashboard ----
+# How often live_dashboard.html re-fetches live_data.json, in milliseconds.
+# The page is served from a localhost-only HTTP server the scan starts on an
+# ephemeral port (see modules/reporting/dashboard_live.py) rather than opened
+# as a file:// URL — browsers block fetch() against file://, so a file-opened
+# dashboard would sit at "waiting for data" forever.
+LIVE_DASHBOARD_POLL_MS = 2000
 
 # ---- Threading ----
 MAX_THREADS = 10

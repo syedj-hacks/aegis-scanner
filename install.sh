@@ -41,9 +41,11 @@ VENV_DIR="$REPO_ROOT/venv"
 #   sqlmap                        modules/web/sqlmap_wrap.py
 #   hydra                         modules/scanning/hydra_wrap.py
 #   enum4linux                    modules/scanning/enum4linux_wrap.py
+#   cloud-enum                    modules/recon/cloud_enum_wrap.py
 SCAN_TOOLS=(
     bind9-dnsutils nmap nikto gobuster subfinder amass theharvester dirb
     whatweb nuclei zaproxy sslyze testssl.sh wpscan sqlmap hydra enum4linux
+    cloud-enum
 )
 
 # Python environment + WeasyPrint's native Pango/Cairo/GDK-Pixbuf bindings
@@ -68,6 +70,34 @@ if $SUDO apt install -y "${SCAN_TOOLS[@]}"; then
 else
     echo "[-] Some scan tools failed to install — check apt output above."
     echo "    aegis.py still runs; a profile using a missing tool logs a warning and skips it."
+fi
+
+# cloud_enum comes from apt (Kali packages it as cloud-enum, verified 0.8-1)
+# or from its upstream git repo. It is deliberately NOT installed with pip.
+#
+# That is not a style preference. The name "cloud-enum" on PyPI is an empty
+# placeholder package — its own description reads "Reserved name
+# placeholder. No functionality." — and `pip install cloud-enum` therefore
+# succeeds, reports success, and installs a package containing nothing.
+# Anyone who ran it would believe the tool was installed while
+# modules/recon/cloud_enum_wrap.py went on logging "binary not found on
+# PATH" forever. Verified by installing it and reading the metadata.
+if ! command -v cloud_enum >/dev/null 2>&1 && ! command -v cloud-enum >/dev/null 2>&1 \
+   && [[ ! -x /opt/cloud_enum/cloud_enum.py ]]; then
+    if command -v git >/dev/null 2>&1; then
+        echo "[*] cloud_enum is not available from apt here — installing via git clone to /opt/cloud_enum"
+        if $SUDO git clone --depth 1 https://github.com/initstring/cloud_enum.git /opt/cloud_enum; then
+            $SUDO chmod +x /opt/cloud_enum/cloud_enum.py
+            $SUDO ln -sf /opt/cloud_enum/cloud_enum.py /usr/local/bin/cloud_enum
+            pip install -r /opt/cloud_enum/requirements.txt >/dev/null 2>&1 || true
+            echo "[+] cloud_enum installed to /opt/cloud_enum (linked as /usr/local/bin/cloud_enum)"
+        else
+            echo "[-] cloud_enum git clone failed — the recon profile will log 'binary not found' and skip bucket discovery"
+        fi
+    else
+        echo "[-] cloud_enum is missing and git is not available to fetch it — install it manually"
+        echo "    Do NOT 'pip install cloud-enum': that PyPI name is an empty placeholder package."
+    fi
 fi
 
 # apt's nuclei package is missing/stale on some Kali mirrors — fall back to

@@ -394,6 +394,32 @@ def remediation_text(finding: dict) -> str:
     if kind in ("banner", "fingerprint_header", "technology_fingerprint"):
         return _BANNER_REMEDIATION
 
+    # --- Recon mapper findings ------------------------------------------
+    if kind == "recon_leak":
+        return (
+            f"Force a password reset for {finding.get('name') or 'this address'} "
+            "and rotate any credential reused elsewhere by the same person; "
+            "enable MFA on every account it can authenticate to. Treat the "
+            "breached password as public — it is."
+        )
+
+    if kind == "recon_bucket":
+        return (
+            "Confirm this bucket belongs to your organisation first — the "
+            "cloud storage namespace is global, so a keyword match is not "
+            "proof of ownership. If it is yours: remove public read/list "
+            "permissions, audit what was exposed and for how long via access "
+            "logs, and rotate any credential or key found in its contents."
+        )
+
+    if kind == "recon_subdomain":
+        return (
+            "Confirm this host is meant to be internet-facing and is on the "
+            "asset inventory. Certificate transparency records survive the "
+            "host, so a name here may be decommissioned, a forgotten staging "
+            "environment, or live and unmonitored — scan it to find out which."
+        )
+
     if kind == "nuclei_finding":
         reference = finding.get("reference") or ""
         suffix = f" Reference: {reference}" if reference else ""

@@ -44,10 +44,13 @@ from modules.enrichment.severity import score_finding
 from modules.enrichment.remediation import get_remediation
 from database.db import insert_scan, insert_findings_bulk
 from modules.reporting.report_txt import generate_txt_report
+from modules.reporting.dashboard_live import update_live_data
 from modules.profiles._common import (
     warn_unavailable_tools, count_and_report_tool_failures, persist_tool_run,
     finalise_reports,
     nuclei_description, nuclei_port, nuclei_service,
+    is_web_port as _is_web_port, is_https_port as _is_https_port,
+    findings_from_whatweb as _findings_from_whatweb,
 )
 
 PROFILE_NAME = "quickscan"
@@ -57,42 +60,14 @@ PROFILE_NAME = "quickscan"
 # warn_unavailable_tools() instead of silently vanishing.
 _WIRED_TOOLS = {"nslookup", "nmap", "whatweb", "nuclei"}
 
-# Ports/service-name hints used to decide which open ports are worth
-# running whatweb/nuclei against — same heuristic deepscan.py uses.
-_WEB_PORTS = (80, 443, 8080, 8443)
-_WEB_SERVICE_HINTS = ("http", "https", "ssl")
-_HTTPS_PORTS = (443, 8443)
-
-
-def _is_web_port(port_entry: dict) -> bool:
-    port = port_entry.get("port")
-    service = str(port_entry.get("service") or "").lower()
-    if port in _WEB_PORTS:
-        return True
-    return any(hint in service for hint in _WEB_SERVICE_HINTS)
-
-
-def _is_https_port(port_entry: dict) -> bool:
-    port = port_entry.get("port")
-    service = str(port_entry.get("service") or "").lower()
-    return port in _HTTPS_PORTS or "ssl" in service or "https" in service
+# The web-port predicates and the whatweb mapper now live in _common.py
+# (imported above under their previous private names) — quickscan,
+# stealthscan and deepscan all need them, and three identical copies of a
+# rule that is not per-profile is three places for it to go stale.
 
 
 def _score_and_remediate(findings: list) -> list:
     return [get_remediation(score_finding(f)) for f in findings]
-
-
-def _findings_from_whatweb(whatweb_result: dict) -> list:
-    port = whatweb_result.get("port")
-    return [
-        {
-            "type": "technology_fingerprint", "port": port,
-            "name": tech["name"], "value": tech["value"],
-            "description": f"Technology fingerprinted: {tech['name']}"
-                            + (f" ({tech['value']})" if tech["value"] else ""),
-        }
-        for tech in whatweb_result.get("technologies") or []
-    ]
 
 
 def _findings_from_nuclei(nuclei_result: dict) -> list:
@@ -148,6 +123,7 @@ def run_quickscan(target: str, non_interactive: bool = False, auth=None):
     warn_unavailable_tools(target, profile_cfg.get("tools"), PROFILE_NAME, _WIRED_TOOLS)
 
     scan_id = insert_scan(target, PROFILE_NAME)
+    update_live_data(target, [], current_tool="nmap port scan", progress_pct=10)
 
     tool_results = []
     findings = []
@@ -182,6 +158,7 @@ def run_quickscan(target: str, non_interactive: bool = False, auth=None):
     # are the whole point of this profile's speed/depth tradeoff, and an
     # interrupt during the web check below must not cost them.
     insert_findings_bulk(scan_id, findings)
+    update_live_data(target, findings, current_tool="nmap -sV", progress_pct=55)
 
     web_ports = [p for p in open_ports if _is_web_port(p)]
     if web_ports:
@@ -202,6 +179,7 @@ def run_quickscan(target: str, non_interactive: bool = False, auth=None):
             advance(f"Nuclei :{port}")
 
         insert_findings_bulk(scan_id, web_findings)
+        update_live_data(target, web_findings, current_tool="nuclei", progress_pct=90)
         findings.extend(web_findings)
     else:
         print_info(f"[{PROFILE_NAME}] no web port found among open ports — whatweb/nuclei skipped")
@@ -216,11 +194,11 @@ def run_quickscan(target: str, non_interactive: bool = False, auth=None):
 
     # Writes both reports, prunes the capped history and prints the
     # end-of-scan REPORT GENERATED banner — see _common.finalise_reports().
-    txt_path, pdf_path = finalise_reports(
+    txt_path, pdf_path, html_path = finalise_reports(
         target, PROFILE_NAME, scan_id, non_interactive=non_interactive
     )
     print_success(f"[{PROFILE_NAME}] scan {scan_id} complete — {len(findings)} finding(s)")
-    return scan_id, txt_path, pdf_path, stats
+    return scan_id, txt_path, pdf_path, html_path, stats
 
 
 if __name__ == "__main__":
@@ -230,5 +208,5 @@ if __name__ == "__main__":
         print_error("Usage: python -m modules.profiles.quickscan <target>")
         sys.exit(1)
 
-    sid, path, _stats = run_quickscan(sys.argv[1])
+    sid, path, _pdf, _html, _stats = run_quickscan(sys.argv[1])
     print_success(f"Quickscan complete — scan_id={sid} report={path}")
