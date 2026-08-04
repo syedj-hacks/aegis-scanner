@@ -43,7 +43,7 @@ findings as they become final, not all at once), record which tools actually ran
 summary panel because `summary_stats()` alone only knows DB-derived severity counts, never which
 tools actually ran.
 
-**All five profiles now write both a `.txt` and a `.pdf`** (via `finalise_reports()`), not just
+**All six profiles now write a `.txt`, a `.pdf` and a self-contained `.html`** (via `finalise_reports()`), not just
 deepscan — that is what makes retention's `.txt`/`.pdf` pairing meaningful for every profile.
 deepscan's 4-tuple return shape is kept for backward compatibility, not because it is the only
 profile with a PDF.
@@ -60,7 +60,7 @@ Nothing in `modules/` should call `subprocess` or `print()` directly — it goes
 | `logger.py` | `get_logger(target)` — one logger per target, writing to `output/<target>/scan_errors.log`. Also: `log_tool_start/success/failure/skip`, `log_finding`, `log_scan_start/end`. |
 | `display.py` | All terminal output (Rich-based): `print_banner/panel/phase/info/success/warning/error`, `print_table` (now includes a Description column), `print_tree`, `scan_progress_bar`, `print_summary(target, stats, show_tool_counts=True)`. |
 | `config.py` | Gitignored — `NVD_API_KEY`, `PROFILES`, `TOOL_TIMEOUTS`, `NMAP_TIMEOUTS`, `PROFILE_TIME_BUDGET_SECONDS`, `COMPULSORY_TOOLS`, `SKIP_KEY`, `CONDITIONAL_TOOLS`, `output_dir()`. Mirrored by `config.example.py` (tracked) — **keep both in sync when adding a config key**. `config.example.py` auto-loads a gitignored `.env` and ships a shared default `NVD_API_KEY` (§7). |
-| `modules/profiles/_common.py` | Shared profile-layer helpers — everything five orchestrators would otherwise each carry a copy of. `GLOBAL_AVAILABLE_TOOLS` (every tool with a real wrapper anywhere in the codebase) + `warn_unavailable_tools(target, tools, profile_name, wired_tools)`; `web_param_candidates()`, `classify_tool_outcome()`, `count_and_report_tool_failures()`, `persist_tool_run()`, `finalise_reports()`, and the `nuclei_*`/`named_description()` finding-shaping helpers. See §2.1. |
+| `modules/profiles/_common.py` | Shared profile-layer helpers — everything six orchestrators would otherwise each carry a copy of. `GLOBAL_AVAILABLE_TOOLS` (every tool with a real wrapper anywhere in the codebase) + `warn_unavailable_tools(target, tools, profile_name, wired_tools)`; `web_param_candidates()`, `classify_tool_outcome()`, `count_and_report_tool_failures()`, `persist_tool_run()`, `finalise_reports()`, and the `nuclei_*`/`named_description()` finding-shaping helpers. See §2.1. |
 
 ### 2.1 What lives in `_common.py` and why
 
@@ -89,6 +89,30 @@ This is why a scan against a dead host, a missing binary, or a mid-scan Ctrl+C s
 | `dns.py` | `resolve_dns(target)` | `nslookup`, socket fallback | resolved IP(s) |
 | `subdomain.py` | `enumerate_subdomains(target)` | `subfinder`, `amass` | discovered hostnames |
 | `osint.py` | `harvest_osint(target, source="crtsh", limit=500)` | `theharvester` | OSINT hits |
+| `cert_transparency.py` | `find_subdomains_crtsh(domain, target=None)` | crt.sh HTTP API | `{subdomains, count, source, skipped, error}` |
+| `cloud_enum_wrap.py` | `find_cloud_buckets(keyword, target=None)` | `cloud_enum` | `{buckets, inventory, count, skipped, error}` |
+| `leaked_creds.py` | `check_leaked_creds(emails, target=None)` | HIBP HTTP API | `{available, checked, breached_count, breached_accounts, clean_count, skipped, error}` |
+
+Three notes on the recon trio, each of which is the whole reason the module is shaped the way it is:
+
+- **`cert_transparency.py` never renders a failure as an empty result.** crt.sh is a single
+  volunteer-run service that 502s constantly (measured: three consecutive 502s while writing the
+  module, and again during live verification hours later). It retries three times with backoff,
+  and then reports an error — because "crt.sh is down" and "this domain has no certificates" are
+  different facts that must not look identical to a reader. It also rejects a 200 whose body is
+  not a JSON list: crt.sh serves an HTML error page with a 200 status under load.
+- **`cloud_enum_wrap.py` separates OPEN from merely EXISTING.** A bucket that exists but is
+  protected is inventory; only a publicly listable one is a finding. Reporting the former as an
+  exposure would inflate every recon report against any company that uses cloud storage, which is
+  all of them. Its line parser also requires a recognised provider URL — the obvious substring
+  test for `"s3"`/`"storage"` matches cloud_enum's own progress banners, so
+  `[*] Checking for S3 buckets` would be reported as a finding on every single run.
+- **`leaked_creds.py` treats "no API key" as an explicit state, not a result.** HIBP has required
+  a paid key on `breachedaccount` since 2019. The naive implementation — `200` means breached,
+  anything else means clean — turns the resulting `401` into "every address is clean", which is a
+  false all-clear on a security tool: the one output a reader acts on by doing nothing. So the
+  result carries `available: False`, only a genuine `404` from an authenticated request counts as
+  clean, and the profile's summary prints **NOT CHECKED** rather than a zero.
 
 ### `modules/scanning/` — Phase 4
 | File | Entry point | Tool(s) | Returns |
@@ -135,7 +159,7 @@ implementations, same data shape) — `compliance`, which passes `--script` dire
 | `nikto_wrap.py` | `run_nikto(target, port=80, use_https=False)` | `nikto` | `{findings: [{description, reference, test_id, path}], base_url, server, product, version, error, skipped}` — nikto exits 0 even on connection failure, so failure is detected from report text. `test_id`/`path` are nikto's own per-finding id and URI (both `""` on tests that print neither, e.g. `"Apache/2.4.25 appears to be outdated"` has no URI); `server`/`product`/`version` come from its `Server:` banner line, with `"No banner retrieved"` treated as no banner. **Invoked with `-nointeractive -ask no`**: after a scan that hit unknown server strings, nikto 2.6 prints a "submit this to CIRT.net? (y/n)" prompt and was observed blocking on stdin *even under `-nointeractive`*, burning the full 600s timeout and having every finding discarded — `-ask no` answers it up front. `-maxtime` is set to the tool timeout minus a deliberately generous 90s margin (nikto only checks `-maxtime` between tests, so a slow batch overshoots) so nikto self-terminates and flushes its report instead of being SIGKILLed at the wire. A timeout that *does* overshoot is salvaged rather than discarded: if the captured output already contains findings, they are parsed and kept with the timeout recorded in `error`; any other failure (missing binary, target never connected) still returns empty |
 | `gobuster_wrap.py` | `run_gobuster(target, port=80, use_https=False, wordlist=None)` | `gobuster dir` | `{discovered_paths: [{path, status_code, size, redirect, url}], base_url, wordpress_fingerprinted: bool, error, skipped}`; auto-retries with `--exclude-length` on SPA wildcard responses. `size`/`redirect` are gobuster's own `[Size: n]` / `[--> target]` and are `None` where it printed neither — a 0-byte page and an unreported size are different facts |
 | `dirb_wrap.py` | `run_dirb(target, port=80, use_https=False, wordlist=None)` | `dirb -S -w -r` | `{discovered_paths: [{path, status_code, size, redirect, url}], raw_output, error, skipped}` — see below for the wordlist/failure-detection fix. `size` is dirb's own `SIZE:` (captured by the regex since the module was written, previously discarded when the dict was built); `redirect` is always `None` — dirb does not report redirect targets |
-| `whatweb_wrap.py` | `run_whatweb(target, port=80, use_https=False)` | `whatweb -a 3` | `{technologies: [{name, value}], cms_detected: str\|None, raw_output, error, skipped}` — `cms_detected` still has no consumer (§5.6) |
+| `whatweb_wrap.py` | `run_whatweb(target, port=80, use_https=False)` | `whatweb -a 3` | `{technologies: [{name, value}], cms_detected: str\|None, raw_output, error, skipped}` — `cms_detected` now feeds deepscan's wpscan trigger alongside gobuster's flag (§5.6) |
 | `nuclei_wrap.py` | `run_nuclei(target, port=80, use_https=False, severity=None)` | `nuclei -jsonl -silent` | `{findings: [{template_id, name, severity, description, matched_at, reference, cve_id}], raw_output, error, skipped}` — `cve_id` (new) is comma-joined from `info.classification.cve-id`, threaded through by every profile that persists nuclei findings |
 | `sqlmap_wrap.py` | `run_sqlmap(target, url)` | `sqlmap --batch --random-agent --level 1 --risk 1 --banner --current-db --dbs` | `{injectable: bool, findings: [{parameter, method, type, title, payload, techniques}], metadata: {dbms, banner, current_db, databases}, raw_output, error, skipped}` — see below |
 | `xss_wrap.py` | `run_xss(target, url)` | `nuclei -dast -tags xss -jsonl -silent` | `{vulnerable: bool, findings: [{template_id, name, severity, parameter, method, payload, endpoint, matched_at, evidence, reference}], raw_output, error, skipped}` — records itself in `tool_results` under the name **`nuclei-xss`**. Rejects a URL with no `?` up front (see below) |
@@ -212,10 +236,12 @@ procedure if it ever does.
 | `report_txt.py` | `generate_txt_report(scan_id, output_path=None)` | Blocks: header → scope note → severity summary → top findings → **Injection & Scripting Vulnerabilities** → detail. `preview_report()` calls `print_summary(..., show_tool_counts=False)` — see `display.py` below for why. |
 | `report_pdf.py` | `generate_pdf_report(scan_id, output_path=None)` | WeasyPrint, imported lazily. All interpolated values are HTML-escaped. Same block order as the TXT report, plus an inline **severity-distribution donut SVG** on the cover, generated from the same `by_severity` counts the summary block prints (no chart library, no external asset — the CSS/SVG is written inline so the PDF has no network dependency). |
 | `retention.py` | `retain_reports(target, profile, paths, scan_id=, non_interactive=)`, `report_filename()`, `prune_reports()`, `list_stored_reports()` | Capped, indexed report history — see §3.3. |
-| `completion.py` | `print_report_summary(target, profile, scan_id, summary, txt_path=, pdf_path=)` | The `+- REPORT GENERATED -+` block printed last: severity line, `notable_types()` (e.g. "2 CVEs, 7 ZAP alerts, 13 discovered paths"), the profile's scope note, and both file paths as OSC 8 terminal hyperlinks over a `file://` URI. Terminals without OSC 8 support just show the plain path, which is why the full path is always written out rather than hidden behind link text. |
+| `report_html.py` | `generate_html_report(scan_id, output_path=None, duration=None)` | Self-contained single-file HTML report — see §3.5. Generated for every profile from `_common.finalise_reports()`. |
+| `dashboard_live.py` | `init_live_dashboard(target)`, `update_live_data(...)`, `finalize_live_dashboard(...)`, `shutdown_live_dashboard(target)` | The live browser view, served over localhost — see §3.6. |
+| `completion.py` | `print_report_summary(target, profile, scan_id, summary, txt_path=, pdf_path=, html_path=)` | The `+- REPORT GENERATED -+` block printed last: severity line, `notable_types()` (e.g. "2 CVEs, 7 ZAP alerts, 13 discovered paths"), the profile's scope note, and both file paths as OSC 8 terminal hyperlinks over a `file://` URI. Terminals without OSC 8 support just show the plain path, which is why the full path is always written out rather than hidden behind link text. |
 | `attribution.py` | `check_finding(finding, profile, ran_tools=None)`, `check_scan(scan_id, profile, findings)` | Attribution correctness for stored findings — see §3.4. Not called during a scan; it is the audit layer `tests/db_sweep.py` runs. |
 
-Both writers return the path or `None` — they never raise.
+All writers return the path or `None` — they never raise.
 
 ### 3.2 `summary.py` is the shared report vocabulary
 
@@ -308,10 +334,76 @@ Check 1 answers on one of two bases, and every issue it raises is stamped with w
   captured.**
 
 Two normalisation rules keep this honest rather than noisy: `_PRODUCER_ALIASES` maps the wrapper
-names `nmap_service_detect` → `nmap` and `nuclei-xss` → `nuclei`, and `UNTRACKED_PRODUCERS`
+names `nmap_service_detect` → `nmap`, `nuclei-xss` → `nuclei` and `subdomain_enum` →
+`{subfinder, amass}` (an alias value may be a set — that one wrapper drives both tools, and its
+merged output genuinely came from whichever succeeded), and `UNTRACKED_PRODUCERS`
 grants `nvd` per-scan whenever the profile does CVE enrichment at all — the NVD lookup is an
 in-process REST call, never a subprocess in `tool_results`, so it can never be recorded as "ran"
 and every stored `cve` row would otherwise be flagged the moment its scan gained a record.
+
+`ran_producer_set()` lowercases tool names before matching. It did not, and the consequence was
+invisible for months: `theHarvester` (the binary's own capitalisation, and what `osint.py` stamps
+on its result) never matched producer `theharvester`, so any finding credited to it would be
+reported as produced by a tool that never ran. Nothing surfaced it because theharvester sat in
+`NON_FINDING_TOOLS` for every profile — until `recon` made it a real producer of a persisted
+finding type, at which point the whole-database sweep failed immediately. The sweep earning its
+keep on a bug introduced two hours earlier is the argument for having it.
+
+### 3.5 `report_html.py` — the self-contained HTML report
+
+One file, no network. Inline CSS and JS, a hand-written SVG severity donut, and a
+sortable/filterable findings table in ~60 lines of vanilla JavaScript. That is a requirement
+rather than a preference: these reports get attached to emails, opened on review machines and
+archived alongside an engagement, so a page that loses its styling when a CDN is unreachable — or
+that phones a third party every time an assessor opens it — is not a deliverable.
+
+**Every value is escaped, and the reason is specific.** Findings contain raw tool output: nikto
+descriptions, gobuster paths, ZAP alert prose, whatweb banners. A discovered path is literally
+attacker-influenced content, and that text routinely contains `<`, `>` and `&`. So nothing is
+interpolated into markup as a string. The findings are serialised with `json.dumps` into a
+`<script type="application/json">` block with those three characters replaced by unicode escapes
+(otherwise a finding whose description contains the literal `</script>` breaks the page open), and
+the table is built with `textContent`. Header values that do reach markup go through
+`html.escape()`. Verified against a payload containing `</script><img src=x onerror=...>`: the
+page still parses as exactly two script elements.
+
+Two caps exist because recon changed the volume assumptions: the recon section renders at most 250
+rows and states the true total, since a passive sweep legitimately returns tens of thousands of
+subdomains and inlining them produces a multi-megabyte page nobody scrolls. The donut also has an
+explicit empty state — a donut with no segments is an invisible chart, which reads as a broken
+page rather than as good news.
+
+### 3.6 `dashboard_live.py` — the live scan dashboard
+
+**It is served, not opened as a file, and that is the whole design constraint.** The obvious
+implementation writes `live_dashboard.html` and `live_data.json` next to each other, opens the HTML
+with `xdg-open`, and has the page `fetch()` the JSON every couple of seconds. That does not work,
+and it fails silently: a page opened as `file:///…` has a null origin, and every modern browser
+refuses `fetch()`/XHR against `file://` URLs. The dashboard would render its empty shell and sit at
+"waiting for data…" for ever while the scan ran perfectly well beside it, with the real reason
+visible only in the browser console.
+
+So a `ThreadingHTTPServer` is started on `127.0.0.1` with port `0`. Scope of that server is
+deliberate: bound to loopback and **never** `0.0.0.0` (a scan's output directory holds findings
+about a third party), serving exactly one target's own directory, on an OS-assigned port so two
+concurrent scans cannot collide, on a daemon thread so it cannot outlive the process. If it cannot
+start, `init_live_dashboard()` returns `None` and the scan proceeds unchanged — the live view is an
+optional extra and nothing about a scan's real output depends on it.
+
+`live_data.json` is rewritten whole through a temp file and `os.replace()`, which is atomic on
+POSIX, so a polling browser reads either the whole previous document or the whole new one. A
+partial read is a JSON parse error, which the page would show as a broken dashboard on a scan that
+is fine. State is per-target and lock-guarded, because the profiles run web tools concurrently.
+
+**There is no `use_live` parameter anywhere in the orchestrators.** `update_live_data()` no-ops for
+a target whose dashboard was never started, so profiles call it unconditionally and the scan code
+path is byte-identical whether or not anyone is watching. That is why enabling the dashboard
+required no signature change to six orchestrator functions.
+
+The one wart, documented rather than hidden: the server dies with the process, so the completion
+banner it shows is unreachable a moment after the scan ends. `aegis.py` holds an interactive
+`--live` run open at the end to compensate; a scripted run is told plainly where the static report
+is instead. Making the thread non-daemon would hang every scripted run.
 
 `display.py:print_summary(target, stats, show_tool_counts=True)` gained `show_tool_counts` —
 `report_txt.py`'s mid-run preview panel used to show a permanently-stale "Tools run: 0" (the
@@ -320,17 +412,32 @@ real stats dict doesn't exist yet at that point in a profile run), so the previe
 the real final SCAN SUMMARY panel that follows immediately after has the correct counts.
 
 ### `modules/profiles/` — Phase 8 (orchestration layer)
-See §4 for per-profile behavior. All five now share `modules/profiles/_common.py`'s
-`warn_unavailable_tools()` (§2) instead of a hand-rolled per-profile copy, and all five persist
+See §4 for per-profile behavior. All **six** share `modules/profiles/_common.py`'s
+`warn_unavailable_tools()` (§2) instead of a hand-rolled per-profile copy, and all six persist
 findings incrementally (per phase/port) rather than in one batch at the end (§5.7).
+
+All six also now return the same shape — `(scan_id, txt_path, pdf_path, html_path, stats)` — and
+get their HTML report from the single `finalise_reports()` call rather than each writing one.
+`aegis._normalize_result()` needed no change for the added element because it detects the trailing
+`stats` dict instead of assuming a tuple length.
 
 - **`quickscan.py`** — **now actually runs `whatweb` + `nuclei`** against the first detected web
   port (nuclei scoped to `nuclei_severity: ["critical", "high"]` to stay fast). This closes what
   used to be quickscan's biggest gap: `PROFILES['quickscan']['tools']` listed `whatweb`/`nuclei`
   since early on, but nothing ever called them, so quickscan and stealthscan used to come back
   near-identical.
-- **`stealth.py`** — unchanged in scope (nslookup + nmap only), migrated onto the shared
-  `warn_unavailable_tools()` helper. See §4 for its port-list redesign.
+- **`stealth.py`** — now runs **one `whatweb` fingerprint** against the first open web port, and
+  deliberately nothing else. whatweb costs a handful of requests against a port that has already
+  been scanned, and it turns "port 80 is open" into "port 80 is nginx 1.18 running WordPress" —
+  the difference between an open-port list and a usable one. **`nuclei` is listed in this
+  profile's `tools` but never wired**, which is not an oversight: listing it is what makes
+  `warn_unavailable_tools()` print an explicit "has a wrapper but is not run by this profile, by
+  design" note instead of the tool being invisibly absent. Running it would fire thousands of
+  templated requests per port and make the quietest profile the second-loudest while its nmap half
+  was still politely pacing at `-T2` — a profile that is quiet in one half and loud in the other
+  is not a quiet profile, it is one that misrepresents itself. `tests/t_stealth_guard.py` §E
+  enforces this by checking `_WIRED_TOOLS` rather than the config list. See §4 for the port-list
+  redesign.
 - **`webaudit.py`** — per-port loop bounded by `PROFILE_TIME_BUDGET_SECONDS['webaudit']` (30
   min); `banner_grab` now skips ports already known to be web ports (they don't send an
   unsolicited banner). Runs the **XSS pass** (`xss_wrap.run_xss()` over
@@ -349,6 +456,29 @@ findings incrementally (per phase/port) rather than in one batch at the end (§5
 - **`compliance.py`** — **now also runs `whatweb`** alongside `sslyze`, both targeting whichever
   port(s) `ssl-enum-ciphers` identified as TLS-speaking (443 fallback if open). Persists per-TLS-
   port rather than batched across all of them.
+- **`recon.py`** — the passive attack-surface mapper, and the profile that breaks the most
+  assumptions the other five share, deliberately:
+  - **It contacts nothing.** Every source is public — crt.sh certificate logs, DNS aggregators,
+    cloud storage namespaces, a breach database. That is what makes it safe to run against a name
+    you do not yet have authorisation to scan, and why it is a separate profile rather than a
+    phase of deepscan (which is emphatically not passive).
+  - **Its target may not be a host.** It accepts a company name as well as a domain. `_plan()`
+    decides which steps are *applicable* rather than running everything and reporting failures for
+    steps that were never applicable: with no domain there is nothing to resolve, no CT logs to
+    query and no subdomains to enumerate, so those three do not run and are not counted as
+    failures. This is also the first place free text reaches the filesystem, which is why
+    `config.safe_target_dirname()` exists.
+  - **It caps what it persists as findings.** `_MAX_SUBDOMAIN_FINDINGS = 100`, plus one summary
+    row stating the true total. Measured, not guessed: a passive run against example.com returned
+    23,330 unique names, and one finding each produces a report whose signal sits at row 12,000.
+    Every name is still kept in `recon_subdomains`. Names corroborated by more sources survive the
+    cap first — `vpn.example.com` is a better lead than `0.0.1.example.com`, which alphabetical
+    ordering would have preferred.
+  - Its findings go through the **normal** pipeline (`recon_subdomain`/`recon_bucket`/`recon_leak`
+    scored by `severity.py`, remediated by `remediation.py`), so they reach the reports, the
+    summary and the diff with no special-casing. The `recon_*` tables hold only what `findings`
+    structurally cannot: a subdomain's source, a bucket's provider, and the one-to-many between a
+    breached address and its breaches.
 
 ### `database/db.py`
 SQLite at `database/aegis.db`. Three tables:
@@ -357,9 +487,36 @@ SQLite at `database/aegis.db`. Three tables:
 scans (id, target, timestamp, profile)
 findings (id, scan_id, port, service, version, cve_id, cvss, severity,
           description, remediation, finding_type, product,
-          parameter, payload, evidence, endpoint, reference)
+          parameter, payload, evidence, endpoint, reference,
+          cvss_vector, compliance_refs)
 scan_tools_run (id, scan_id, tool_name, port, outcome)   -- outcome: ran|skipped|failed
+
+-- recon mapper (every row here ALSO becomes a `findings` row, so it reaches the
+-- reports/summary/diff with no special-casing; these hold what findings cannot,
+-- and all of what the 100-finding subdomain cap leaves out)
+recon_subdomains (id, scan_id, subdomain, source)
+recon_buckets    (id, scan_id, bucket_url, provider, access)  -- access: open|protected|unknown
+recon_leaks      (id, scan_id, email, breach_name, breach_date)
 ```
+
+**`insert_findings_bulk()` filters before inserting**, and both halves are easy to get wrong in the
+direction that loses data:
+
+- *Ghost rows* — no declared `finding_type` **and** no substantive field — are dropped. Both halves
+  are required, and the type half is what keeps it safe: an `open_port` on a port nmap could not
+  name a service is a real observation with nothing else populated. The 42 known ghosts (scans 3
+  and 11) carry no type at all, **not** `finding_type == 'port_scan'`, so a filter keyed on that
+  string would have removed nothing.
+- *Within-batch duplicates* collapse on `diff.finding_key()` — `(finding_type, port, identifier)`,
+  lazily imported to dodge the import cycle. The obvious key `(port, finding_type, cve_id)` would
+  collapse every CVE-less finding on a port into one row: 6,580 `discovered_path` rows in this
+  database become a handful. Deduplication that deletes real findings is worse than the duplicates
+  it removes. Scope is one batch because profiles insert per-port, so a batch is the unit in which
+  a mapper can emit the same finding twice.
+
+`_insert_recon_rows()` **reports** a failed write rather than swallowing it. It passed silently
+once, and what that hid was a 15-minute recon run writing all 10,925 of its rows into a table that
+did not exist: `python3 -m modules.profiles.recon` bypasses `aegis.py`'s `init_db()`.
 
 `init_db()` runs an idempotent migration (`PRAGMA table_info(findings)` → `ALTER TABLE ... ADD
 COLUMN` for any of `description`/`remediation`/`finding_type`/`product`/`parameter`/`payload`/
@@ -402,12 +559,33 @@ fallback), `PROFILE_DISPATCH` (name → orchestrator function), `_normalize_resu
 the 3-tuple/4-tuple return shapes from profiles — detects the trailing `stats` dict rather than
 assuming a fixed length), `main()`.
 
-**Target and `--profile` are optional.** If the target is omitted entirely (bare
-`python3 aegis.py`), the CLI drops into interactive mode via `_prompt_target()`/
-`_prompt_profile()`. If a target *is* supplied but `--profile` isn't, it silently defaults to
-`quickscan`, no menu — unchanged, fully backward compatible.
+**Three top-level modes.** A bare `python3 aegis.py` with *no arguments at all* shows a mode menu
+(`_prompt_mode()`): 1 vulnerability scan, 2 recon mapper, 3 scan diff. **Any argument that already
+states an intent — a target, `--profile`, `--recon` — skips the menu entirely.** That is the
+backward-compatibility contract in one line: the menu is what you get when you have told the tool
+nothing, not a step inserted in front of people who have.
 
-Flags: `[target] [--profile ...] [-v/--verbose] [--non-interactive] [--version]`.
+**Target and `--profile` are optional.** With the target omitted, the CLI prompts via
+`_prompt_target()`/`_prompt_profile()`. If a target *is* supplied but `--profile` isn't, it
+silently defaults to `quickscan`, no menu — unchanged.
+
+`--recon` is the one mode that **accepts free text**: `_prompt_recon_target()` applies no hostname
+validation, because "Acme Corp" is a supported input, and `is_company` is decided by whether the
+input parses as a hostname. Mode 3 / `--diff` runs no scan; `_prompt_scan_pair()` lists the last
+ten scans and normalises the chosen pair to (older, newer) so the delta reads forwards in time.
+
+`_maybe_start_live_dashboard()` starts the browser view. **No `use_live` flag is threaded into the
+orchestrators** — `update_live_data()` no-ops for a target with no dashboard, so the scan path is
+identical either way. `_hold_dashboard_open()` keeps the process alive at the end of an interactive
+`--live` run, because the server is a daemon thread and would otherwise die at exactly the moment
+the dashboard would show its completion banner.
+
+`_print_attack_surface_delta()` prints a one-line delta against the previous scan of the same
+target after **every** scan (silent on a first scan); the full table stays behind `--diff`.
+
+Flags: `[target] [--profile ...] [-v/--verbose] [--non-interactive] [--targets ...]
+[--auth-cookie/--auth-header ...] [--diff A B] [--diff-verbose] [--recon] [--live|--no-live]
+[--version]`.
 **`--non-interactive`** never prompts — when the stored-report cap (§3.3) is reached it deletes
 the oldest report automatically instead of asking. It is implied whenever stdin/stdout is not a
 terminal, so piped runs, cron and the smoke-test harness get that behavior without passing it.
@@ -422,16 +600,17 @@ makes the final "Tools run/failed/skipped" line correct.
 
 ## 4. Profile behavior cheat sheet
 
-Every profile writes **both** a TXT and a PDF report (§1), named per scan and capped per
-profile+target (§3.3).
+Every profile writes a TXT, a PDF **and** a self-contained HTML report (§1, §3.5). The TXT/PDF
+are named per scan and capped per profile+target (§3.3).
 
 | Profile | Tools it actually runs | Ports scanned | 2nd nmap `-sV -sC` pass? | CVE/severity enrichment |
 |---|---|---|---|---|
 | `quickscan` | nslookup, nmap, nmap -sV -sC, **whatweb + nuclei on the first open web port** | top ports (`-T4 -F`) | yes | web findings scored; raw port/service persisted unscored (LOW default) |
-| `stealthscan` | nslookup, nmap | curated ~20-port list (`-T2 -Pn --randomize-hosts`) | **no** (deliberately, to avoid doubling probe traffic) | no |
+| `stealthscan` | nslookup, nmap, **whatweb on the first open web port only** (nuclei listed but never wired — see §3) | curated ~20-port list (`-T2 -Pn --randomize-hosts`) | **no** (deliberately, to avoid doubling probe traffic) | whatweb findings scored; open ports unscored |
 | `webaudit` | nslookup, nmap, header check, nikto, gobuster, dirb, whatweb, banner grab (non-web ports only), sslyze (if https), **XSS pass (nuclei `-dast -tags xss`)** | 80/443/8080/8443 only | no | web findings + nmap-script findings + `Server` banner CVE lookup |
 | `deepscan` | nslookup, subfinder, amass, theharvester, nmap (bare discovery sweep, **no** -sV/-sC), nmap -sV -sC (2nd targeted pass — nmap-script findings come from here now), banner grab (non-web ports only), header check, nikto, gobuster, dirb, whatweb, nuclei, **XSS pass**, ZAP baseline, + conditionally sqlmap, hydra, wpscan, enum4linux | discovery: all ports; web module on any detected web port | yes | yes, on every finding |
 | `compliance` | nmap (`--script ssl-enum-ciphers,http-headers`), **sslyze + testssl.sh + whatweb** (on the port(s) ssl-enum-ciphers identified) | 80/443/8443 (script-targeted) | no | nmap-script + sslyze + testssl + whatweb findings, scored/remediated, **plus PCI-DSS/ISO 27001/NIST 800-53 `compliance_refs` (this profile only)** |
+| `recon` | nslookup, **crt.sh, subfinder + amass, theHarvester, cloud_enum, HIBP** | **none — sends nothing to the target** | no | recon findings scored/remediated: leak HIGH, bucket MEDIUM, subdomain LOW |
 
 `compliance` is the only profile that skips DNS resolution — `"nslookup"` isn't in
 `PROFILES['compliance']['tools']`, and the orchestrator follows that config literally.
@@ -560,9 +739,13 @@ type with no honest mapping gets NONE rather than a loosely-related control.
 
 ### Diffing (`modules/reporting/diff.py`)
 
-`diff_scans(a, b)` -> new / fixed / **unverified** / changed / unchanged.
+`diff_scans(a, b)` -> new / fixed / **unverified** / changed / **escalated** / **deescalated** /
+unchanged, plus `counts` and a one-line `delta_summary`. `escalated`/`deescalated` partition
+`changed` by direction; `changed` is kept whole so existing readers see exactly what they saw
+before. Rendering: `render_diff()` (plain text, for a cron mail body), `print_diff()` (Rich table
+for a terminal), `generate_diff_report()` (writes `output/<target>/diff_<a>_to_<b>.txt`).
 
-Two design points that are the whole value of it:
+Three design points that are the whole value of it:
 
 - Findings are matched on a **stable identity key** `(finding_type, port,
   identifier)` — never a dict hash. Descriptions carry byte counts, status
@@ -575,6 +758,44 @@ Two design points that are the whole value of it:
 - **"Fixed" is not claimed when it cannot be.** A finding absent from scan B
   whose producing tool did not RUN in B is reported as `unverified`, not fixed —
   a crashed nikto must not read as "everything nikto found is remediated".
+  Observed live on a real pair in this database: scans 139→179 produce
+  "0 fixed, 71 unverified". A naive diff would have announced 71 findings fixed.
+- **Severity changes are reported by direction, and only when comparable.**
+  `_severity_direction()` returns 0 — not an escalation — when either label is
+  missing or unrecognised. An unscored finding compared against a scored one is
+  evidence that one scan did not score it, not that risk moved, and manufacturing
+  an alarm out of a schema gap is the same class of error as inventing churn.
+  `print_diff()` also warns when the two scans are of **different targets**: that
+  is not a delta, it is two unrelated scans subtracted from each other, and an
+  unlabelled "23,330 new findings" would read as a catastrophic regression.
+
+## 4b. Recon / dashboard subsystems (2026-08-05)
+
+### Recon mapper (`modules/profiles/recon.py`, `modules/recon/*`)
+
+Covered in §3 (per-module contracts) and §4 (cheat sheet). The three things that make it
+structurally different from every other profile: it **contacts nothing**, its **target may not be
+a host**, and it is the first place **free text reaches the filesystem** (hence
+`config.safe_target_dirname()`). Its findings go through the normal severity/remediation pipeline
+so the reports, summary and diff need no special-casing; the `recon_*` tables carry only what
+`findings` cannot express and what the 100-finding subdomain cap leaves out.
+
+### HTML report and live dashboard
+
+See §3.5 and §3.6. The two constraints worth carrying in your head before touching either:
+**nothing may reference an external resource** (these are emailed and read offline), and **the
+dashboard must be served, not opened as a file** (browsers block `fetch()` on `file://`, and the
+failure is silent).
+
+### Report/severity vocabulary added this pass
+
+| Finding type | Severity | Producer(s) | Why that grade |
+|---|---|---|---|
+| `recon_leak` | HIGH | `hibp` | A credential for this address is in a public breach corpus. Given password reuse that is a live authentication risk now — the one recon finding to act on today. |
+| `recon_bucket` | MEDIUM | `cloud_enum` | Real exposure, but the cloud namespace is global so a keyword match is not proof of ownership. Needs confirmation before it is anyone's incident. |
+| `recon_subdomain` | LOW | `crtsh`, `subfinder`, `amass`, `theharvester` | A name exists. It may not resolve, may be unreachable, and may be entirely intended — a lead to scan, not a weakness. Anything higher floods the report with hundreds of MEDIUMs and buries the two findings that matter. |
+
+---
 
 ## 5. Known gaps (intentional — read before "fixing")
 
@@ -596,9 +817,15 @@ Two design points that are the whole value of it:
    with no error logged against it specifically).
 2. **`webaudit` never calls `zaproxy`; `deepscan` never calls `sslyze`.** Both deliberate scoping
    decisions in each profile's own docstring / `_WIRED_TOOLS` set, not oversights.
-3. **`whatweb`'s `cms_detected` flag has no consumer.** `whatweb_wrap.py` detects WordPress/
-   Joomla/Drupal independently of gobuster, but nothing branches on it — deepscan's `wpscan`
-   dispatch still only checks gobuster's `wordpress_fingerprinted`.
+3. ~~**`whatweb`'s `cms_detected` flag has no consumer.**~~ **RESOLVED 2026-08-05.** `deepscan`
+   now ORs it with gobuster's `wordpress_fingerprinted`, so either signal dispatches `wpscan`, and
+   the log names which one fired. Keeping both is the point rather than redundancy: gobuster infers
+   WordPress from brute-forced paths and so only fires when `/wp-admin` or `/wp-content` sit at
+   guessable locations — a renamed content directory, a 403, or a wordlist without the right entry
+   and wpscan never ran on a WordPress site — whereas whatweb reads the generator meta tag, `wp-*`
+   asset paths and cookies straight out of the response. The bug was that `deepscan` discarded its
+   whatweb result at the end of each per-port loop iteration; it collects them in `whatweb_results`
+   now.
 4. **`CONDITIONAL_TOOLS` firing has mainly been verified against purpose-built targets**, not
    this project's two default smoke-test targets (scanme.nmap.org, pentest-ground.com — neither
    meets any of the four trigger conditions on its own). Correct target-dependent behavior.
@@ -649,6 +876,32 @@ Two design points that are the whole value of it:
     so a fresh clone is caught at install time instead of at scan time. The pinless requirement
     resolves to the 0.1.0 shim, which pulls in the renamed `zaproxy` 0.6.0 — verified to still
     provide `zapv2`/`ZAPv2` with the exact surface `zap_wrap.py` uses.
+14. **`cloud_enum` has never actually run here.** The wrapper is complete and its parser is tested
+    against captured output, but the binary is not installed on this machine (`sudo` needs a
+    password), so bucket discovery has only ever been exercised through its honest "binary not
+    found on PATH" branch. **That half of the recon profile is unverified live.** Install it and
+    re-run before claiming otherwise.
+15. **`pip install cloud-enum` installs an empty package.** The PyPI name is a placeholder whose
+    own metadata reads *"Reserved name placeholder. No functionality."* It exits 0 and provides
+    nothing, so the tool looks installed while the wrapper logs "binary not found" for ever. Use
+    apt's `cloud-enum` (Kali 0.8-1) or `github.com/initstring/cloud_enum`; `install.sh` does, and
+    says why. This is a supply-chain trap, not a packaging inconvenience.
+16. **crt.sh is chronically down.** 502 on every attempt across two sessions hours apart, so a
+    *successful* certificate-transparency lookup has not been observed on this machine. The
+    wrapper retries and then reports a failure — it never renders one as "zero subdomains", which
+    is what keeps this a known gap rather than a silent wrong answer.
+17. **The HIBP breach check is inert without a paid API key**, and reports NOT RUN rather than
+    clean. Only its no-key path has been exercised here. The failure mode it was written against
+    is worth restating: `200 = breached, anything else = clean` turns the resulting 401 into "every
+    address is clean" — a false all-clear, the one output a reader acts on by doing nothing.
+18. **The live dashboard dies with the process.** Its server is a daemon thread, so the completion
+    banner is unreachable a moment after a run ends; `aegis.py` holds an interactive `--live` run
+    open to compensate. Do **not** "fix" this by making the thread non-daemon — that hangs every
+    scripted run.
+19. **Recon subdomain findings are capped at 100 + a summary row.** Not a bug and not a parsing
+    limit: a passive sweep of example.com returned 23,330 names. The full set is in
+    `recon_subdomains`; the HTML recon section separately caps its table at 250 rows and states
+    the true total.
 
 ---
 
@@ -708,6 +961,10 @@ aegis-scanner/
 | `tests/t_phase*.py` | Plain-stdlib assertion scripts, one per work pass, run as `python3 tests/t_phaseN.py`. No pytest dependency — they exit non-zero on failure. |
 | `tests/fixtures/` | Real captured output from gobuster/nikto/nuclei/ZAP, committed so parser changes are tested against what the tools actually print, not against invented strings. |
 | `tests/t_pty.py` | The skip-key and Ctrl+C paths under a real PTY — the listener is inert on a non-TTY, so nothing else can exercise them. |
+| `tests/t_stealth_guard.py` | That `stealthscan` is still quiet: small fixed port list, `-T2`, sequential, and (§E) that it **wires in** no sweeping tool. §E deliberately checks `_WIRED_TOOLS` rather than the config `tools` list — what makes a profile loud is what it runs, and the two differ on purpose here. |
+| `tests/t_cvss.py`, `tests/t_diff.py`, `tests/t_testssl.py` | The local CVSS v3.1 engine, scan diffing, and the testssl.sh wrapper. |
+
+All twelve suites total **590 assertions**, expected to pass with zero failures.
 | `tests/db_sweep.py` | The gate: renders **every** scan in `database/aegis.db` and checks crashes, ambiguous cells, duplicate rendered lines, **and** attribution (§3.4). Exits 0 only when everything passes. `python3 tests/db_sweep.py` for all scans, `python3 tests/db_sweep.py 138 139` for specific ids. Attribution lives here rather than in a separate script for a specific reason: the regression it exists to catch was missed because that question was nobody's job — run as one command, it cannot be the step someone forgets. |
 | `smoke_test/smoke_testN.txt` | The written evidence for pass N: what was run, against what, what it produced, and — the part that matters — what is still open. Each pass opens by resolving the previous pass's open items. |
 | `tools/backfill_nuclei_identity.py` | A one-off historical repair, kept for the record. Dry-run unless `--apply`, writes a before/after dump before any write, supports `--revert`, and only writes a row when two independent derivations of its template id agree (2 rows were skipped rather than guessed). It deliberately did **not** correct `port`: that value was never recorded for those runs, so writing it in would insert an inferred value into a historical record rather than restore an observed one. |
@@ -731,6 +988,16 @@ aegis-scanner/
   via a background cbreak-mode listener thread in `error_handler.py` (`_SkipKeyListener`) that
   only activates when stdin is a real TTY — inert on any non-interactive run (piped input, CI,
   the smoke-test harness).
+- **`LIVE_DASHBOARD_POLL_MS = 2000`** — how often the live dashboard re-fetches `live_data.json`;
+  baked into the page when it is generated.
+- **`safe_target_dirname(target)`** — reduces a target to one safe path segment before
+  `output_dir()` uses it. Characters are replaced rather than stripped so two targets cannot
+  collapse onto one directory. Every profile but `recon` passes a validated hostname and this never
+  fires; `recon` accepts free text, and `--recon "../../etc/evil"` wrote outside `output/` before
+  it existed.
+- **`AEGIS_HIBP_API_KEY`** (`.env`/env only, no default and there should not be one) — an HIBP key
+  is a paid personal credential, so shipping one would bill someone else's account for every
+  clone. Without it the breach check reports NOT RUN.
 - **Ctrl+C** now skips just the current tool on a single press (same as the skip key) unless it's
   the second press within 2 seconds, which aborts the whole scan (`KeyboardInterrupt` propagates
   up to `aegis.py`) — previously a single Ctrl+C always aborted the entire scan regardless of
@@ -762,10 +1029,11 @@ first run (never overwrites an existing file).
   `modules.profiles._common.warn_unavailable_tools()` with this profile's own `_WIRED_TOOLS` set,
   wrap steps in `scan_progress_bar()`, persist findings incrementally as they're produced (not
   batched at the end), call `persist_tool_run(scan_id, tool_results)` right after computing the
-  stats dict, finish through `finalise_reports()`, and return `(scan_id, report_path, stats)`.
+  stats dict, finish through `finalise_reports()`, and return the uniform 5-tuple
+  `(scan_id, txt_path, pdf_path, html_path, stats)`.
   Also add the profile to `attribution.PROFILE_PRODUCERS` — a drift guard asserts every
   `_WIRED_TOOLS` entry appears there, so a profile missing from it fails the test suite.
-- New finding kind → this is now a five-place change, and the checks will tell you if you miss
+- New finding kind → this is now a **six**-place change, and the checks will tell you if you miss
   one:
   1. Give it a stable `finding_type` and set `description`/`remediation`/`type`/`product` (plus
      `parameter`/`payload`/`evidence`/`endpoint`/`reference` where they apply) directly on the
@@ -777,7 +1045,10 @@ first run (never overwrites an existing file).
      triggers), and to `summary._NOT_APPLICABLE` for every field it can never carry.
   4. Add it to `attribution.FINDING_TYPE_PRODUCERS`, and to `REQUIRED_FIELDS` only if its
      identity column is genuinely certain.
-  5. If it is an injection/scripting class, add it to `summary.INJECTION_FINDING_TYPES` so both
+  5. Make sure every producer you named appears in `attribution.PROFILE_PRODUCERS` for at least
+     one profile — `t_phase9` asserts "no finding type is produced by a tool no profile runs",
+     which the recon types failed until `PROFILE_PRODUCERS['recon']` existed.
+  6. If it is an injection/scripting class, add it to `summary.INJECTION_FINDING_TYPES` so both
      report writers pick it up from the one definition.
 - **Never key a classifier on a column merely being present.** SQLite rows carry every column, so
   `"reference" in finding` became true of every stored row the moment that column was added and
@@ -786,8 +1057,18 @@ first run (never overwrites an existing file).
 - New tool that produces findings → give its wrapper result a `tool` name, make sure it reaches
   `tool_results` (that is what gets recorded in `scan_tools_run`), and if the wrapper name differs
   from the producer name, add the mapping to `attribution._PRODUCER_ALIASES` (as `nuclei-xss` →
-  `nuclei` does). A producer that never flows through `tool_results` at all needs an entry in
-  `UNTRACKED_PRODUCERS` with a reason, or every finding it produces will be flagged.
+  `nuclei` does). An alias value may be a **set** where one wrapper drives several tools —
+  `subdomain_enum` → `{subfinder, amass}`. Names are matched lowercased: `theHarvester` silently
+  failed to match producer `theharvester` for months, latent only because theharvester was in
+  `NON_FINDING_TOOLS` until `recon` made it a real producer. A producer that never flows through
+  `tool_results` at all needs an entry in `UNTRACKED_PRODUCERS` with a reason, or every finding it
+  produces will be flagged.
+- **A tool that cannot run must say so; it must never return a clean-looking empty result.** Same
+  defect class as the dropped skip flag, and it keeps reappearing in new shapes: an HIBP check with
+  no API key returning "0 breached" reads as an all-clear nobody earned, and a crt.sh 502 returning
+  "0 subdomains" is indistinguishable from a domain that has no certificates. Give the result an
+  explicit unavailable/error state and make the report render it. A false all-clear is the one
+  output a reader acts on by doing nothing.
 - Fixing a duplicate → fix it at **collection** time, where the two paths that produce it can
   share a `seen` set. A render-time guard is a safety net, not the fix (§5.8).
 - Repairing historical data → only from what was actually recorded. If a value was never

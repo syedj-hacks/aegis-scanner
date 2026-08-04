@@ -338,7 +338,7 @@ Examples:
   #   output/<target>/report_<profile>_<target>_<scan_id>.txt
   #   output/<target>/report_<profile>_<target>_<scan_id>.pdf
   #
-  # ALL FIVE profiles now write both a .txt and a .pdf (not deepscan only), and both
+  # ALL SIX profiles now write a .txt, a .pdf AND a self-contained report.html, and both
   # are named per scan so a new scan never overwrites an older report. The exact paths
   # are printed in the REPORT GENERATED block at the end of every run.
   #

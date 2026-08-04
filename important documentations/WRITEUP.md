@@ -78,27 +78,34 @@ handful of gaps that remain by design (mainly: `webaudit` deliberately never cal
 |---|---|---|
 | Foundation | `modules/utils/` | Done — logger, error handler (Popen-based, timeout + skip-keybind + Ctrl+C handling), config (+ `.env` auto-load), display |
 | Shared profile layer | `modules/profiles/_common.py` | Done — codebase-wide "does a wrapper exist / does this profile call it" check (replacing five hand-rolled copies), the one ran/skipped/failed predicate, the tools-run record, XSS candidate discovery, and the shared end-of-scan report sequence |
-| Recon | `modules/recon/` | Done — DNS, subdomain enum, OSINT |
+| Recon | `modules/recon/` | Done — DNS, subdomain enum, OSINT, **certificate transparency (crt.sh)**, **cloud bucket discovery (cloud_enum)**, **breach check (HIBP)** |
 | Scanning | `modules/scanning/` | Done — port scan (chunked full-range sweeps, `--script` parsing), service detect (`-sV -sC` combined), banner grabber, enum4linux, hydra |
 | Web | `modules/web/` | Done — header audit, Nikto, gobuster, dirb, whatweb, nuclei, sqlmap (read-only enumeration), **XSS (nuclei DAST)**, sslyze, wpscan, ZAP (via its own daemon API) |
 | Enrichment | `modules/enrichment/` | Done — CVE lookup (NVD, with product-disambiguation), severity scoring (word-boundary keyword matching), remediation text |
-| Reporting | `modules/reporting/` | Done — summary builder (the shared report vocabulary), TXT report, PDF report (severity donut cover), **capped report history**, **end-of-scan banner**, **attribution audit** |
-| Profiles | `modules/profiles/` | Done — quickscan (runs whatweb+nuclei), stealthscan (curated port list), webaudit, deepscan, compliance (runs whatweb too); all persist findings incrementally, all record which tools ran, all produce TXT + PDF |
-| CLI | `aegis.py` | Done — argparse entry point (target/profile optional, interactive prompt mode, `--non-interactive`), dispatch table, final summary with real (not always-zero) tool counts |
+| Reporting | `modules/reporting/` | Done — summary builder (the shared report vocabulary), TXT report, PDF report (severity donut cover), **self-contained HTML report**, **live browser dashboard**, **scan diffing**, capped report history, end-of-scan banner, attribution audit |
+| Profiles | `modules/profiles/` | Done — quickscan (runs whatweb+nuclei), stealthscan (curated port list + whatweb), webaudit, deepscan, compliance (runs whatweb too), **recon (passive attack-surface mapper)**; all persist findings incrementally, all record which tools ran, all produce TXT + PDF + HTML |
+| CLI | `aegis.py` | Done — argparse entry point (target/profile optional, interactive prompt mode, `--non-interactive`), **a three-way mode menu for a bare invocation**, `--recon`, `--live`, `--diff`, dispatch table, final summary with real (not always-zero) tool counts, and a one-line attack-surface delta after every scan |
 | Install | `install.sh`, `setup.py` | Done — apt tool install, venv, dependency check (incl. the ZAP client), automatic `config.py` bootstrap, `.env` key prompt, nuclei fallback, one-time ZAP passive-rules bootstrap |
 | Verification | `tests/`, `smoke_test/` | Done — per-pass assertion scripts, real captured tool fixtures, a PTY test for the skip keybind, and a whole-database audit gate; each pass's evidence and open items written up in `smoke_test/` |
 
-## 4. The five scan profiles
+## 4. The six scan profiles
 
-All five write both a TXT and a PDF report.
+All six write a TXT, a PDF **and** a self-contained HTML report.
 
 | Profile | What it actually runs |
 |---|---|
 | `quickscan` (default) | DNS resolve → fast top-port nmap (`-T4 -F`) → service detection → whatweb + high-severity nuclei on the first open web port |
-| `stealthscan` | DNS resolve → quiet `-T2` scan of a fixed ~20-port list (web/mail/DB/remote-admin basics) — **no** second service-detect pass, keeps footprint minimal |
+| `stealthscan` | DNS resolve → quiet `-T2` scan of a fixed ~20-port list (web/mail/DB/remote-admin basics) — **no** second service-detect pass — then a single `whatweb` fingerprint on the first open web port. Deliberately no nuclei; see §5 |
 | `webaudit` | DNS resolve → nmap scoped to web ports (80/443/8080/8443) → banner grab on non-web ports → header audit + Nikto + gobuster + dirb + whatweb (+ sslyze on HTTPS ports) on each open web port, wall-clock-bounded to 30 min → an XSS fuzzing pass over the parameterised URLs built from gobuster/dirb's discovered paths → CVE lookup on the `Server` banner + nmap-script findings |
 | `deepscan` | Everything: DNS + subdomain enum + OSINT → chunked full-port nmap discovery (no -sV/-sC) + a targeted `-sV -sC` pass (this is also where nmap-script findings come from) + banner grab on non-web ports → web module (header/nikto/gobuster/dirb/whatweb/nuclei/XSS/ZAP) on any discovered web port, wall-clock-bounded to 1 hour → conditional sqlmap/hydra/wpscan/enum4linux where their trigger conditions are detected → CVE lookup + severity + remediation on every finding |
 | `compliance` | nmap with `--script ssl-enum-ciphers,http-headers` (no DNS — not in this profile's tool list) → sslyze + whatweb on the TLS port(s) the script identified; script/sslyze/whatweb results are scored and remediated |
+| `recon` | **Sends nothing to the target.** crt.sh certificate transparency → subfinder + amass → theHarvester → cloud_enum bucket discovery → HIBP breach check on any harvested addresses. Accepts a **company name** as well as a domain |
+
+`recon` is the odd one out and deliberately so: it is the only profile that sends no packet to the
+target, which is what makes it safe to point at a name you do not yet have written authorisation
+to scan, and the only one that accepts a company name rather than a hostname. Given a bare name
+there is no domain, so DNS, certificate transparency and subdomain enumeration are reported *not
+applicable* instead of being run and failing.
 
 `webaudit` is the one profile whose report carries a **scope note**, because the honest statement
 about it is subtle: it runs nuclei in DAST/XSS mode but *not* the severity template pass, so a
@@ -277,6 +284,49 @@ carrying forward:
   delta, so cron mails you only when something changed) does the whole job
   without a process to supervise.
 
+### 5.y The recon / dashboard batch (2026-08-05)
+
+Three features — a passive recon mapper, a self-contained HTML report with a live browser
+dashboard, and a fuller scan diff — plus a set of bug fixes. What is worth recording is not the
+feature list but **the shape of the four bugs found building it**, because all four were the same
+bug wearing different clothes: *an implementation that succeeds and produces nothing.*
+
+- **`pip install cloud-enum` installs an empty package.** The PyPI name is a placeholder whose own
+  description reads "Reserved name placeholder. No functionality." It exits 0. Anyone following
+  the obvious install instruction would have a tool that appears installed while the wrapper logs
+  "binary not found on PATH" for ever. `install.sh` uses apt or the upstream git repo and explains
+  why in a comment, because the next person to touch it will otherwise reach for pip.
+- **HIBP has required a paid API key since 2019.** The natural implementation — treat HTTP 200 as
+  "breached" and anything else as "not breached" — turns the resulting 401 into *every address is
+  clean*. That is a false all-clear on a security tool, which is the single worst output it can
+  produce: it is the one a reader acts on by doing nothing. The check now carries an explicit
+  `available` flag, only a genuine 404 from an authenticated request counts as clean, and the
+  summary prints **NOT CHECKED**.
+- **A `file://` page cannot poll for data.** Browsers block `fetch()` against file origins, so the
+  natural "write two files and open the HTML" dashboard design renders its shell and then waits
+  for data for ever, with the reason visible only in the devtools console. It is served from
+  `127.0.0.1` instead.
+- **A dedup key of `(port, finding_type, cve_id)` deletes real findings.** Every CVE-less finding
+  on a port collapses into one row: on this database that is 6,580 `discovered_path` rows becoming
+  a handful. Deduplication that deletes findings is worse than the duplicates it removes, so the
+  filter reuses the identity key `diff.py` already worked out. Relatedly, the "empty ghost rows"
+  that needed removing carry *no* `finding_type` at all rather than a particular one — a filter
+  keyed on a type string would have matched nothing.
+
+Two other things this batch is worth remembering for:
+
+- **The whole-database attribution sweep earned its keep on a bug introduced two hours earlier.**
+  `ran_producer_set()` never lowercased tool names, so `theHarvester` — the binary's own
+  capitalisation, and what `osint.py` stamps on its result — never matched the producer name
+  `theharvester`. It had been latent for months and could stay latent, because theharvester sat in
+  `NON_FINDING_TOOLS` for every profile. The moment `recon` made it a real producer of a persisted
+  finding type, the sweep failed. An audit that only ever passes is not evidence of anything.
+- **Volume assumptions had to change.** A passive subdomain sweep of `example.com` returned 23,330
+  names. Persisting one finding each produces a report whose signal sits at row 12,000 — which is
+  to say, no signal. Findings are capped at 100 plus a summary row stating the true total, ordered
+  so names several sources corroborate survive the cap first; the full list stays in
+  `recon_subdomains`. A cap that hides the total would have been the wrong fix.
+
 ## 6. Known gaps / honesty notes
 
 - **ZAP's passive-scanner add-on** (`pscanrules` — without it ZAP scans complete cleanly and
@@ -289,8 +339,11 @@ carrying forward:
   outside the wrapper's poll loop. A property of ZAP, not of the skip machinery.
 - `webaudit` never calls `zaproxy`; `deepscan` never calls `sslyze` — both permanently unwired
   by design (scope decisions documented in each profile's own file), not oversights.
-- `whatweb_wrap.py`'s CMS-detection flag (`cms_detected`) has no consumer yet — only gobuster's
-  `wordpress_fingerprinted` flag currently triggers the `wpscan` conditional check.
+- `whatweb_wrap.py`'s `cms_detected` **is now consumed**: `deepscan` ORs it with gobuster's
+  `wordpress_fingerprinted`, so either signal triggers `wpscan`, and the report names which one
+  fired. The two catch different sites — gobuster only fires when `/wp-admin`-style paths sit at
+  guessable locations, whereas whatweb reads the generator tag and asset paths out of the
+  response.
 - `deepscan`'s conditional tools (sqlmap/hydra/wpscan/enum4linux) have all four been verified
   firing live end-to-end with real evidence and **zero tool failures**, against the local
   intentionally-vulnerable lab in `test-targets/` (WordPress → wpscan, DVWA → sqlmap CRITICAL SQLi
@@ -306,6 +359,20 @@ carrying forward:
   halves (it stopped answering entirely), so the "after" run lost findings from the sequential
   tools and the number measured target decay as much as concurrency. The clean figure comes from
   the DVWA container — see smoke_test11 for both the number and why the first one was thrown out.
+- **`cloud_enum` has never actually run on the development machine** (`sudo` needs a password
+  there), so the recon profile's bucket-discovery half is code-complete and unit-tested against
+  captured output but **unverified live** — it has only ever been exercised through its honest
+  "binary not found" path. Install it and re-run before claiming that half works.
+- **crt.sh returned 502 on every attempt** across two sessions hours apart, so a *successful*
+  certificate-transparency lookup has not been observed here either. The wrapper retries and then
+  reports a failure; it never renders one as "zero subdomains", which is the difference between a
+  known gap and a silent wrong answer. subfinder/amass cover the same ground and are verified
+  working (10,925 names on a live badssl.com run).
+- **The HIBP breach check has only been exercised through its no-key path**, for the reason in
+  §5.y — there is deliberately no bundled key.
+- **The live dashboard stops when the command exits.** Its server is a daemon thread; an
+  interactive `--live` run holds the process open at the end so the completion banner is
+  reachable, and a scripted one is told where the static report is instead.
 - **Two historical attribution mismatches are reported and allowlisted, not rewritten.** Old rows
   have not been edited to make the audit quiet. Likewise, the one historical data repair that was
   done (`tools/backfill_nuclei_identity.py`) deliberately restored only values recoverable from

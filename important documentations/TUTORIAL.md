@@ -133,16 +133,25 @@ Step 9.
 
 ## Step 4 — Read the report
 
-Every scan writes **two** files, named after the scan so nothing is ever overwritten:
+Every scan writes **three** files — the TXT and PDF are named after the scan so nothing is ever
+overwritten, and `report.html` always holds the latest scan of that target:
 
 ```bash
 ls output/scanme.nmap.org/
 # report_quickscan_scanme.nmap.org_151.txt
 # report_quickscan_scanme.nmap.org_151.pdf
+# report.html
 
 cat      output/scanme.nmap.org/report_quickscan_scanme.nmap.org_151.txt
 xdg-open output/scanme.nmap.org/report_quickscan_scanme.nmap.org_151.pdf
+xdg-open output/scanme.nmap.org/report.html
 ```
+
+**The HTML one is the one to open when you are actually triaging.** Its findings table sorts by
+any column and filters by severity, type, or free text, which the TXT and PDF cannot do. It is a
+single self-contained file with no external resources — no fonts, no scripts, no images loaded
+from anywhere — so it renders identically offline, on an air-gapped review box, or as an email
+attachment.
 
 (The exact filename is printed in the `REPORT GENERATED` block at the end of the run — you don't
 have to guess the scan id.)
@@ -167,6 +176,16 @@ things at once, which is why you won't see one.
 which to drop; a scripted run drops the oldest and logs it. The cap is per *profile* deliberately,
 so a pile of quickscans can't evict the one deepscan report of that host.
 
+**After every scan you also get a one-line delta** against the previous scan of the same target,
+without asking for it:
+
+```
+Attack surface delta: 2 new, 2 fixed since scan #221 (0 unchanged)
+Full comparison: python3 aegis.py --diff 221 222
+```
+
+On a target's first scan there is nothing to compare, so the line is simply not printed.
+
 ## Step 5 — Try the other profiles
 
 Each profile trades speed for depth differently. Try them against the same target and compare
@@ -178,9 +197,17 @@ python3 aegis.py scanme.nmap.org --profile stealthscan    # quiet -T2 scan of a 
 python3 aegis.py scanme.nmap.org --profile webaudit       # headers + Nikto + gobuster + dirb + whatweb (+sslyze on HTTPS) + an XSS fuzzing pass, bounded to 30 min
 python3 aegis.py scanme.nmap.org --profile deepscan       # everything (incl. nuclei, the XSS pass, ZAP baseline, and conditional sqlmap/hydra/wpscan/enum4linux)
 python3 aegis.py scanme.nmap.org --profile compliance     # nmap TLS/header scripts + sslyze + whatweb, scored instead of discarded
+python3 aegis.py example.com      --profile recon         # passive: subdomains, cloud buckets, breached emails — sends nothing to the target
 ```
 
-All five write both a `.txt` and a `.pdf` — that isn't a deepscan-only thing any more.
+All six write a `.txt`, a `.pdf` **and** a self-contained `report.html` — that isn't a
+deepscan-only thing any more.
+
+**`stealthscan` runs one `whatweb` fingerprint and deliberately no `nuclei`.** whatweb costs a
+handful of requests and turns "port 80 is open" into "port 80 is nginx running WordPress". nuclei
+would fire thousands of requests per port and make the quietest profile the second-loudest, so it
+is listed in the profile's config (you will see a "not run by this profile, by design" note) but
+never actually run. If you want nuclei, use quickscan or deepscan.
 
 **About the XSS pass** (`webaudit` and `deepscan`): after gobuster/dirb find paths, Aegis builds
 URLs with a query string from the script endpoints among them (`/search.php?q=1` and similar) and
@@ -220,6 +247,85 @@ python3 aegis.py scanme.nmap.org --profile quickscan --non-interactive
 > A venv missing one dependency is invisible until a scan reports "tools failed: 1" — that exact
 > situation happened here with the ZAP client. `python3 setup.py` verifies every required package
 > imports, so run it if a tool starts dropping out for no obvious reason.
+
+---
+
+## Step 5a — The guided menu
+
+Run Aegis with no arguments at all and it asks what you want to do first:
+
+```bash
+python3 aegis.py
+```
+
+```
+1. Vulnerability scan   pick a profile and scan a host
+2. Recon mapper         map what a domain or company name exposes (passive)
+3. Scan diff            compare two finished scans
+```
+
+**Any argument at all skips this menu**, so everything you have already learned keeps working
+exactly as before — `python3 aegis.py scanme.nmap.org` still goes straight to a quickscan.
+
+---
+
+## Step 5b — Map an attack surface without touching the target (recon)
+
+Every other profile scans a host. The recon mapper answers a different question — *what does this
+organisation actually expose?* — and it answers it entirely from public sources: certificate
+transparency logs, DNS aggregators, public cloud storage namespaces, and a breach database. **It
+sends nothing to the target**, which is what makes it safe to run against a name you do not yet
+have written authorisation to scan.
+
+```bash
+python3 aegis.py example.com --recon        # domain mode
+python3 aegis.py --recon "Acme Corp"        # company-name mode
+```
+
+It is the only mode that accepts a **company name**. With a bare name there is no domain, so
+there is nothing to resolve, no certificate logs to query and no subdomains to enumerate — those
+three steps are reported as *not applicable* rather than run and failed. You get the cloud-bucket
+search and the OSINT harvest.
+
+What you get back:
+
+| Finding | Severity | What it means |
+|---|---|---|
+| `recon_leak` | HIGH | This email address appears in a public breach corpus. Given password reuse, act on this one today. |
+| `recon_bucket` | MEDIUM | A publicly readable cloud bucket matching the keyword. **Confirm you own it first** — the cloud namespace is global, so a name match is not proof of ownership. |
+| `recon_subdomain` | LOW | A hostname exists. It may not resolve and may be entirely intended. A lead to scan, not a weakness. |
+
+Two things to know before you trust the output:
+
+- **The breach check needs an API key.** Have I Been Pwned has required a paid key since 2019.
+  Without `AEGIS_HIBP_API_KEY` in your `.env`, the check reports **NOT CHECKED** — and that is
+  deliberately *not* the same as "no breaches found". Never read a missing key as an all-clear.
+- **Subdomain counts get large.** A passive sweep of `example.com` returned 23,330 names. The
+  report lists the 100 best-corroborated plus a summary line with the true total; the complete
+  list is kept in the database (`recon_subdomains`) and in the HTML report's recon section.
+
+---
+
+## Step 5c — Watch a scan happen (live dashboard)
+
+```bash
+python3 aegis.py scanme.nmap.org --live
+```
+
+Opens a browser page that fills in while the scan runs: which tool is going, a progress bar, and
+findings appearing newest-first. You are asked about it anyway on an interactive run; `--no-live`
+never asks.
+
+It is served from `127.0.0.1` on a random port — not opened as a `file://` page, because browsers
+refuse to let a local file fetch data and the dashboard would sit at "waiting for data" for ever.
+Nothing is exposed to your network. **It stops when the command exits**, so an interactive run
+pauses at the end and waits for you to press Enter before closing it.
+
+Every scan also writes `output/<target>/report.html` whether or not you use `--live`: one
+self-contained file with a sortable, filterable findings table and no external resources at all,
+so it works offline and is safe to email.
+
+---
 
 ## Step 6 — Add or change your NVD API key later
 
@@ -371,14 +477,27 @@ the session is being sent.
 Diff any two finished scans:
 
 ```bash
-python3 aegis.py --diff 137 168             # summary of new / fixed / unchanged
+python3 aegis.py --diff 137 168             # summary of new / fixed / escalated / unchanged
 python3 aegis.py --diff 137 168 --diff-verbose   # also list the unchanged ones
 ```
+
+Or run `python3 aegis.py` with no arguments and pick mode 3, which lists your last ten scans and
+lets you choose two by number — handy when you don't remember the ids.
 
 Read `UNVERIFIED` carefully: those findings are absent from the later scan, but
 the tool that would have found them did not run in it. They are **not**
 remediated — that distinction is the difference between a diff you can act on
-and one you cannot.
+and one you cannot. A real pair from this project's own database reports
+**"0 fixed, 71 unverified"**; a naive diff would have told you 71 things got fixed.
+
+`ESCALATED` and `DOWNGRADED` are findings still present whose severity moved, shown as
+`LOW → HIGH`. A severity change is reported only when both scans actually scored the finding —
+an unscored finding compared against a scored one means one scan didn't grade it, not that your
+risk moved.
+
+If you diff two scans of **different targets**, Aegis says so in a banner before the table. That
+is not a delta, it is two unrelated scans subtracted from each other, and the counts will look
+alarming for no reason.
 
 For scheduling, use cron rather than a daemon — `--non-interactive` exists for
 exactly this, and cron already solves restarts, logging and mail:

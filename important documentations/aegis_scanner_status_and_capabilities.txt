@@ -2,8 +2,9 @@
 AEGIS SCANNER — STATUS, CAPABILITIES, AND HONEST ASSESSMENT
 Written 2026-07-25, after the smoke_test3 verification pass
 Revised 2026-07-29 (full verification pass — see smoke_test/TEST_RUN_
-FINDINGS_20260729.md; §3.4 conditional tools resolved) and 2026-07-31
-(§3.5 CVE version-range filtering resolved)
+FINDINGS_20260729.md; §3.4 conditional tools resolved), 2026-07-31
+(§3.5 CVE version-range filtering resolved) and 2026-08-05 (recon mapper,
+HTML report, live dashboard, scan-diff upgrades — §1, §2.1, §3.6-3.9)
 ================================================================================
 
 WHAT THIS DOCUMENT IS
@@ -23,14 +24,17 @@ A modular Kali Linux vulnerability-assessment CLI (`python3 aegis.py
 security tools behind one consistent framework: a shared subprocess runner
 (run_tool()) that never raises and always returns a structured result, a
 shared per-target logger, a shared Rich-based terminal renderer, a SQLite
-findings database, and two report writers (plain text + PDF). Five scan
-profiles trade off speed, stealth, and depth:
+findings database, and three report writers (plain text + PDF + a
+self-contained HTML report). Six scan profiles trade off speed, stealth,
+and depth:
 
   quickscan    — fast overview: DNS, top-port nmap, service detection,
                  whatweb + high-severity nuclei
   stealthscan  — quiet, minimal-footprint scan of a curated list of ~20
                  ports that matter (web/mail/db/remote-admin), no service
-                 probing
+                 probing, plus ONE whatweb fingerprint on the first open
+                 web port. nuclei is deliberately NOT run here — it would
+                 make the quietest profile the second-loudest.
   webaudit     — web-focused: headers, nikto, gobuster, whatweb, ZAP
                  baseline, CVE enrichment on discovered web ports
   deepscan     — the full assessment: everything above plus subdomain
@@ -39,10 +43,25 @@ profiles trade off speed, stealth, and depth:
                  CVE/severity/remediation on every finding, TXT+PDF reports
   compliance   — TLS cipher + HTTP header baseline (nmap ssl-enum-ciphers,
                  sslyze, whatweb) on the well-known web/TLS ports
+  recon        — PASSIVE attack-surface map: certificate transparency
+                 (crt.sh), subdomain enumeration, OSINT, public cloud
+                 bucket discovery, and a breach check on harvested email
+                 addresses. It sends NOTHING to the target, and it is the
+                 only profile that accepts a company NAME as well as a
+                 domain ("Acme Corp"). That combination is what makes it
+                 safe to point at a name you do not yet have written
+                 authorisation to scan.
 
 Every scan persists to database/aegis.db and produces output/<target>/
-report.txt (and, for deepscan, report.pdf too) plus a scan_errors.log with
-a full audit trail of every tool call, success, failure, timeout, and skip.
+report_<profile>_<target>_<id>.txt and .pdf, plus a self-contained
+report.html, plus a scan_errors.log with a full audit trail of every tool
+call, success, failure, timeout, and skip.
+
+Three top-level modes. Running `python3 aegis.py` with no arguments now
+asks what you want to do (1 vulnerability scan / 2 recon mapper / 3 scan
+diff). ANY argument skips that menu, so every existing command line behaves
+exactly as it did before. `--live` opens a browser dashboard that fills in
+while the scan runs, served from 127.0.0.1 on a random port.
 
 
 2. DOES IT PRODUCE REAL EVIDENCE? — YES, for the large majority of the
@@ -257,6 +276,89 @@ they are actively detected rather than version-keyword-matched, so they are
 the stronger thing to point at if you want a single example.
 
 
+3.6 Recon mapper — bucket discovery and crt.sh are UNVERIFIED LIVE
+--------------------------------------------------------------------------------
+Added 2026-08-05. Two of the recon profile's five sources have never actually
+produced a result on the development machine, and the honest position is that
+those halves are code-complete rather than proven:
+
+  - cloud_enum is NOT INSTALLED here (apt install needs a password this
+    session could not supply), so bucket discovery has only ever been
+    exercised through its "binary not found on PATH" failure branch.
+  - crt.sh returned HTTP 502 on EVERY attempt across two sessions hours
+    apart. That is crt.sh's ordinary overload behaviour, not a bug in the
+    wrapper, but it means a successful certificate-transparency lookup has
+    not been observed here.
+
+What IS verified live: subfinder + amass returned 10,925 real subdomains for
+badssl.com in a full run through aegis.py, theHarvester ran, the findings were
+scored and persisted, and all three report formats were written. Company-name
+mode was verified separately and correctly ran only the two applicable steps.
+
+Both unverified paths fail LOUDLY rather than silently — crt.sh being down is
+never rendered as "this domain has no subdomains", and a missing cloud_enum
+binary is a reported tool failure. That is what makes this a known gap and not
+a silent wrong answer. To close it: `sudo apt install cloud-enum` and re-run.
+
+DO NOT run `pip install cloud-enum` to fix this. That PyPI name is an empty
+placeholder package — its own description reads "Reserved name placeholder.
+No functionality." — which installs successfully and provides nothing, leaving
+the tool apparently installed while the wrapper reports it missing for ever.
+
+
+3.7 The HIBP breach check needs a paid API key, and says so
+--------------------------------------------------------------------------------
+Have I Been Pwned has required a paid API key on its breachedaccount endpoint
+since 2019. Without AEGIS_HIBP_API_KEY in .env, the recon profile's breach
+check reports NOT CHECKED and the summary says so explicitly.
+
+This is worth understanding rather than treating as a missing feature, because
+the alternative is the worst possible failure for a security tool. The obvious
+implementation treats HTTP 200 as "breached" and everything else as "not
+breached" — under which the 401 from a missing key makes every address come
+back clean, and the scan reports "0 accounts breached" for an organisation
+whose credentials are all over the internet. A false all-clear is the one
+output a reader acts on by doing nothing. So "no key" is an explicit
+unavailable state here, never a result.
+
+Demo note: if a reviewer asks why this returns nothing, the answer is a
+feature, not an excuse — show them the NOT CHECKED line.
+
+
+3.8 Recon subdomain counts are capped in the report, not in the database
+--------------------------------------------------------------------------------
+A passive subdomain sweep returns far more than expected: 23,330 unique names
+for example.com. Persisting one finding per name produced a report whose real
+signal — an open bucket, a breached address — sat at row 12,000, which is to
+say no signal at all.
+
+The report therefore lists the 100 best-corroborated names (a name several
+sources agree on outranks one only a single source saw) plus ONE summary
+finding stating the true total. Every name is still stored in full in the
+recon_subdomains table, and the HTML report's recon section shows up to 250
+with the true count. Nothing is hidden; the total is always stated.
+
+
+3.9 The live dashboard stops when the command exits
+--------------------------------------------------------------------------------
+The --live dashboard is served by a daemon thread inside the scanning process,
+so it dies the moment aegis.py returns. An interactive --live run therefore
+pauses at the end and waits for Enter, so the completion banner and its link
+to the full report are actually reachable; a scripted run prints the path to
+report.html instead.
+
+This is a deliberate trade. Making the server outlive the scan would mean
+either a non-daemon thread (which would hang every cron/CI run) or a separate
+supervised process, and neither is worth it for a view whose whole purpose is
+to be watched while the scan happens.
+
+Note also that the dashboard is SERVED over 127.0.0.1 rather than opened as a
+file:// page. That is not a preference: browsers block fetch() against file://
+origins, so a file-opened dashboard would sit at "waiting for data" for ever
+with the reason visible only in the browser console. Nothing is exposed to the
+network — it binds loopback only, on an OS-assigned port.
+
+
 4. IDEAS TO MAKE IT LOOK MORE PROFESSIONAL FOR A DEMO / REVIEW
 ================================================================================
 - Lead the demo with stealthscan, quickscan, or compliance — all three are
@@ -264,11 +366,35 @@ the stronger thing to point at if you want a single example.
   produce real, non-zero findings. Save deepscan for a moment where a
   longer wait is acceptable, or kick it off early and let it run in the
   background while narrating the other profiles.
-- Show the PDF report, not just the terminal output or the .txt file — it
-  has a proper cover page, a colour-coded severity summary with
-  proportional bars, and per-finding cards with description/remediation.
-  It reads like a real vendor pentest deliverable, which is a much
-  stronger visual than a terminal scrollback.
+- Show the HTML report (output/<target>/report.html) — as of 2026-08-05 it
+  is the strongest single visual the project has. Dark themed, a severity
+  donut, and a findings table that sorts by any column and filters by
+  severity/type/free text live in front of the reviewer. Worth saying out
+  loud while it is open: it is ONE file with no external resources at all,
+  so it renders identically offline or as an email attachment — which is
+  what a real deliverable has to do.
+- Show the PDF report too — it has a proper cover page, a colour-coded
+  severity summary with proportional bars, and per-finding cards with
+  description/remediation. It reads like a vendor pentest deliverable,
+  which is a much stronger visual than a terminal scrollback.
+- Run one scan with --live and leave the browser tab visible while it
+  works. Watching findings appear in real time, with the current tool and
+  a progress bar, demos far better than a static wall of terminal output.
+  Start it before you begin narrating, so there is something moving.
+- Show the attack-surface delta line that prints after every scan
+  ("2 new, 2 fixed since scan #221"), then run the full
+  `python3 aegis.py --diff A B`. If you want ONE thing that shows judgment
+  rather than plumbing, use the UNVERIFIED category: a finding missing
+  from the later scan is only called "fixed" when a tool that would have
+  found it actually ran. There is a real pair in the database that reports
+  "0 fixed, 71 unverified" where a naive diff would have claimed 71
+  remediations. That is the difference between a tool you can act on and
+  one you cannot, and it is easy to explain in two sentences.
+- `python3 aegis.py --recon "Acme Corp"` is a good opener for a
+  non-technical reviewer: it takes a company NAME, touches nothing, and
+  explains itself. Pair it with the NOT CHECKED line on the breach check
+  (§3.7) as an example of the project refusing to report a false
+  all-clear.
 - If asked "does this find real vulnerabilities," point at the NVD CVE
   lookup and nuclei findings specifically — those are traceable to a
   public CVE ID or a named, real-world template match, which is more
