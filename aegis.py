@@ -30,7 +30,7 @@ from modules.profiles._common import web_tool_concurrency
 from modules.profiles.multi_target import parse_targets
 from modules.utils.display import (
     console, print_banner, print_panel, print_info, print_success,
-    print_warning, print_error, print_summary,
+    print_warning, print_error, print_summary, set_verbosity,
 )
 from database.db import init_db
 from modules.reporting.summary import build_summary, summary_stats
@@ -239,8 +239,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "-v", "--verbose",
-        action="store_true",
-        help="show which tools and settings this profile will use, before it starts",
+        action="count", default=0,
+        help="increase output detail. -v shows which tools and settings this "
+             "profile will use before it starts; -vv adds fine-grained "
+             "per-plugin/enrichment debug lines. Repeatable.",
     )
     parser.add_argument(
         "--non-interactive",
@@ -1001,6 +1003,10 @@ def _build_engine_dispatch(args):
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+
+    # Set console verbosity once, from -v/-vv, before anything prints. -vv
+    # turns on print_debug() lines across the whole run.
+    set_verbosity(getattr(args, "verbose", 0))
 
     # --list-plugins is a query, not a scan: print the plugin registry and
     # exit before any banner or target handling.

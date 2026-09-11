@@ -11,7 +11,7 @@ nothing for a web plugin to run against until the port scan has said what
 is open (see modules/engine/scanner.py).
 """
 
-from plugins.base import ScannerPlugin, Finding, findings_from_legacy, CONFIRMED, POTENTIAL
+from plugins.base import ScannerPlugin, findings_from_legacy, CONFIRMED, POTENTIAL
 from plugins._mappers import (
     findings_from_banners, findings_from_cves, score_and_remediate,
 )

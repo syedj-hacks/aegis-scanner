@@ -1,0 +1,54 @@
+name: Bug report
+description: Something in Aegis Scanner behaved incorrectly.
+title: "[bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. The single most useful thing you can include
+        is the scan's `output/<target>/scan_errors.log` — it records what
+        every tool actually did, and most "no findings" / "tool didn't run"
+        reports are answered by it in seconds.
+  - type: checkboxes
+    id: prechecks
+    attributes:
+      label: Before filing
+      options:
+        - label: I confirmed the target was reachable (a "no open ports" or "no findings" result is very often the target rate-limiting or being down, not a scanner bug).
+          required: true
+        - label: I am scanning a system I am authorised to scan.
+          required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what did you get instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Exact command
+      description: The full `aegis.py ...` command line (redact any credentials).
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: scan_errors.log
+      description: Paste the relevant tail of output/<target>/scan_errors.log.
+      render: text
+  - type: input
+    id: profile
+    attributes:
+      label: Profile / engine
+      description: Which profile (or --engine --scan-profile) were you running?
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS, Python version, and whether you ran natively or via Docker.
+    validations:
+      required: true

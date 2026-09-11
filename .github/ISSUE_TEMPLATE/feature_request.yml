@@ -1,0 +1,29 @@
+name: Feature request
+description: Suggest a new check, output, or capability.
+title: "[feat]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What can't you do today, or what is harder than it should be?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: >
+        What would you like Aegis to do? If it is a new detection, note
+        whether it fits a declarative signature (signatures/*.yaml) or needs
+        a full plugin.
+    validations:
+      required: true
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: This is for authorised/defensive assessment (not mass-targeting, DoS, or attack evasion).
+          required: true

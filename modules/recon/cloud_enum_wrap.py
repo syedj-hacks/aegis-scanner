@@ -172,7 +172,7 @@ def find_cloud_buckets(keyword: str, target: str = None) -> dict:
             or "cloud_enum failed"
         )
         if result["skipped"]:
-            print_warning(f"[cloud_enum] skipped by user")
+            print_warning("[cloud_enum] skipped by user")
         else:
             logger.error(f"[cloud_enum] failed for '{keyword}': {result['error']}")
             print_warning(f"[cloud_enum] failed for '{keyword}': {result['error']}")

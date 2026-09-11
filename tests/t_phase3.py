@@ -1,5 +1,5 @@
 """Phase 3 verification: no bare dashes, honest labels, real nuclei JSONL."""
-import sys, json, os, tempfile
+import sys, os, tempfile
 sys.path.insert(0, "/home/jafar/aegis-scanner")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -12,7 +12,6 @@ from modules.reporting.summary import (
     field_display, service_display, cvss_display, finding_identifier,
     FINDING_TYPE_TOOL,
 )
-from database.db import get_findings_for_scan, get_scan_history
 
 ok = fail = 0
 def check(name, cond, detail=""):

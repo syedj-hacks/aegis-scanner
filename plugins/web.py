@@ -16,7 +16,7 @@ per port before their tool loop.
     severity    list   nuclei severity filter (from the profile)
 """
 
-from plugins.base import ScannerPlugin, findings_from_legacy, CONFIRMED, POTENTIAL
+from plugins.base import ScannerPlugin, findings_from_legacy, CONFIRMED
 from plugins._mappers import (
     findings_from_headers, findings_from_whatweb, findings_from_nikto,
     findings_from_gobuster, findings_from_dirb, findings_from_nuclei,

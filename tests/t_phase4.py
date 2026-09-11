@@ -8,7 +8,7 @@ _TMP = os.path.join(tempfile.gettempdir(), "aegis_tests")
 
 from modules.reporting.retention import (
     report_filename, list_stored_reports, prune_reports, retain_reports,
-    _parse_stored_name, _prompt_choice, _DEFAULT_KEEP,
+    _parse_stored_name, _prompt_choice,
 )
 
 ok = fail = 0

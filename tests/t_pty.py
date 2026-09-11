@@ -7,7 +7,7 @@ prune_reports() was never actually exercised. This drives the whole thing
 through a real terminal so the isatty() gate, the prompt rendering and all
 three choices are proven end to end.
 """
-import os, pty, sys, shutil, subprocess, time, tempfile
+import os, pty, sys, shutil, time, tempfile
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _FIXTURES = os.path.join(_HERE, "fixtures")

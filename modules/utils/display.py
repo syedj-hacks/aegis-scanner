@@ -16,6 +16,48 @@ from contextlib import contextmanager
 
 console = Console()
 
+# --- Verbosity (Phase 5: -v / -vv) ---------------------------------------
+# Console verbosity level, set once from the CLI (-v = 1, -vv = 2), default
+# 1. This gates the two ends of the output spectrum without touching the
+# middle:
+#   level 0  (-q/quiet, if ever wired)  errors and warnings only
+#   level 1  (default)                  the normal [*]/[+]/[!]/[-] stream
+#   level 2  (-vv)                      the above plus print_debug() detail
+# print_info/success/warning/error keep their existing always-on behaviour
+# at the default level, so nothing that exists today changes; print_debug is
+# new and silent unless -vv is given. Kept as a module global (not threaded
+# through every call) because the console itself is a module global and the
+# whole point is one process-wide verbosity the operator sets once.
+_VERBOSITY = 1
+
+
+def set_verbosity(level: int) -> None:
+    """Set the process-wide console verbosity (0 quiet, 1 normal, 2 debug)."""
+    global _VERBOSITY
+    try:
+        _VERBOSITY = max(0, int(level))
+    except (TypeError, ValueError):
+        _VERBOSITY = 1
+
+
+def get_verbosity() -> int:
+    return _VERBOSITY
+
+
+def print_debug(message: str) -> None:
+    """
+    Fine-grained diagnostic line, shown only at -vv (verbosity >= 2).
+
+    For the detail an operator wants when something looks wrong but that
+    would be noise in a normal run — a resolved config value, a per-plugin
+    timing, the exact command a wrapper built. It is NOT a replacement for
+    the file log (logger.py), which records everything regardless of console
+    verbosity; this only decides what reaches the terminal.
+    """
+    if _VERBOSITY >= 2:
+        console.print(f"[dim][.][/dim] {message}")
+
+
 # Severity color map used everywhere findings are displayed
 SEVERITY_COLORS = {
     "CRITICAL": "bold red",

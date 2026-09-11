@@ -3,9 +3,16 @@ database/db.py
 SQLite persistence layer for scan history and findings.
 """
 
+import logging
 import sqlite3
 import os
 from datetime import datetime
+
+# Module logger for low-level DB diagnostics that have no target/scan
+# context to route into a per-target scan_errors.log (logger.py is
+# target-scoped). Proper logging rather than a raw print(), so the message
+# honours whatever logging configuration the host process set up.
+_log = logging.getLogger("aegis.db")
 
 DB_PATH = os.path.join("database", "aegis.db")
 
@@ -209,7 +216,7 @@ def _insert_recon_rows(table: str, columns: tuple, scan_id: int, rows: list) -> 
         # having to fix — see modules/utils/error_handler.py's skip-flag
         # note. It still does not raise: the scan's findings are already
         # committed and this is supplementary detail.
-        print(f"[db] could not write {len(prepared)} row(s) to {table}: {exc}")
+        _log.error("could not write %d row(s) to %s: %s", len(prepared), table, exc)
 
 
 def insert_recon_subdomains(scan_id: int, rows: list) -> None:

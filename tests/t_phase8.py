@@ -29,7 +29,6 @@ from modules.profiles.deepscan import (
     _findings_from_zap, _findings_from_nikto, _findings_from_gobuster,
     _findings_from_dirb,
 )
-from modules.profiles._common import named_description
 from modules.reporting.summary import field_display
 
 ok = fail = 0
@@ -350,7 +349,7 @@ finally:
 # ---------------------------------------------------------------------------
 print("\n=== H. webaudit scope note (Phase 4) ===")
 from modules.reporting.summary import profile_scope_note
-from modules.reporting.report_txt import _scope_note_block, render_report
+from modules.reporting.report_txt import _scope_note_block
 from modules.reporting.report_pdf import _scope_note_html
 
 note = profile_scope_note("webaudit")
@@ -455,7 +454,6 @@ check("empty-string finding_type falls through to sniffing",
       _finding_kind({"finding_type": "", "path": "/admin"}) == "discovered_path")
 
 # every real stored finding_type must survive the round-trip unchanged
-import database.db as _db
 for ft in ("zap_finding", "nikto_finding", "discovered_path", "nuclei_finding",
            "missing_security_header", "smb_share", "weak_credentials"):
     row = {"finding_type": ft, "description": "d", "reference": None,

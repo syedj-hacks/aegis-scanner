@@ -1,0 +1,10 @@
+.git
+venv/
+output/
+__pycache__/
+*.pyc
+database/enrich_cache/
+*.log
+presentation/
+smoke_test/
+tests/

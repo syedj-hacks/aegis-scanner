@@ -43,7 +43,6 @@ from modules.web.nuclei_wrap import run_nuclei
 from modules.enrichment.severity import score_finding
 from modules.enrichment.remediation import get_remediation
 from database.db import insert_scan, insert_findings_bulk
-from modules.reporting.report_txt import generate_txt_report
 from modules.reporting.dashboard_live import update_live_data
 from modules.profiles._common import (
     warn_unavailable_tools, count_and_report_tool_failures, persist_tool_run,

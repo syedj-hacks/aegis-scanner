@@ -50,9 +50,9 @@ from plugins.base import PluginResult
 from modules.engine.ratelimit import RateLimiter
 
 from modules.utils.display import (
-    print_phase, print_info, print_success, print_warning, print_error,
+    print_phase, print_info, print_success, print_debug,
 )
-from modules.utils.logger import log_scan_start, log_scan_end, get_logger
+from modules.utils.logger import log_scan_start, log_scan_end
 from modules.profiles._common import (
     is_web_port, is_https_port, web_param_candidates,
     count_and_report_tool_failures, persist_tool_run, finalise_reports,
@@ -166,7 +166,16 @@ class ScanEngine:
                 # _run_plugin never raises, but as_completed can surface a
                 # cancellation; guard so one oddity cannot lose the stage.
                 try:
-                    results.append(future.result())
+                    pr = future.result()
+                    results.append(pr)
+                    # -vv: per-plugin outcome and timing, the detail an
+                    # operator wants when a stage is slow or a plugin is
+                    # silently doing nothing.
+                    print_debug(
+                        f"[{label}] {pr.plugin}: {pr.outcome} "
+                        f"({len(pr.findings)} finding(s), {pr.duration:.1f}s)"
+                        + (f" — {pr.error}" if pr.error else "")
+                    )
                 except Exception as exc:  # noqa: BLE001
                     results.append(PluginResult(
                         plugin=futures[future], outcome="failed",

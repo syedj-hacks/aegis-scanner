@@ -15,11 +15,9 @@ Phase 3 — detection quality verification.
      Confirmed finding, a non-matching response produces nothing
 """
 import http.server
-import json
 import os
 import socket
 import sys
-import tempfile
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

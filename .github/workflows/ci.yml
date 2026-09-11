@@ -1,0 +1,73 @@
+# CI — lint, unit tests, and a Docker build check on every push and PR.
+#
+# The three jobs mirror the three things that must stay true for the project
+# to be contributable: the code is clean (ruff), the logic is correct (the
+# unit suite), and the container still builds (so `docker run` keeps
+# working). None of them contacts a real target — the unit suite is
+# hermetic (no network; the enrichment tests use seeded caches and local
+# HTTP servers), which is what lets it run in CI at all.
+name: CI
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ruff
+        run: pip install ruff
+      # ruff config lives in pyproject.toml. The scan wrappers legitimately
+      # use broad excepts (the "never raises" contract) and long comment
+      # blocks, which the config allows rather than the code fighting.
+      - name: Lint
+        run: ruff check .
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install runtime deps
+        # weasyprint needs native libs for the PDF tests; installed so the
+        # reporting suite exercises the real renderer rather than skipping it.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 libcairo2
+          pip install -r requirements.txt
+      - name: Run the unit suite
+        # The hermetic tests — every t_phase*/enrichment/reporting/plugin
+        # suite that needs no external security binary or live target. Each
+        # exits non-zero on any failed assertion, so a regression fails CI.
+        run: |
+          set -e
+          for t in tests/t_phase1_plugins.py tests/t_phase2_engine.py \
+                   tests/t_phase3_enrichment.py tests/t_phase4_reporting.py \
+                   tests/t_cvss.py tests/t_diff.py tests/t_phase8.py \
+                   tests/t_phase9.py tests/t_phase10.py tests/t_target.py; do
+            echo "=== $t ==="
+            python "$t"
+          done
+
+  docker-build:
+    name: Docker build check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        # Build only (no push, no run): proves the Dockerfile and the pinned
+        # deps still produce a working image, which is what keeps the
+        # zero-setup `docker run` path from silently rotting.
+        run: docker build -t aegis-scanner:ci .

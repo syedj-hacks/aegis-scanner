@@ -36,7 +36,7 @@ import abc
 import dataclasses
 import hashlib
 import time
-from typing import Any, Iterable
+from typing import Iterable
 
 
 # --- Severity ------------------------------------------------------------

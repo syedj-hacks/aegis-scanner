@@ -518,7 +518,7 @@ def main():
         sys.exit("[!] post-apply verification FAILED — restore from the backup above")
 
     print(f"[+] {len(changes)} row(s) updated and verified")
-    print(f"[+] port left unchanged on every row (verified)")
+    print("[+] port left unchanged on every row (verified)")
     print(f"[*] to undo: python3 tools/backfill_nuclei_identity.py --revert {dump_path}")
     conn.close()
 

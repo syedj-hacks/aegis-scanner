@@ -133,7 +133,7 @@ def lookup_epss(cve_ids, target: str = "epss") -> dict:
         outcome = safe_call(_fetch_batch, batch, target=target, label="epss-lookup")
         if not outcome.get("success"):
             log_tool_failure(target, "epss-lookup", outcome.get("error") or "EPSS request failed")
-            print_warning(f"[EPSS] lookup failed for a batch — findings keep CVSS-only risk")
+            print_warning("[EPSS] lookup failed for a batch — findings keep CVSS-only risk")
             continue
         fetched_any = True
         scores = outcome.get("data") or {}

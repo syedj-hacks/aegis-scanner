@@ -4,7 +4,7 @@ sys.path.insert(0, "/home/jafar/aegis-scanner")
 
 from modules.web.nuclei_wrap import _parse_nuclei_jsonl, _cve_from_template, _cvss_from_classification
 from modules.profiles._common import nuclei_description
-from modules.reporting.summary import deduplicate_findings, _dedup_key
+from modules.reporting.summary import deduplicate_findings
 
 ok = fail = 0
 def check(name, cond, detail=""):
