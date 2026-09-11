@@ -1,0 +1,33 @@
+# full.yaml — comprehensive assessment, the engine analogue of deepscan.
+#
+# Every plugin that applies to the target runs: full port sweep, service
+# detection, the complete web toolset (headers, nikto, gobuster, dirb,
+# nuclei, sslyze, testssl, ZAP), the conditional service checks (wpscan on
+# a WordPress host, enum4linux on an SMB host, hydra on a login service),
+# and CVE enrichment. This is the profile the Phase 6 smoke test runs.
+name: Full Scan
+description: Comprehensive assessment — all applicable plugins, CVE/EPSS enrichment.
+
+nmap_profile: deepscan
+nuclei_severity: [critical, high, medium, low]
+gobuster_wordlist: /usr/share/wordlists/dirb/common.txt
+
+# "all" = every discovered plugin; applicable() gates each to the contexts
+# it actually fits (wpscan only on WordPress, sslyze only on TLS, ...).
+plugins: all
+
+# hydra sends real login attempts. It is in the full profile deliberately —
+# a full assessment tests weak credentials — but a site owner who wants it
+# out can copy this profile and add it to `exclude`.
+exclude: []
+
+# Safety matters MORE here, not less: this is the profile that runs the most
+# plugins at once against one host. The cap keeps aggregate pressure bounded
+# even while a dozen plugins are eligible.
+safety:
+  max_requests_per_second: 10
+  max_concurrent_plugins: 5
+
+rate_limits:
+  nuclei_rate_limit: 150
+  gobuster_threads: 30

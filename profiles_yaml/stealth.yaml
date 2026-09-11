@@ -1,0 +1,22 @@
+# stealth.yaml — quiet, minimal-footprint scan.
+#
+# A small, slow, passive-leaning scan: DNS, a polite -T2 nmap sweep of a
+# fixed short port list (from config.PROFILES['stealthscan']), service
+# detection and a single whatweb fingerprint. Deliberately NO nuclei, nikto,
+# gobuster, dirb, ZAP or any active injection/brute-force — those are loud.
+# The safety governor is set low so plugin launches are spaced well apart.
+name: Stealth Scan
+description: Quiet, minimal-footprint — polite port scan + light fingerprint, nothing loud.
+
+nmap_profile: stealthscan
+
+plugins:
+  - dns
+  - port_scan
+  - service_detect
+  - whatweb
+
+# One plugin at a time, well spaced: the whole point is low observability.
+safety:
+  max_requests_per_second: 2
+  max_concurrent_plugins: 1

@@ -41,6 +41,7 @@ run_targets), because "skip the current tool" has no single referent when
 six tools across three targets are running.
 """
 
+import ipaddress
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -59,6 +60,42 @@ except ImportError:
 # Serialises the per-target start/finish announcements so two threads
 # finishing at once cannot interleave halfway through a line.
 _print_lock = threading.Lock()
+
+# A /-suffixed token is only expanded as CIDR when the part before the /
+# is a bare IP address. "example.com/24" is a URL path, not a network, and
+# must be left exactly as it is — reducing it to a host is aegis.py's job,
+# not this parser's.
+_MAX_CIDR_HOSTS = 1024
+
+
+def _expand_cidr(token: str) -> list:
+    """
+    Expand an IPv4/IPv6 CIDR token to its host addresses.
+
+    Returns [] if `token` is not a CIDR whose left side is a bare IP — the
+    caller then keeps the token verbatim, so a hostname with a slash (a
+    URL) is never silently turned into a bogus network.
+
+    A /32 (or /128) is returned as the single host it names. Larger
+    networks are capped at _MAX_CIDR_HOSTS: a stray /8 in a target file
+    would otherwise enqueue 16 million scans, which is a footgun, not a
+    feature. The cap is reported by the caller.
+    """
+    if "/" not in token:
+        return []
+    head = token.split("/", 1)[0]
+    try:
+        ipaddress.ip_address(head)          # left side must be a bare IP
+    except ValueError:
+        return []
+    try:
+        network = ipaddress.ip_network(token, strict=False)
+    except ValueError:
+        return []
+    # .hosts() drops network/broadcast for a real subnet; for a /32 it is
+    # empty, so fall back to the single address the prefix names.
+    hosts = list(network.hosts()) or [network.network_address]
+    return [str(h) for h in hosts[:_MAX_CIDR_HOSTS]]
 
 
 def parse_targets(raw) -> list:
@@ -91,9 +128,20 @@ def parse_targets(raw) -> list:
     except OSError:
         candidates = [p.strip() for p in text.split(",")]
 
+    # Expand any CIDR tokens to their host addresses before de-duplicating,
+    # so "10.0.0.0/30, 10.0.0.1" collapses the overlap rather than scanning
+    # 10.0.0.1 twice.
+    expanded = []
+    for candidate in candidates:
+        hosts = _expand_cidr(candidate)
+        if hosts:
+            expanded.extend(hosts)
+        elif candidate:
+            expanded.append(candidate)
+
     seen = set()
     targets = []
-    for candidate in candidates:
+    for candidate in expanded:
         if candidate and candidate not in seen:
             seen.add(candidate)
             targets.append(candidate)

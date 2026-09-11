@@ -23,7 +23,7 @@ from rich.table import Table
 
 from modules.utils.config import (
     PROFILES, get_profile, SKIP_KEY, get_rate_limits,
-    MAX_CONCURRENT_NMAP_CHUNKS, MAX_CONCURRENT_TARGETS,
+    MAX_CONCURRENT_NMAP_CHUNKS, MAX_CONCURRENT_TARGETS, MAX_THREADS,
 )
 from modules.utils.auth import load_auth
 from modules.profiles._common import web_tool_concurrency
@@ -314,6 +314,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="with --diff, also list the unchanged findings (they are "
              "counted but not listed by default — on a real target they "
              "are most of them).",
+    )
+    # --- Plugin engine (opt-in; Phase 2) ---------------------------------
+    # The legacy profile orchestrators remain the default. --engine switches
+    # to the concurrent, plugin-driven engine with a declarative YAML scan
+    # profile. Everything downstream (database, reports, diff) is shared, so
+    # an --engine scan is reported identically to a legacy one.
+    parser.add_argument(
+        "--engine",
+        action="store_true",
+        help="run the concurrent plugin engine instead of the built-in "
+             "profile orchestrators. Uses a YAML scan profile (--scan-profile) "
+             "and honours --threads and the profile's safety throttle.",
+    )
+    parser.add_argument(
+        "--scan-profile",
+        default="full", metavar="NAME|FILE",
+        help="engine YAML profile (default: full). A shipped name "
+             "(quick/full/stealth/recon) or a path to a .yaml file. "
+             "Only consulted with --engine.",
+    )
+    parser.add_argument(
+        "--threads",
+        type=int, default=None, metavar="N",
+        help="max plugins to run at once within one engine scan "
+             f"(default {MAX_THREADS}, capped at {MAX_THREADS}). Composes "
+             "with the profile's per-target rate limit. Only with --engine.",
+    )
+    parser.add_argument(
+        "--list-plugins",
+        action="store_true",
+        help="list every discovered scanner plugin (name, context, "
+             "availability) and exit. Does not scan.",
     )
     parser.add_argument(
         "--version",
@@ -860,12 +892,24 @@ def _run_multi_target(args, targets) -> int:
 
     auth = load_auth(cli_cookie=args.auth_cookie, cli_header=args.auth_header)
 
+    # --engine composes with --targets: each host is scanned by the plugin
+    # engine (with its own per-target rate limiter, so one throttled host
+    # never starves another), still bounded by --max-concurrent-targets.
+    if args.engine:
+        dispatch = _build_engine_dispatch(args)
+        if dispatch is None:
+            return 1
+        dispatch_label = args.scan_profile
+    else:
+        dispatch = PROFILE_DISPATCH[args.profile]
+        dispatch_label = args.profile
+
     start = time.time()
     try:
         results = run_targets(
             targets,
-            PROFILE_DISPATCH[args.profile],
-            profile=args.profile,
+            dispatch,
+            profile=dispatch_label,
             non_interactive=args.non_interactive,
             auth=auth,
             max_concurrent=args.max_concurrent_targets,
@@ -886,9 +930,73 @@ def _run_multi_target(args, targets) -> int:
     return 0 if succeeded else 1
 
 
+def _run_list_plugins() -> int:
+    """Print the discovered plugin registry and exit. Used by --list-plugins."""
+    from plugins import describe, load_errors
+
+    rows = describe()
+    table = Table(title="Aegis Scanner — discovered plugins", show_lines=False)
+    table.add_column("Plugin", style="cyan", no_wrap=True)
+    table.add_column("Context")
+    table.add_column("Baseline")
+    table.add_column("Available")
+    table.add_column("Description")
+    for name, types, baseline, desc, avail in rows:
+        avail_render = "[green]yes[/green]" if avail == "yes" else f"[yellow]{avail}[/yellow]"
+        table.add_row(name, types, baseline, avail_render, desc)
+    console.print(table)
+    console.print(f"[dim]{len(rows)} plugin(s) discovered from plugins/.[/dim]")
+
+    if load_errors:
+        console.print("[red]Plugins that failed to load:[/red]")
+        for modname, err in load_errors:
+            console.print(f"  [red]{modname}[/red]: {err}")
+    return 0
+
+
+def _build_engine_dispatch(args):
+    """
+    Build a dispatch callable for --engine from the requested YAML profile.
+
+    Returns a callable with the same (target, non_interactive, auth)
+    signature the profile orchestrators expose — so main()'s shared
+    completion path handles its result unchanged — or None if the profile
+    could not be loaded (message already printed).
+    """
+    from modules.engine import load_yaml_profile, run_engine_scan
+    from modules.engine.profiles_yaml import ProfileError
+
+    try:
+        profile = load_yaml_profile(args.scan_profile)
+    except ProfileError as exc:
+        print_error(f"engine profile: {exc}")
+        return None
+
+    if args.verbose:
+        safety = profile.get("safety") or {}
+        print_info(
+            f"[verbose] engine profile '{profile['name']}' -> "
+            f"plugins={profile['plugins'] or 'all'} "
+            f"threads={args.threads or MAX_THREADS} "
+            f"safety={{rps:{safety.get('max_requests_per_second', 'none')}, "
+            f"concurrent:{safety.get('max_concurrent_plugins', 'none')}}}"
+        )
+
+    def dispatch(target, non_interactive=False, auth=None):
+        return run_engine_scan(target, profile, threads=args.threads,
+                               non_interactive=non_interactive, auth=auth)
+
+    return dispatch
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+
+    # --list-plugins is a query, not a scan: print the plugin registry and
+    # exit before any banner or target handling.
+    if args.list_plugins:
+        return _run_list_plugins()
 
     # --diff produces no scan and no banner: it is a reporting query, and
     # its output is meant to be pipeable into a mail body or a log.
@@ -1044,7 +1152,17 @@ def main() -> int:
 
     live = _maybe_start_live_dashboard(args)
 
-    dispatch = PROFILE_DISPATCH[args.profile]
+    # --engine swaps the legacy orchestrator for the concurrent plugin
+    # engine, driven by a YAML scan profile. Everything after dispatch is
+    # shared: run_engine_scan returns the same (scan_id, txt, pdf, html,
+    # stats) tuple the profile functions do, so the completion panel,
+    # summary and delta below are unchanged.
+    if args.engine:
+        dispatch = _build_engine_dispatch(args)
+        if dispatch is None:
+            return 1
+    else:
+        dispatch = PROFILE_DISPATCH[args.profile]
     start = time.time()
 
     try:

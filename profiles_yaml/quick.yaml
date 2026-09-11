@@ -1,0 +1,29 @@
+# quick.yaml — fast overview, the engine analogue of the quickscan profile.
+#
+# DNS + a fast top-ports nmap sweep + service detection, then a light web
+# pass (headers, whatweb fingerprint, high/critical nuclei only). No brute-
+# forcing, no active injection, no TLS deep-dive: the point is speed.
+name: Quick Scan
+description: Fast overview — DNS, top-port scan, service detection, light web check.
+
+# nmap flags come from config.PROFILES['quickscan'] so the engine reuses the
+# same live-verified fast-scan arguments the legacy profile uses.
+nmap_profile: quickscan
+nuclei_severity: [critical, high]
+
+plugins:
+  - dns
+  - port_scan
+  - service_detect
+  - header_check
+  - whatweb
+  - nuclei
+
+# Modest safety cap. quick scans are usually a single host, but the same
+# throttle applies if pointed at a fragile one.
+safety:
+  max_requests_per_second: 8
+  max_concurrent_plugins: 4
+
+rate_limits:
+  nuclei_rate_limit: 150

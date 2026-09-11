@@ -1,0 +1,15 @@
+# recon.yaml — passive attack-surface map. Sends NOTHING to the target.
+#
+# Only passive-context plugins: certificate-transparency + subdomain
+# enumeration, cloud-bucket discovery, and the HIBP breach check (which
+# reports NOT RUN without an API key — never "clean"). Everything here
+# contacts third parties only, so the safety governor is irrelevant and
+# omitted.
+name: Recon (passive)
+description: Passive attack-surface map — subdomains, cloud buckets, breach check. Never touches the target.
+
+target_types: [passive]
+plugins:
+  - subdomain_enum
+  - cloud_enum
+  - hibp
