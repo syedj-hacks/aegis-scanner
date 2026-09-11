@@ -88,8 +88,14 @@ def report_filename(profile: str, target: str, scan_id, extension: str) -> str:
 # Matches the names report_filename() produces, capturing the profile and
 # the scan id. The profile group is non-greedy and the scan id is anchored
 # to the end so a target containing underscores still parses.
+# txt/pdf were the original pair; json and sarif (Phase 4 machine outputs)
+# are also per-scan-named and so must be swept up with their scan, or they
+# would accumulate one-per-scan forever. html is deliberately absent: it is
+# written to a single fixed report.html that each scan overwrites, so it has
+# nothing to prune. Grouping is by scan_id, so all of a scan's files are
+# kept or removed as one unit.
 _STORED_REPORT = re.compile(
-    r"^report_(?P<profile>.+?)_(?P<target>.+)_(?P<scan_id>\d+)\.(?P<ext>txt|pdf)$"
+    r"^report_(?P<profile>.+?)_(?P<target>.+)_(?P<scan_id>\d+)\.(?P<ext>txt|pdf|json|sarif)$"
 )
 
 

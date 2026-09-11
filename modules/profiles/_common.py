@@ -24,6 +24,8 @@ from modules.utils.display import print_info, print_warning, print_error
 from modules.reporting.report_txt import generate_txt_report
 from modules.reporting.report_pdf import generate_pdf_report
 from modules.reporting.report_html import generate_html_report
+from modules.reporting.report_json import generate_json_report
+from modules.reporting.report_sarif import generate_sarif_report
 from modules.reporting.dashboard_live import finalize_live_dashboard
 from modules.reporting.retention import retain_reports
 from modules.reporting.completion import print_report_summary
@@ -477,9 +479,26 @@ def finalise_reports(target: str, profile: str, scan_id,
     pdf_path = generate_pdf_report(scan_id)
     html_path = generate_html_report(scan_id)
 
+    # Machine-readable outputs (Phase 4): JSON for scripting/chaining and
+    # SARIF for CI/CD. Both are cheap (no rendering, no native deps) and
+    # read the same build_summary() the human reports do, so they can never
+    # disagree with the PDF about what the scan found. Generated here — the
+    # one place every profile and the engine funnel through — so no caller
+    # has to remember them, and returned alongside the human reports only
+    # implicitly (they are on disk and announced); the 3-tuple return stays
+    # unchanged so every existing caller is unaffected.
+    json_path = sarif_path = None
+    try:
+        summary_for_machine = build_summary(scan_id, quiet=True)
+        json_path = generate_json_report(summary_for_machine)
+        sarif_path = generate_sarif_report(summary_for_machine)
+    except Exception as exc:
+        print_warning(f"[{profile}] machine-readable report generation failed: {exc}")
+
     try:
         retain_reports(
-            target, profile, [txt_path, pdf_path, html_path],
+            target, profile,
+            [txt_path, pdf_path, html_path, json_path, sarif_path],
             scan_id=scan_id, non_interactive=non_interactive,
         )
     except Exception as exc:

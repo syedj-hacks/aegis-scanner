@@ -45,6 +45,7 @@ from modules.reporting.summary import (
     profile_scope_note,
 )
 from modules.enrichment.compliance_map import group_by_framework, FRAMEWORKS
+from modules.reporting.risk_report import risk_posture, top_risks
 
 # Print-legible equivalents of display.SEVERITY_COLORS.
 #
@@ -283,6 +284,45 @@ def _stylesheet() -> str:
         color: #777;
         text-align: center;
     }
+
+    /* --- Phase 4: part headers, risk banner, top risks, enrichment --- */
+    h1.part {
+        font-size: 15pt;
+        margin: 26px 0 12px 0;
+        padding-bottom: 5px;
+        border-bottom: 2px solid #2b3a55;
+        color: #2b3a55;
+        page-break-before: auto;
+    }
+    p.lead { color: #444; font-size: 9.5pt; margin: 4px 0 12px 0; }
+    .risk-banner {
+        display: flex;
+        align-items: center;
+        border: 2px solid #4a5568;
+        border-radius: 8px;
+        padding: 14px 18px;
+        margin: 8px 0 18px 0;
+    }
+    .risk-score { font-size: 40pt; font-weight: 700; line-height: 1; min-width: 165px; }
+    .risk-max { font-size: 15pt; color: #888; font-weight: 400; }
+    .risk-meta { padding-left: 18px; }
+    .risk-band {
+        display: inline-block; color: #fff; font-weight: 700; font-size: 9pt;
+        padding: 2px 10px; border-radius: 10px; letter-spacing: 0.4px;
+    }
+    .risk-note { font-size: 9pt; color: #444; margin-top: 6px; }
+    .toprisk {
+        border-left: 3px solid #cbd5e0; padding: 6px 10px; margin: 7px 0;
+        background: #f7f9fc;
+    }
+    .toprisk-head { font-weight: 600; margin-bottom: 3px; }
+    .risk-chip {
+        display: inline-block; background: #2b3a55; color: #fff; font-size: 8pt;
+        padding: 1px 7px; border-radius: 9px; margin-left: 6px;
+    }
+    .facts.enrich { margin-top: 3px; }
+    .conf-confirmed { color: #2f7d32; font-weight: 700; }
+    .conf-potential { color: #b8860b; font-weight: 700; }
     """
 
 
@@ -570,6 +610,26 @@ def _details_html(summary: dict) -> str:
         # Shared with the text report so the same finding cannot be titled
         # two different things depending on which file the reader opens.
 
+        # Phase 4 enrichment line: confidence (Confirmed/Potential — the
+        # false-positive distinction), EPSS exploit probability, and the
+        # combined risk score. Only rendered when present so a legacy-scan
+        # finding (all NULL) shows the same card it always did.
+        confidence = finding.get("confidence")
+        epss = finding.get("epss_score")
+        risk = finding.get("risk_score")
+        enrich_bits = []
+        if confidence:
+            css = "conf-confirmed" if confidence == "Confirmed" else "conf-potential"
+            enrich_bits.append(f'<span class="{css}">{_esc(confidence)}</span>')
+        if epss is not None:
+            enrich_bits.append(f"EPSS {epss * 100:.0f}%")
+        if risk is not None:
+            enrich_bits.append(f"Risk {risk}/10")
+        enrich_html = (
+            f'<div class="facts enrich">{" &nbsp;|&nbsp; ".join(enrich_bits)}</div>'
+            if enrich_bits else ""
+        )
+
         cards.append(
             f'<div class="finding" style="border-left-color:{_severity_hex(severity)}">'
             f'<div class="head">{index}. {_esc(title)} &nbsp;{_badge(severity)}</div>'
@@ -579,10 +639,11 @@ def _details_html(summary: dict) -> str:
             f'CVE {_esc(field_display(finding, "cve_id"))} &nbsp;|&nbsp; '
             f'CVSS {_esc(cvss_display(finding))}'
             f"</div>"
+            + enrich_html
             # Same two cells the text report's detail card gained, through
             # the same field_display(), so the two files cannot disagree
             # about what a finding's endpoint or citation was.
-            f'<div class="facts">'
+            + f'<div class="facts">'
             f'Endpoint {_esc(_truncate(field_display(finding, "endpoint")))} '
             f'&nbsp;|&nbsp; '
             f'Reference {_esc(_truncate(field_display(finding, "reference")))}'
@@ -655,9 +716,89 @@ def _compliance_html(summary: dict) -> str:
     return "".join(parts)
 
 
+def _risk_band_hex(band: str) -> str:
+    """Colour for the environment risk band."""
+    return {
+        "Critical": "#b3123a", "High": "#c74a1b",
+        "Medium": "#b8860b", "Low": "#2f7d32", "None": "#4a5568",
+    }.get(band, "#4a5568")
+
+
+def _risk_banner_html(summary: dict) -> str:
+    """
+    The environment Risk Score banner — one number for the whole scanned
+    asset, the first thing the executive summary shows. Aggregated from
+    every finding's combined CVSS+EPSS risk weighted by asset criticality
+    (Phase 4); the method is stated so the number is not a black box.
+    """
+    posture = risk_posture(summary)
+    env = posture["environment_risk"]
+    score = env["score"]
+    band = env["band"]
+    colour = _risk_band_hex(band)
+    crit = posture["criticality"]
+
+    return (
+        '<div class="risk-banner" style="border-color:{c}">'
+        '<div class="risk-score" style="color:{c}">{s}<span class="risk-max">/100</span></div>'
+        '<div class="risk-meta">'
+        '<div class="risk-band" style="background:{c}">{b} RISK</div>'
+        '<div class="risk-note">Environment Risk Score — aggregated from every '
+        "finding's combined CVSS&times;EPSS risk, weighted by an asset "
+        'criticality of <b>{crit}</b>. Higher means a more urgent, more '
+        "exploitable posture; it is driven by the worst findings, not the "
+        "count of them.</div>"
+        "</div></div>"
+    ).format(c=colour, s=score, b=band.upper(), crit=_esc(crit))
+
+
+def _executive_top_risks_html(summary: dict) -> str:
+    """
+    Top 5 risks in plain language — the executive summary's actionable core.
+    Each is a sentence a non-specialist can act on, ranked by combined risk
+    (so a mass-exploited medium can outrank a theoretical critical).
+    """
+    risks = top_risks(summary.get("findings") or [], limit=5)
+    if not risks:
+        return ""
+
+    items = []
+    for r in risks:
+        sev = str(r.get("severity") or "LOW").upper()
+        risk_score = r.get("risk_score")
+        risk_txt = f'<span class="risk-chip">risk {risk_score}</span>' if risk_score is not None else ""
+        items.append(
+            '<div class="toprisk">'
+            f'<div class="toprisk-head">{r["rank"]}. {_badge(sev)} {risk_txt}</div>'
+            f'<p>{_esc(r["plain_language"])}</p>'
+            "</div>"
+        )
+
+    return (
+        '<h2 class="section">Top Risks — Plain Language</h2>'
+        '<p class="lead">The five findings that most deserve attention, in '
+        "priority order. Priority blends severity with real-world exploit "
+        "probability (EPSS), so the list reflects what to fix first, not "
+        "merely what scores highest.</p>"
+        + "".join(items)
+    )
+
+
 def render_html(summary: dict) -> str:
     """
     Build the complete HTML document WeasyPrint typesets into the PDF.
+
+    Structured into two reader-facing parts (Phase 4):
+
+      EXECUTIVE SUMMARY   the risk posture at a glance — the environment
+                          Risk Score, the severity breakdown chart, and the
+                          top 5 risks written in plain language. Everything a
+                          decision-maker needs without reading a CVE.
+
+      TECHNICAL FINDINGS  the full per-finding detail — CVE/CVSS/EPSS,
+                          evidence, endpoint, and remediation steps — plus
+                          the injection and compliance sections. For the
+                          engineer who will do the remediation.
 
     Pure: no I/O and no console output, so the markup can be inspected or
     tested without producing a file.
@@ -671,7 +812,13 @@ def render_html(summary: dict) -> str:
         f"<style>{_stylesheet()}</style>"
         "</head><body>"
         + _cover_html(summary)
+        # --- Executive Summary ---
+        + '<h1 class="part">Executive Summary</h1>'
+        + _risk_banner_html(summary)
         + _summary_html(summary)
+        + _executive_top_risks_html(summary)
+        # --- Technical Findings ---
+        + '<h1 class="part">Technical Findings</h1>'
         + _top_findings_html(summary)
         + _injection_html(summary)
         + _compliance_html(summary)
