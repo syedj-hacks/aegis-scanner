@@ -75,11 +75,24 @@ def init_db():
     # spelled severity bucket. compliance_refs carries the PCI-DSS/ISO
     # 27001/NIST 800-53 control references for a finding, populated by the
     # compliance profile only.
+    # confidence / epss_score / risk_score / plugin / finding_uid were the
+    # last added, for the plugin engine and the Phase 3 enrichment. confidence
+    # is "Confirmed" vs "Potential" (see plugins/base.py) — the false-positive
+    # distinction; epss_score is FIRST.org exploit probability 0-1; risk_score
+    # is the combined CVSS+EPSS score; plugin is which ScannerPlugin produced
+    # the row; finding_uid is the content-derived stable id a diff lines up on.
+    # All nullable — legacy rows and legacy-profile scans leave them NULL and
+    # every reader treats NULL as "not enriched", exactly as with cvss_vector.
     for column in ("description", "remediation", "finding_type", "product",
                    "parameter", "payload", "evidence", "endpoint",
-                   "reference", "cvss_vector", "compliance_refs"):
+                   "reference", "cvss_vector", "compliance_refs",
+                   "confidence", "plugin", "finding_uid"):
         if column not in existing_columns:
             cur.execute(f"ALTER TABLE findings ADD COLUMN {column} TEXT")
+    # Numeric enrichment columns are REAL, not TEXT.
+    for column in ("epss_score", "risk_score"):
+        if column not in existing_columns:
+            cur.execute(f"ALTER TABLE findings ADD COLUMN {column} REAL")
 
     # Per-scan tools-run record. Separate table (not a JSON column on scans)
     # to match this schema's convention: findings already hang off scans by
@@ -288,8 +301,10 @@ def insert_finding(scan_id: int, finding: dict):
            (scan_id, port, service, version, cve_id, cvss, severity,
             description, remediation, finding_type, product,
             parameter, payload, evidence, endpoint, reference,
-            cvss_vector, compliance_refs)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            cvss_vector, compliance_refs,
+            confidence, epss_score, risk_score, plugin, finding_uid)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   ?, ?, ?, ?, ?)""",
         (
             scan_id,
             finding.get("port"),
@@ -313,6 +328,17 @@ def insert_finding(scan_id: int, finding: dict):
             # a schema and a JOIN to buy nothing. Only the compliance
             # profile populates it; every other profile leaves it NULL.
             _compliance_refs_text(finding.get("compliance_refs")),
+            # Plugin-engine / Phase 3 enrichment columns. Every one is
+            # nullable and every legacy-profile caller omits them, so those
+            # rows insert with NULL exactly as before — the plugin engine
+            # and the enrichment pass are the only writers that populate
+            # them. finding_uid is the content-derived stable id
+            # (plugins/base.Finding.assign_id) a scan diff can line up on.
+            finding.get("confidence"),
+            finding.get("epss_score"),
+            finding.get("risk_score"),
+            finding.get("plugin"),
+            finding.get("finding_uid"),
         ),
     )
     conn.commit()
