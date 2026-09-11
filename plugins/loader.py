@@ -131,6 +131,23 @@ def discover(force: bool = False) -> dict:
 
                 registry[instance.name] = instance
 
+        # Signature-backed plugins (Phase 3): declarative YAML/JSON checks
+        # from signatures/, each becoming a SignaturePlugin. Loaded through
+        # the same failure policy — a malformed signature is recorded, not
+        # fatal — and namespaced "sig:<id>" so a signature can never collide
+        # with a Python plugin's name.
+        try:
+            from plugins.signature import load_signatures
+            sig_plugins, sig_errors = load_signatures()
+            for instance in sig_plugins:
+                if instance.name in registry:
+                    errors.append((instance.name, "duplicate signature/plugin name"))
+                    continue
+                registry[instance.name] = instance
+            errors.extend(sig_errors)
+        except Exception as exc:  # noqa: BLE001 — signatures are additive
+            errors.append(("signatures", f"signature loading failed: {exc}"))
+
         load_errors[:] = errors
         _cache = registry
         return _cache

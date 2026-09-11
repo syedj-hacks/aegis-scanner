@@ -1,0 +1,26 @@
+# Detects a publicly-readable .git/config — a common source-code exposure
+# that leaks repository layout and often internal URLs/credentials.
+id: exposed-git-config
+info:
+  name: Exposed .git/config
+  severity: medium
+  description: >
+    The web server serves /.git/config, exposing the repository's
+    configuration. An attacker can often reconstruct the full source tree
+    from an exposed .git directory.
+  remediation: >
+    Block access to the .git directory at the web server (deny /.git in
+    nginx/apache), and do not deploy the .git directory to production.
+  reference:
+    - https://owasp.org/www-community/attacks/Source_code_disclosure
+requests:
+  - method: GET
+    path: "/.git/config"
+    matchers_condition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: word
+        part: body
+        words: ["[core]", "repositoryformatversion"]
+        condition: and

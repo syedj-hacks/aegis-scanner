@@ -40,6 +40,14 @@ from modules.utils.logger import (
 from modules.utils.display import (
     print_info, print_success, print_warning, print_error,
 )
+from modules.enrichment import enrich_cache
+
+# Local cache for NVD responses (Phase 3 "cache responses locally to avoid
+# rate limits"). CVSS data for a published CVE does not change, so a long
+# TTL is safe; 30 days balances "immutable in practice" against picking up
+# the rare post-publication CVSS revision within a reasonable window.
+_CVE_CACHE_NAMESPACE = "nvd"
+_CVE_CACHE_TTL = 30 * 24 * 3600
 
 # Seconds to wait for connect + response. A module constant rather than
 # config.get_timeout() because TOOL_TIMEOUTS is scoped to subprocess tools;
@@ -677,6 +685,27 @@ def lookup_cves(product, version=None, target: str = "nvd",
         # _MIN_INTERVAL has already adapted to that slower rate.
         print_warning("[CVE] no NVD API key configured; using the slower anonymous rate limit")
 
+    # Cache check FIRST — before the throttle, before the network. CVSS data
+    # for a published CVE is effectively immutable, so a keyword we have
+    # already resolved is served from disk in microseconds instead of
+    # costing a request against NVD's tight anonymous rate limit. A deepscan
+    # of a host with several services running the same software (and a
+    # re-scan of the same host tomorrow) asks the identical keyword
+    # repeatedly; without this the scan spends most of its time asleep in
+    # _throttle(). The cache stores the raw NVD json payload keyed by
+    # keyword+limit; _parse_cves re-runs over it, so product/version
+    # filtering still applies to a cached response exactly as to a fresh one.
+    _cache_key = f"{keyword}|{limit}"
+    cached_json = enrich_cache.get(_CVE_CACHE_NAMESPACE, _cache_key, _CVE_CACHE_TTL)
+    if cached_json is not None:
+        print_info(f"[CVE] cache hit for '{keyword}'")
+        result["cves"] = _parse_cves(cached_json, result["product"],
+                                     result["version"], cpe_products)
+        log_tool_success(target, "nvd-cve-lookup")
+        if result["cves"]:
+            print_success(f"[CVE] {len(result['cves'])} CVE(s) matched '{keyword}' (cached)")
+        return result
+
     attempt = 0
     while True:
         _throttle()
@@ -726,6 +755,11 @@ def lookup_cves(product, version=None, target: str = "nvd",
         log_tool_failure(target, "nvd-cve-lookup", f"{keyword} — {err}")
         print_error(f"[CVE] NVD lookup failed for '{keyword}': {err}")
         return result
+
+    # Cache the raw payload (keyed by keyword+limit) before parsing, so the
+    # next lookup of this keyword — this scan or a later one — skips the
+    # network. Best-effort; a cache-write failure never affects the result.
+    enrich_cache.put(_CVE_CACHE_NAMESPACE, _cache_key, data.get("json"))
 
     result["cves"] = _parse_cves(data.get("json"), result["product"], result["version"], cpe_products)
     log_tool_success(target, "nvd-cve-lookup")

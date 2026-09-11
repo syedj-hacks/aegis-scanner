@@ -348,6 +348,14 @@ def build_parser() -> argparse.ArgumentParser:
              "availability) and exit. Does not scan.",
     )
     parser.add_argument(
+        "--criticality",
+        choices=["low", "medium", "high", "critical"],
+        default="medium", metavar="LEVEL",
+        help="asset criticality of the target (low/medium/high/critical, "
+             "default medium). Weights this target's findings in the "
+             "environment Risk Score. Only with --engine.",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"Aegis Scanner {__version__}",
@@ -984,7 +992,8 @@ def _build_engine_dispatch(args):
 
     def dispatch(target, non_interactive=False, auth=None):
         return run_engine_scan(target, profile, threads=args.threads,
-                               non_interactive=non_interactive, auth=auth)
+                               non_interactive=non_interactive, auth=auth,
+                               criticality=getattr(args, "criticality", "medium"))
 
     return dispatch
 

@@ -1,0 +1,38 @@
+# Detects an exposed phpinfo() page — leaks full PHP configuration, paths,
+# loaded modules and environment, a strong reconnaissance aid for an attacker.
+id: phpinfo-exposed
+info:
+  name: Exposed phpinfo() page
+  severity: low
+  description: >
+    A phpinfo() page is reachable, disclosing the PHP version, build
+    configuration, loaded extensions, absolute paths and environment
+    variables.
+  remediation: >
+    Remove phpinfo() test pages from production. They are diagnostic tools,
+    not intended to be publicly reachable.
+  reference:
+    - https://www.php.net/manual/en/function.phpinfo.php
+# phpinfo() pages hide under many common names; each request is tried in
+# turn and the signature fires on the first that matches.
+requests:
+  - method: GET
+    path: "/phpinfo.php"
+    matchers_condition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: word
+        part: body
+        words: ["PHP Version", "phpinfo()"]
+        condition: or
+  - method: GET
+    path: "/info.php"
+    matchers_condition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: word
+        part: body
+        words: ["PHP Version", "phpinfo()"]
+        condition: or

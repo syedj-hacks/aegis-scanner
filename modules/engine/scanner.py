@@ -59,6 +59,8 @@ from modules.profiles._common import (
 )
 from database.db import insert_scan, insert_findings_bulk
 from modules.reporting.dashboard_live import update_live_data
+from modules.enrichment.pipeline import enrich_findings
+from modules.enrichment.risk import environment_risk_score
 
 try:
     from modules.utils.config import MAX_THREADS
@@ -84,11 +86,17 @@ class ScanEngine:
     """
 
     def __init__(self, profile: dict, threads: int = None,
-                 non_interactive: bool = False, auth=None):
+                 non_interactive: bool = False, auth=None,
+                 criticality: str = "medium", active_validation: bool = True):
         self.profile = profile or {}
         self.threads = max(1, min(int(threads or MAX_THREADS), MAX_THREADS))
         self.non_interactive = non_interactive
         self.auth = auth
+        # Asset criticality weights this target's findings in the
+        # environment risk roll-up (Phase 4). A stealth/passive profile
+        # turns off active validation (no live probing of the target).
+        self.criticality = criticality or "medium"
+        self.active_validation = active_validation
         self.limiter = RateLimiter.from_profile(self.profile.get("safety"))
 
     # --- plugin selection ------------------------------------------------
@@ -241,14 +249,24 @@ class ScanEngine:
         all_findings = []
 
         def _absorb(results):
+            batch = []
             for r in results:
                 all_results.append(r)
                 for f in r.findings:
                     all_findings.append(f)
-            scored = [f.to_db_dict()
-                      for r in results for f in r.findings]
-            if scored:
-                insert_findings_bulk(scan_id, scored)
+                    batch.append(f)
+            if not batch:
+                return
+            # Phase 3 enrichment BEFORE persist, so confidence/EPSS/risk are
+            # written to the row rather than bolted on afterwards. EPSS is
+            # batched+cached, so enriching per stage costs at most one API
+            # call per stage and usually zero (cache hits). Active
+            # validation re-reads a live banner only for version-matched web
+            # findings; the profile can turn it off.
+            for f in batch:
+                setattr(f, "criticality", self.criticality)
+            enrich_findings(batch, target, active_validation=self.active_validation)
+            insert_findings_bulk(scan_id, [f.to_db_dict() for f in batch])
 
         # --- Stage 1: discovery, sequential --------------------------
         ctx = dict(base_cfg)
@@ -331,6 +349,13 @@ class ScanEngine:
             "tools_skipped": sum(1 for r in tool_results if r.get("skipped")),
         }
         persist_tool_run(scan_id, tool_results)
+
+        # Environment Risk Score for the whole scan (Phase 4), from every
+        # finding's combined risk weighted by this asset's criticality.
+        env_risk = environment_risk_score(
+            [f.to_db_dict() for f in all_findings], self.criticality)
+        stats["environment_risk"] = env_risk["score"]
+        stats["risk_band"] = env_risk["band"]
         log_scan_end(target, stats)
 
         txt_path, pdf_path, html_path = finalise_reports(
@@ -349,19 +374,30 @@ class ScanEngine:
             "tool_results": tool_results, "stats": stats,
             "report_paths": [p for p in (txt_path, pdf_path, html_path) if p],
             "elapsed": elapsed, "throttle_wait": self.limiter.total_wait,
+            "environment_risk": env_risk,
         }
 
 
 def run_engine_scan(target: str, profile: dict, threads: int = None,
-                    non_interactive: bool = False, auth=None) -> tuple:
+                    non_interactive: bool = False, auth=None,
+                    criticality: str = "medium",
+                    active_validation: bool = None) -> tuple:
     """
     Convenience wrapper returning the (scan_id, txt, pdf, html, stats) tuple
     that aegis.py's dispatch and multi_target._normalise already understand
     — so an engine scan slots into the existing CLI plumbing with no special
     handling.
+
+    active_validation defaults to OFF for a passive-only profile (there is
+    no target being probed to validate against) and ON otherwise.
     """
+    if active_validation is None:
+        types = set(profile.get("target_types") or [])
+        active_validation = types != {"passive"}
     engine = ScanEngine(profile, threads=threads,
-                        non_interactive=non_interactive, auth=auth)
+                        non_interactive=non_interactive, auth=auth,
+                        criticality=criticality,
+                        active_validation=active_validation)
     result = engine.scan(target)
     paths = result["report_paths"]
     txt = paths[0] if len(paths) > 0 else None

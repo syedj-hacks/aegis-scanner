@@ -1,0 +1,25 @@
+# Detects a publicly-readable .env file — frequently holds database
+# credentials, API keys and secrets.
+id: exposed-dotenv
+info:
+  name: Exposed .env file
+  severity: high
+  description: >
+    The web server serves a /.env file, which commonly contains database
+    credentials, framework secrets and third-party API keys in plaintext.
+  remediation: >
+    Move .env outside the web root and deny access to dotfiles at the web
+    server. Rotate any secrets that were exposed.
+  reference:
+    - https://owasp.org/www-project-web-security-testing-guide/
+requests:
+  - method: GET
+    path: "/.env"
+    matchers_condition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: regex
+        part: body
+        regex:
+          - "(?i)(DB_PASSWORD|APP_KEY|SECRET|API_KEY)\\s*="

@@ -12,3 +12,4 @@ venv/
 *.pre-backfill.*
 !tests/fixtures/*.json
 hydra.restore
+database/enrich_cache/
