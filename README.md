@@ -99,6 +99,99 @@ are all resolved relative to it). Each scan is recorded in
 `aegis.py --help` lists all flags, and `aegis.py --version` prints the
 current version.
 
+## Plugin engine (concurrent, YAML-driven)
+
+Alongside the built-in profiles there is a plugin-driven scan engine that
+runs independent checks concurrently and enriches every finding with live
+CVSS/EPSS scoring. It is opt-in — the profiles above are unchanged and
+remain the default.
+
+```bash
+python3 aegis.py <target> --engine --scan-profile full   # concurrent full scan
+python3 aegis.py <target> --engine --scan-profile quick --threads 8
+python3 aegis.py --list-plugins                           # what checks exist
+```
+
+- **Plugins** live in [`plugins/`](plugins/) and are auto-discovered — every
+  existing detection tool has one, and a new check is a new file, no core
+  edit. See [`docs/PLUGIN_GUIDE.md`](docs/PLUGIN_GUIDE.md).
+- **Signatures** ([`signatures/*.yaml`](signatures/)) are declarative,
+  Nuclei-style HTTP checks — add one with no Python at all.
+- **YAML scan profiles** ([`profiles_yaml/`](profiles_yaml/):
+  quick/full/stealth/recon) choose which plugins run and set a per-target
+  safety throttle (`--threads` bounds concurrency; the profile's
+  `max_requests_per_second` paces launches so a fragile target is not
+  overwhelmed).
+- **Enrichment**: each finding gets a live CVSS vector/score (NVD, cached),
+  an EPSS exploit-probability (FIRST.org), a combined risk score, and a
+  **Confirmed vs Potential** confidence label. `--criticality` weights the
+  target in the environment Risk Score.
+- **Outputs**: every scan now also writes machine-readable `report.*.json`
+  (scripting) and `report.*.sarif` (CI/CD, e.g. GitHub code scanning)
+  beside the TXT/PDF/HTML.
+
+## Comparison to Industry Tools
+
+Aegis is a lightweight open-source scanner, not a commercial platform. This
+is an honest account of where it is comparable to a tool like Nessus and
+where it is not.
+
+**Comparable in kind:**
+
+- **CVSS + EPSS risk scoring.** Findings carry a live CVSS vector/score and
+  an EPSS exploit-probability, combined into a single risk score and rolled
+  up into an environment Risk Score weighted by configurable asset
+  criticality — the same severity-plus-likelihood model commercial scanners
+  use to prioritise.
+- **Plugin architecture.** Detection is a set of discoverable plugins plus a
+  declarative signature format, so coverage grows without touching the core
+  — the same extensibility model as Nessus plugins / Nuclei templates.
+- **Confirmed vs Potential.** Findings the scanner actually exercised are
+  distinguished from version/banner inferences, with lightweight active
+  validation — the false-positive discipline a professional report needs.
+- **CI/CD & scripting integration.** Native SARIF output drops into GitHub
+  code scanning and other pipelines; JSON output chains into other tools.
+- **Safety throttling.** A per-target request-rate governor bounds scan
+  pressure, the way a commercial scanner's safe-checks/pacing does.
+- **Executive + technical reporting.** The PDF separates an executive
+  summary (risk posture, top risks in plain language) from per-finding
+  technical detail.
+
+**Still a gap (what Aegis does *not* do):**
+
+- **No continuous or scheduled scanning.** Aegis runs on demand; there is no
+  built-in scheduler, monitoring, or trend-over-time engine.
+- **No agent-based scanning.** It scans over the network only — there are no
+  host agents for authenticated local inspection at scale.
+- **No compliance templates.** There is a control-mapping compliance profile,
+  but no packaged PCI-DSS / HIPAA / CIS-benchmark audit templates.
+- **Smaller detection corpus.** It orchestrates a fixed set of best-in-class
+  open-source tools plus its own signatures; it does not carry the tens of
+  thousands of vendor-maintained checks a commercial feed does.
+- **No centralised multi-user platform.** No web console, RBAC, asset
+  inventory, or ticketing integrations — it is a CLI tool with local report
+  output.
+
+### Known detection gaps (from the Phase 6 lab smoke test)
+
+The plugin engine was smoke-tested live against the BlackBox lab (see
+[`smoke_test/PHASE6_RESULTS.md`](smoke_test/PHASE6_RESULTS.md)). It completed
+without crashing, generated PDF/JSON/SARIF, enriched findings with
+CVSS+EPSS, and knocked no service offline. The honest gaps it surfaced:
+
+- **No sqlmap / XSS / nmap-NSE plugin yet.** The legacy `deepscan` confirms a
+  SQL injection on DVWA and runs NSE scripts; the engine does not yet, so
+  its full profile trades active *injection confirmation* for speed and
+  enrichment. Use `--profile deepscan` (legacy) when injection confirmation
+  matters, or contribute those plugins (see `docs/PLUGIN_GUIDE.md`).
+- **App-level vulns need authentication** (DVWA XSS/command-injection,
+  Juice/WebGoat challenges) — supply `--auth-cookie` and the injection
+  plugins above.
+- **Version-matched CVEs are labelled `Potential`, not confirmed** — by
+  design. On the Samba host the engine matched 16 CVEs (incl. CVE-2015-0240,
+  CVSS 10.0, EPSS 0.88) from the banner and flagged every one Potential
+  rather than asserting exploitability it did not test.
+
 ## Documentation
 All project documentation lives in [`important documentations/`](important%20documentations/):
 

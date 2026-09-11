@@ -93,7 +93,7 @@ def init_db():
     for column in ("description", "remediation", "finding_type", "product",
                    "parameter", "payload", "evidence", "endpoint",
                    "reference", "cvss_vector", "compliance_refs",
-                   "confidence", "plugin", "finding_uid"):
+                   "confidence", "plugin", "finding_uid", "validation"):
         if column not in existing_columns:
             cur.execute(f"ALTER TABLE findings ADD COLUMN {column} TEXT")
     # Numeric enrichment columns are REAL, not TEXT.
@@ -309,9 +309,10 @@ def insert_finding(scan_id: int, finding: dict):
             description, remediation, finding_type, product,
             parameter, payload, evidence, endpoint, reference,
             cvss_vector, compliance_refs,
-            confidence, epss_score, risk_score, plugin, finding_uid)
+            confidence, epss_score, risk_score, plugin, finding_uid,
+            validation)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?, ?, ?)""",
+                   ?, ?, ?, ?, ?, ?)""",
         (
             scan_id,
             finding.get("port"),
@@ -346,6 +347,11 @@ def insert_finding(scan_id: int, finding: dict):
             finding.get("risk_score"),
             finding.get("plugin"),
             finding.get("finding_uid"),
+            # Active-validation note (plugins/base.Finding.validation): the
+            # live-probe corroboration/discrepancy string, when one was
+            # produced. NULL for legacy rows and for findings not actively
+            # validated.
+            finding.get("validation"),
         ),
     )
     conn.commit()

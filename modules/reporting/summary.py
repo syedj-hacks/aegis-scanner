@@ -196,6 +196,7 @@ FINDING_TYPE_TOOL = {
     "recon_leak": "HIBP",
     "recon_subdomain": "crt.sh/subfinder/amass",
     "service_version": "nmap -sV",
+    "signature_match": "signature",
     "smb_share": "enum4linux",
     "smb_user": "enum4linux",
     "sqlmap_finding": "sqlmap",

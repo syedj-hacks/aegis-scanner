@@ -107,6 +107,11 @@ FINDING_TYPE_PRODUCERS = {
     "recon_leak": {"hibp"},
     "recon_subdomain": {"crtsh", "subfinder", "amass", "theharvester"},
     "service_version": {"nmap"},
+    # Signature-backed checks (plugins/signature.py). Every signature emits
+    # this type; its producer is the synthetic "signature", which
+    # ran_producer_set derives from the "sig:<id>" tool records so a
+    # signature_match is credited to whichever signature ran.
+    "signature_match": {"signature"},
     "smb_share": {"enum4linux"},
     "smb_user": {"enum4linux"},
     "sqlmap_finding": {"sqlmap"},
@@ -160,6 +165,22 @@ PROFILE_PRODUCERS = {
         "banner_grab", "header_check", "nvd", "wpscan", "sqlmap", "hydra",
         "enum4linux",
     },
+    # --- Plugin engine profiles (profiles_yaml/*.yaml) --------------------
+    # Keyed by the YAML profile's lowercased display `name:`, which is what
+    # is stored in scans.profile for an engine scan and what
+    # profile_producers() looks up. Registering them means an engine scan
+    # attributes through the same model as a legacy one (and the orphan-
+    # producer guard sees "signature" as a real, runnable producer). The
+    # per-scan ran-set still does the real work via scan_tools_run; these
+    # sets bound what each engine profile CAN produce.
+    "full scan": {
+        "nmap", "nikto", "gobuster", "dirb", "whatweb", "nuclei", "zaproxy",
+        "banner_grab", "header_check", "nvd", "wpscan", "hydra", "enum4linux",
+        "sslyze", "testssl", "signature",
+    },
+    "quick scan": {"nmap", "whatweb", "nuclei", "header_check", "nvd", "signature"},
+    "stealth scan": {"nmap", "whatweb"},
+    "recon (passive)": {"crtsh", "subfinder", "amass", "cloud_enum", "hibp"},
 }
 
 # Tools a profile wires in that never produce a findings row: DNS/subdomain/
@@ -187,7 +208,22 @@ NON_FINDING_TOOLS = {"nslookup", "subfinder", "amass", "theharvester"}
 _PRODUCER_ALIASES = {
     "nmap_service_detect": "nmap",
     "nuclei-xss": "nuclei",
-    "subdomain_enum": {"subfinder", "amass"},
+    "subdomain_enum": {"subfinder", "amass", "crtsh"},
+    # Plugin engine (plugins/): the engine records the PLUGIN name in
+    # scan_tools_run, not the underlying tool. Most plugin names already
+    # equal their producer (header_check, nikto, gobuster, nuclei, sslyze,
+    # testssl, zaproxy, wpscan, enum4linux, hydra, whatweb, banner_grab,
+    # cloud_enum, hibp) so need no alias. These two do nmap's work under a
+    # plugin name and must map to producer "nmap" so a service_version /
+    # open_port finding from an engine scan credits correctly.
+    "port_scan": "nmap",
+    # service_detect does BOTH nmap -sV and the in-process NVD CVE lookup
+    # (see plugins/discovery.py), so it is the producer of service_version
+    # AND cve findings on an engine scan. Mapping it to nvd as well is what
+    # lets an engine cve finding attribute correctly without the engine's
+    # (dynamic) YAML profile name needing a PROFILE_PRODUCERS entry — nvd is
+    # otherwise an UNTRACKED producer allowed only via the profile.
+    "service_detect": {"nmap", "nvd"},
 }
 
 # Producers that never flow through tool_results and so can never be recorded
@@ -268,6 +304,13 @@ def ran_producer_set(records: list, profile: str) -> set:
         name = str(record.get("tool_name") or "").strip().lower()
         if not name:
             continue
+        # Signature-backed plugins record themselves as "sig:<id>" (see
+        # plugins/signature.py); every one of them produces the same
+        # finding type, signature_match, whose producer is the synthetic
+        # "signature". Collapse them here so a signature_match is credited
+        # to whichever signature actually ran, without enumerating ids.
+        if name.startswith("sig:"):
+            name = "signature"
         alias = _PRODUCER_ALIASES.get(name, name)
         # A wrapper that drives several tools maps to several producers.
         ran |= {alias} if isinstance(alias, str) else set(alias)

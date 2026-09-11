@@ -257,6 +257,7 @@ class Finding:
             "risk_score": self.risk_score,
             "plugin": self.plugin or None,
             "finding_uid": self.id,
+            "validation": self.validation or None,
         }
 
     def to_dict(self) -> dict:
@@ -277,6 +278,16 @@ class Finding:
         """
         legacy = legacy or {}
         finding_type = legacy.get("type") or legacy.get("finding_type") or ""
+        # Mirror db.py.insert_finding's own inference: a mapper dict with no
+        # explicit type but a cve_id IS a CVE finding. Several mappers
+        # (notably _findings_from_cves) never set a `type` because the legacy
+        # insert path infers it downstream — but to_db_dict()'s
+        # "plugin_finding" default would fire first and mask that inference,
+        # so a CVE row would persist as an untyped plugin_finding and break
+        # attribution (caught by the Phase 6 smoke test on the Samba host).
+        # Applying the same rule here keeps engine and legacy rows identical.
+        if not finding_type and legacy.get("cve_id"):
+            finding_type = "cve"
         description = (legacy.get("description") or "").strip()
 
         # The mappers put the human-readable sentence in `description`.
