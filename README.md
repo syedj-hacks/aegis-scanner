@@ -7,6 +7,22 @@ Kali Linux vulnerability assessment framework —
 > `./start-aegis-shield.sh` on Linux. Python 3.10+ is the only requirement.
 > Full documentation: **[saas-platform/README.md](saas-platform/README.md)**
 
+## Run Locally (Docker — no setup)
+
+This runs the whole Aegis Shield web app, including every scanning tool, in one
+container. Nothing to install but Docker.
+
+1. Install **[Docker Desktop](https://www.docker.com/products/docker-desktop/)** and start it.
+2. Clone this repo and open its folder.
+3. Run it:
+   - **Windows:** double-click **`run.bat`**
+   - **Linux / macOS:** run **`./run.sh`**
+4. When it prints the URL, open **http://localhost:8000** in your browser and sign in
+   with the admin e-mail and password shown in the `.env` file (created on first run).
+
+The first build takes a few minutes (it downloads the security tools); later starts are quick.
+Stop it with `docker compose down`. For a live/hosted deploy, see **[DEPLOY.md](DEPLOY.md)**.
+
 ## Setup
 ```bash
 git clone https://github.com/syedj-hacks/aegis-scanner.git

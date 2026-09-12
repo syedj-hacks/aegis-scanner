@@ -8,3 +8,13 @@ database/enrich_cache/
 presentation/
 smoke_test/
 tests/
+
+# Never copy these into the image: huge and/or secret. The frontend build
+# output (saas-platform/frontend/dist) IS committed and is NOT ignored here —
+# the backend serves it.
+**/node_modules/
+saas-platform/backend/.venv/
+saas-platform/backend/data/
+.env
+*.env
+!.env.example

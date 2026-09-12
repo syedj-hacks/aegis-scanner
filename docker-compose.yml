@@ -1,22 +1,78 @@
 # docker-compose.yml
-# The containerised ZAP daemon for Aegis Scanner (item 9).
+# Two independent things live here:
 #
-# Opt-in. The scanner does not need this to run: with ZAP_HOST unset,
-# modules/web/zap_wrap.py spawns a local zap.sh exactly as it always has,
-# and nothing in this file is consulted. Bring it up and set ZAP_HOST to
-# switch deepscan onto it:
+#   1. `app`  — the Aegis Shield web platform (FastAPI backend that also serves
+#               the React frontend) on a single port, backed by SQLite on a
+#               persistent volume. This is the LOCAL ONE-CLICK RUN target:
 #
-#     docker compose up -d zap
-#     echo 'ZAP_HOST=127.0.0.1' >> .env
-#     echo 'ZAP_PORT=8090'      >> .env
+#                   docker compose up --build       (run.sh / run.bat do this)
 #
-# The recovery workflow this exists for — see docker/zap/Dockerfile for the
-# failure it addresses, and TUTORIAL.md for when to reach for it:
+#               then open http://localhost:8000. There is one container on
+#               purpose: the backend serves the built frontend at / (so the
+#               frontend needs no separate service), and SQLite-in-a-volume
+#               means no database service to run. Commented blocks below show
+#               how to switch to a Postgres `db` service if you want one.
 #
-#     docker compose restart zap     # guaranteed-fresh ~/.ZAP profile
+#   2. `zap`  — the containerised OWASP ZAP daemon (item 9), used only to give
+#               deepscan a clean ZAP. It is gated behind the `zap` profile, so
+#               a plain `docker compose up` does NOT start it. Start it exactly
+#               as before, by naming it:
 #
+#                   docker compose up -d zap
+#                   echo 'ZAP_HOST=127.0.0.1' >> .env
+#                   echo 'ZAP_PORT=8090'      >> .env
+#
+#               and the recovery one-liner still works (see docker/zap/Dockerfile
+#               for the failure it addresses, and TUTORIAL.md for when to use it):
+#
+#                   docker compose restart zap     # guaranteed-fresh ~/.ZAP profile
+
 services:
+  # --------------------------------------------------------------- web app
+  app:
+    build:
+      # Build context is the repo ROOT so the backend can import the Aegis
+      # engine as a library; the same Dockerfile is reused for SnapDeploy and
+      # Render so behaviour is identical everywhere (see DEPLOY.md).
+      context: .
+      dockerfile: saas-platform/backend/Dockerfile
+    image: aegis-shield:local
+    container_name: aegis-shield
+    # First run creates .env from .env.example (run.sh / run.bat do this).
+    env_file:
+      - .env
+    environment:
+      # SQLite on the named volume below. Absolute path (four slashes) so it is
+      # the same file regardless of working directory. Override DATABASE_URL in
+      # .env to point at Postgres instead.
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////app/saas-platform/backend/data/aegis_shield.db}
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    volumes:
+      # Everything that must survive a container rebuild lives on named volumes:
+      - aegis-appdata:/app/saas-platform/backend/data   # SaaS DB (users, jobs)
+      - aegis-scandb:/app/database                      # engine scan history
+      - aegis-output:/app/output                        # generated reports
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health',timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      start_period: 40s
+      retries: 6
+    restart: unless-stopped
+
+    # ---- Want a real Postgres instead of SQLite? ------------------------
+    # 1. Uncomment the `db` service at the bottom of this file.
+    # 2. Set in .env:
+    #       DATABASE_URL=postgresql+psycopg2://aegis:aegis@db:5432/aegis
+    # 3. Uncomment depends_on below so the app waits for the database.
+    # depends_on:
+    #   db:
+    #     condition: service_healthy
+
+  # ------------------------------------------------------------------- zap
   zap:
+    profiles: ["zap"]   # not started by a plain `docker compose up`
     build:
       context: ./docker/zap
     image: aegis-zap:local
@@ -91,3 +147,31 @@ services:
       retries: 5
 
     restart: unless-stopped
+
+# --------------------------------------------------------------------- db
+# Optional Postgres, off by default. Uncomment this whole block AND the
+# app's `depends_on` above, then set DATABASE_URL in .env (see the note in
+# the app service). SQLite-in-a-volume is the default so the stack needs no
+# database service at all.
+#
+#  db:
+#    image: postgres:16-alpine
+#    container_name: aegis-shield-db
+#    environment:
+#      POSTGRES_USER: aegis
+#      POSTGRES_PASSWORD: aegis
+#      POSTGRES_DB: aegis
+#    volumes:
+#      - aegis-pgdata:/var/lib/postgresql/data
+#    healthcheck:
+#      test: ["CMD-SHELL", "pg_isready -U aegis"]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#    restart: unless-stopped
+
+volumes:
+  aegis-appdata:   # SaaS database (users, subscriptions, scan jobs)
+  aegis-scandb:    # Aegis engine's own scan-history SQLite
+  aegis-output:    # generated TXT/PDF/HTML reports
+  # aegis-pgdata:  # uncomment with the Postgres `db` service above
