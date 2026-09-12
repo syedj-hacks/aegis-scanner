@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 
-import { api, API_BASE } from "../lib/api";
+import { JobStatus, Severity } from "../components/Labels";
+import PageHeader from "../components/PageHeader";
+import { api, errorMessage } from "../lib/api";
 
 interface Finding {
   id: number;
@@ -27,13 +29,7 @@ interface HistoryJob extends ScanJob {
   created_at: string;
 }
 
-const SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW"];
-const severityColor: Record<string, string> = {
-  CRITICAL: "bg-red-700 text-white",
-  HIGH: "bg-orange-600 text-white",
-  MEDIUM: "bg-amber-600 text-white",
-  LOW: "bg-slate-600 text-white",
-};
+const SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"];
 
 export default function ScanResults() {
   const { jobId } = useParams();
@@ -46,6 +42,7 @@ export default function ScanResults() {
   const [diffResult, setDiffResult] = useState<any | null>(null);
   const [sortSeverity, setSortSeverity] = useState(true);
   const [filterSeverity, setFilterSeverity] = useState<string>("ALL");
+  const [downloadError, setDownloadError] = useState<string | null>(null);
 
   const loadJob = async () => {
     const res = await api.get(`/scans/jobs/${jobId}`);
@@ -75,17 +72,59 @@ export default function ScanResults() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId, job?.status]);
 
+  const counts = useMemo(() => {
+    const c: Record<string, number> = {};
+    for (const f of findings) {
+      const s = (f.severity || "INFO").toUpperCase();
+      c[s] = (c[s] || 0) + 1;
+    }
+    return c;
+  }, [findings]);
+
   const visibleFindings = useMemo(() => {
     let list = [...findings];
-    if (filterSeverity !== "ALL") list = list.filter((f) => f.severity === filterSeverity);
+    if (filterSeverity !== "ALL") list = list.filter((f) => (f.severity || "INFO").toUpperCase() === filterSeverity);
     if (sortSeverity) {
-      list.sort(
-        (a, b) =>
-          SEVERITY_ORDER.indexOf(a.severity || "LOW") - SEVERITY_ORDER.indexOf(b.severity || "LOW")
-      );
+      const rank = (s: string | null) => {
+        const i = SEVERITY_ORDER.indexOf((s || "INFO").toUpperCase());
+        return i === -1 ? SEVERITY_ORDER.length : i;
+      };
+      list.sort((a, b) => rank(a.severity) - rank(b.severity));
     }
     return list;
   }, [findings, filterSeverity, sortSeverity]);
+
+  // Reports need the bearer token, which a plain <a href> can't send — fetch
+  // the file with the API client and hand the browser a blob instead.
+  const download = async (fmt: string) => {
+    if (!job) return;
+    setDownloadError(null);
+    try {
+      const res = await api.get(`/scans/jobs/${job.id}/report`, { params: { fmt }, responseType: "blob" });
+      const blob = fmt === "json" ? new Blob([await res.data.text()], { type: "application/json" }) : res.data;
+      const url = URL.createObjectURL(blob);
+      if (fmt === "html") {
+        window.open(url, "_blank", "noopener");
+      } else {
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `${job.target}_${job.profile}.${fmt}`;
+        a.click();
+      }
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (err: any) {
+      let message = errorMessage(err, "Download failed");
+      const data = err?.response?.data;
+      if (data instanceof Blob) {
+        try {
+          message = JSON.parse(await data.text()).detail || message;
+        } catch {
+          /* keep generic message */
+        }
+      }
+      setDownloadError(message);
+    }
+  };
 
   const runDiff = async () => {
     if (!job?.aegis_scan_id || !compareTargetId) return;
@@ -96,149 +135,181 @@ export default function ScanResults() {
     setDiffResult(res.data);
   };
 
-  if (!job) return <p>Loading...</p>;
+  if (!job) {
+    return <div className="mx-auto max-w-6xl px-5 py-16 text-dim sm:px-8">Loading scan…</div>;
+  }
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold font-mono">{job.target}</h1>
-        <p className="text-slate-400 text-sm">{job.profile} — status: {job.status}</p>
-        {job.error && <p className="text-red-400 text-sm mt-1">{job.error}</p>}
-      </div>
+    <>
+      <PageHeader
+        eyebrow={`Scan #${job.id} · ${job.profile}`}
+        title={<span className="font-mono text-[0.85em] font-semibold tracking-normal">{job.target}</span>}
+        description={
+          job.status === "done"
+            ? `${findings.length} finding${findings.length === 1 ? "" : "s"} recorded.`
+            : job.status === "failed"
+              ? job.error || "The scan did not complete."
+              : "The scan is in progress. This page updates automatically."
+        }
+        actions={
+          <div className="flex items-center gap-3">
+            <span className="[&_.tag]:border-dark-line [&_.tag]:text-on-dark">
+              <JobStatus status={job.status} />
+            </span>
+            <Link to="/dashboard" className="btn-outline-dark btn-sm">All scans</Link>
+          </div>
+        }
+      />
 
       {job.status === "done" && (
         <>
-          <div className="flex items-center gap-2 flex-wrap">
-            {reportFormats.map((fmt) => (
-              <a
-                key={fmt}
-                href={`${API_BASE}/scans/jobs/${job.id}/report?fmt=${fmt}`}
-                target="_blank"
-                rel="noreferrer"
-                className="rounded-md bg-slate-800 hover:bg-slate-700 px-3 py-1.5 text-xs uppercase font-medium"
-              >
-                Download {fmt}
-              </a>
-            ))}
-            {!reportFormats.includes("pdf") && (
-              <span className="text-xs text-slate-500">PDF export requires Pro or Enterprise</span>
+          <div className="border-b border-light-line">
+            <div className="mx-auto grid max-w-6xl grid-cols-2 sm:grid-cols-4">
+              {SEVERITY_ORDER.slice(0, 4).map((s, i) => (
+                <div key={s} className={`px-5 py-6 sm:px-8 ${i > 0 ? "border-l border-light-line" : ""} ${i === 2 ? "border-l-0 sm:border-l" : ""} ${i >= 2 ? "border-t border-light-line sm:border-t-0" : ""}`}>
+                  <div className={`font-display text-[1.9rem] font-extrabold leading-none ${s === "CRITICAL" && counts[s] ? "text-brand" : ""}`}>
+                    {counts[s] || 0}
+                  </div>
+                  <div className="mt-2 font-mono text-[0.7rem] uppercase tracking-[0.08em] text-dim">{s.toLowerCase()}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="mx-auto max-w-6xl space-y-8 px-5 py-10 sm:px-8">
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="eyebrow-light mr-2">Export</span>
+              {reportFormats.map((fmt) => (
+                <button key={fmt} onClick={() => download(fmt)} className="btn-outline btn-sm font-mono uppercase">
+                  {fmt}
+                </button>
+              ))}
+              {!reportFormats.includes("pdf") && (
+                <span className="text-sm text-dim">
+                  PDF and JSON exports are on <Link to="/billing" className="text-action">Pro and Enterprise</Link>
+                </span>
+              )}
+              {downloadError && <span role="alert" className="text-sm text-brand-dim">{downloadError}</span>}
+            </div>
+
+            <div className="panel">
+              <div className="panel-head">
+                <h2 className="panel-title">Findings</h2>
+                <div className="flex items-center gap-2 text-sm">
+                  <label htmlFor="sev-filter" className="sr-only">Filter by severity</label>
+                  <select
+                    id="sev-filter"
+                    value={filterSeverity}
+                    onChange={(e) => setFilterSeverity(e.target.value)}
+                    className="input w-auto py-1.5"
+                  >
+                    <option value="ALL">All severities</option>
+                    {SEVERITY_ORDER.map((s) => (
+                      <option key={s} value={s}>{s.charAt(0) + s.slice(1).toLowerCase()}</option>
+                    ))}
+                  </select>
+                  <button onClick={() => setSortSeverity((v) => !v)} className="btn-outline btn-sm" aria-pressed={sortSeverity}>
+                    {sortSeverity ? "Sorted by severity" : "Original order"}
+                  </button>
+                </div>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Severity</th>
+                      <th>Port</th>
+                      <th>Type</th>
+                      <th>Description</th>
+                      <th>CVE</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {visibleFindings.map((f) => (
+                      <tr key={f.id}>
+                        <td><Severity level={f.severity} /></td>
+                        <td className="font-mono text-[0.82rem]">{f.port ?? "—"}</td>
+                        <td className="whitespace-nowrap text-dim">{f.finding_type}</td>
+                        <td className="min-w-[18rem] max-w-xl">
+                          {f.description}
+                          {f.remediation && <div className="mt-1.5 text-[0.82rem] text-dim">Fix: {f.remediation}</div>}
+                        </td>
+                        <td className="whitespace-nowrap font-mono text-[0.82rem]">{f.cve_id || "—"}</td>
+                      </tr>
+                    ))}
+                    {visibleFindings.length === 0 && (
+                      <tr><td colSpan={5} className="py-10 text-center text-dim">No findings match this filter.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {diffAllowed && history.length > 0 && (
+              <div className="panel">
+                <div className="panel-head">
+                  <h2 className="panel-title">Compare with a previous scan</h2>
+                  <div className="flex items-center gap-2">
+                    <label htmlFor="compare" className="sr-only">Previous scan</label>
+                    <select
+                      id="compare"
+                      value={compareTargetId}
+                      onChange={(e) => setCompareTargetId(e.target.value ? Number(e.target.value) : "")}
+                      className="input w-auto py-1.5 text-sm"
+                    >
+                      <option value="">Select a scan…</option>
+                      {history.map((h) => (
+                        <option key={h.id} value={h.id}>
+                          #{h.id} · {h.profile} · {new Date(h.created_at).toLocaleString()}
+                        </option>
+                      ))}
+                    </select>
+                    <button onClick={runDiff} disabled={!compareTargetId} className="btn-primary btn-sm">
+                      Compare
+                    </button>
+                  </div>
+                </div>
+
+                {diffResult && (
+                  <div className="grid grid-cols-1 gap-px bg-light-line md:grid-cols-2">
+                    <DiffColumn title="New" emphasis items={diffResult.new} />
+                    <DiffColumn title="Fixed · confirmed" items={diffResult.fixed} />
+                    <DiffColumn
+                      title="Unverified"
+                      items={diffResult.unverified}
+                      note="These findings disappeared, but the tool that would have re-confirmed them didn't run this time — their absence proves nothing."
+                    />
+                    <DiffColumn title="Severity changed" items={diffResult.changed} />
+                  </div>
+                )}
+              </div>
+            )}
+            {!diffAllowed && (
+              <p className="text-sm text-dim">
+                Scan comparison is available on <Link to="/billing" className="text-action">Pro and Enterprise</Link>.
+              </p>
             )}
           </div>
-
-          <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
-            <div className="flex items-center justify-between px-4 py-2 border-b border-slate-800">
-              <h2 className="font-semibold">Findings ({findings.length})</h2>
-              <div className="flex items-center gap-2 text-sm">
-                <select
-                  value={filterSeverity}
-                  onChange={(e) => setFilterSeverity(e.target.value)}
-                  className="bg-slate-800 border border-slate-700 rounded-md px-2 py-1"
-                >
-                  <option value="ALL">All severities</option>
-                  {SEVERITY_ORDER.map((s) => (
-                    <option key={s} value={s}>{s}</option>
-                  ))}
-                </select>
-                <button
-                  onClick={() => setSortSeverity((v) => !v)}
-                  className="bg-slate-800 hover:bg-slate-700 rounded-md px-2 py-1"
-                >
-                  Sort by severity: {sortSeverity ? "on" : "off"}
-                </button>
-              </div>
-            </div>
-            <table className="w-full text-sm">
-              <thead className="bg-slate-800 text-slate-300 text-left">
-                <tr>
-                  <th className="px-4 py-2">Severity</th>
-                  <th className="px-4 py-2">Port</th>
-                  <th className="px-4 py-2">Type</th>
-                  <th className="px-4 py-2">Description</th>
-                  <th className="px-4 py-2">CVE</th>
-                </tr>
-              </thead>
-              <tbody>
-                {visibleFindings.map((f) => (
-                  <tr key={f.id} className="border-t border-slate-800 align-top">
-                    <td className="px-4 py-2">
-                      <span className={`px-2 py-0.5 rounded text-xs font-medium ${severityColor[f.severity || "LOW"]}`}>
-                        {f.severity || "LOW"}
-                      </span>
-                    </td>
-                    <td className="px-4 py-2 font-mono">{f.port ?? "-"}</td>
-                    <td className="px-4 py-2">{f.finding_type}</td>
-                    <td className="px-4 py-2 max-w-xl">{f.description}</td>
-                    <td className="px-4 py-2 font-mono">{f.cve_id || "-"}</td>
-                  </tr>
-                ))}
-                {visibleFindings.length === 0 && (
-                  <tr><td colSpan={5} className="px-4 py-6 text-center text-slate-500">No findings match this filter.</td></tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-
-          {diffAllowed && history.length > 0 && (
-            <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
-              <h2 className="font-semibold">Compare with a previous scan</h2>
-              <div className="flex items-center gap-2">
-                <select
-                  value={compareTargetId}
-                  onChange={(e) => setCompareTargetId(Number(e.target.value))}
-                  className="bg-slate-800 border border-slate-700 rounded-md px-2 py-1 text-sm"
-                >
-                  <option value="">Select a scan...</option>
-                  {history.map((h) => (
-                    <option key={h.id} value={h.id}>
-                      #{h.id} — {h.profile} — {new Date(h.created_at).toLocaleString()}
-                    </option>
-                  ))}
-                </select>
-                <button
-                  onClick={runDiff}
-                  disabled={!compareTargetId}
-                  className="rounded-md bg-cyan-600 hover:bg-cyan-500 px-3 py-1.5 text-sm font-medium disabled:opacity-50"
-                >
-                  Compare
-                </button>
-              </div>
-
-              {diffResult && (
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3">
-                  <DiffColumn title="New" color="text-red-400" items={diffResult.new} />
-                  <DiffColumn title="Fixed (confirmed)" color="text-emerald-400" items={diffResult.fixed} />
-                  <DiffColumn
-                    title="Unverified (no re-check ran)"
-                    color="text-amber-400"
-                    items={diffResult.unverified}
-                    note="These findings disappeared, but the tool that would have re-confirmed them didn't run this time — absence proves nothing here."
-                  />
-                  <DiffColumn title="Severity changed" color="text-cyan-400" items={diffResult.changed} />
-                </div>
-              )}
-            </div>
-          )}
-          {!diffAllowed && (
-            <p className="text-sm text-slate-500">Scan comparison requires Pro or Enterprise.</p>
-          )}
         </>
       )}
-    </div>
+    </>
   );
 }
 
-function DiffColumn({ title, color, items, note }: { title: string; color: string; items: any[]; note?: string }) {
+function DiffColumn({ title, items, note, emphasis }: { title: string; items: any[]; note?: string; emphasis?: boolean }) {
   return (
-    <div className="bg-slate-800/50 rounded-lg p-3">
-      <h3 className={`font-semibold text-sm ${color}`}>{title} ({items?.length ?? 0})</h3>
-      {note && <p className="text-xs text-slate-500 mt-1">{note}</p>}
-      <ul className="mt-2 space-y-1 max-h-48 overflow-y-auto">
+    <div className="bg-light p-5">
+      <h3 className={`font-mono text-[0.72rem] uppercase tracking-[0.08em] ${emphasis ? "text-brand" : "text-ink"}`}>
+        {title} · {items?.length ?? 0}
+      </h3>
+      {note && <p className="mt-1.5 text-xs text-dim">{note}</p>}
+      <ul className="mt-3 max-h-48 overflow-y-auto">
         {(items || []).map((f: any, i: number) => (
-          <li key={i} className="text-xs text-slate-300 border-t border-slate-700 pt-1">
+          <li key={i} className="border-t border-light-line py-1.5 text-[0.82rem]">
             {f.description || f.finding_type}
           </li>
         ))}
-        {(!items || items.length === 0) && <li className="text-xs text-slate-500">None</li>}
+        {(!items || items.length === 0) && <li className="text-[0.82rem] text-dim">None</li>}
       </ul>
     </div>
   );

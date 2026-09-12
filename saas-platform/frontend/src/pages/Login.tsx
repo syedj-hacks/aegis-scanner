@@ -1,6 +1,9 @@
 import { FormEvent, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 
+import AuthShell, { FormError } from "../components/AuthShell";
+import PasswordInput from "../components/PasswordInput";
+import { errorMessage } from "../lib/api";
 import { useAuth } from "../lib/auth";
 
 export default function Login() {
@@ -18,42 +21,56 @@ export default function Login() {
     try {
       await login(email, password);
       navigate("/dashboard");
-    } catch (err: any) {
-      setError(err?.response?.data?.detail || "Login failed");
+    } catch (err) {
+      setError(errorMessage(err, "Sign in failed"));
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-slate-950">
-      <form onSubmit={onSubmit} className="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4">
-        <h1 className="text-xl font-bold text-cyan-400">🛡 Aegis Shield</h1>
-        <p className="text-sm text-slate-400">Sign in to run and manage scans.</p>
-        {error && <p className="text-sm text-red-400">{error}</p>}
-        <input
-          type="email" required placeholder="Email" value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          className="w-full rounded-md bg-slate-800 border border-slate-700 px-3 py-2 text-sm"
-        />
-        <input
-          type="password" required placeholder="Password" value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          className="w-full rounded-md bg-slate-800 border border-slate-700 px-3 py-2 text-sm"
-        />
-        <button disabled={loading} className="w-full rounded-md bg-cyan-600 hover:bg-cyan-500 py-2 text-sm font-medium disabled:opacity-50">
-          {loading ? "Signing in..." : "Sign in"}
-        </button>
-        <p className="text-sm text-slate-400">
-          No account? <Link to="/register" className="text-cyan-400">Register</Link>
-        </p>
-        <div className="text-xs text-slate-500 border-t border-slate-800 pt-3">
-          Demo accounts (seeded via seed_demo_users.py):
-          <br />free@demo.aegis / DemoFree123!
-          <br />pro@demo.aegis / DemoPro123!
-          <br />enterprise@demo.aegis / DemoEnterprise123!
+    <AuthShell
+      eyebrow="Sign in"
+      title="Welcome back."
+      aside={
+        <Link to="/register" className="text-sm text-dim-dark transition-colors hover:text-brand">
+          Create account
+        </Link>
+      }
+    >
+      <form onSubmit={onSubmit} className="space-y-5">
+        <FormError message={error} />
+        <div>
+          <label htmlFor="login-email" className="field-label-dark">Work email</label>
+          <input
+            id="login-email"
+            type="email"
+            required
+            autoComplete="email"
+            placeholder="you@company.com"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            className="input-dark"
+          />
         </div>
+        <PasswordInput
+          dark
+          label="Password"
+          required
+          autoComplete="current-password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+        />
+        <button disabled={loading} className="btn-primary w-full">
+          {loading ? "Signing in…" : "Sign in"}
+        </button>
+        <p className="border-t border-dark-line pt-5 text-sm text-dim-dark">
+          New to Aegis Shield?{" "}
+          <Link to="/register" className="font-semibold text-on-dark hover:text-brand">
+            Create an account
+          </Link>
+        </p>
       </form>
-    </div>
+    </AuthShell>
   );
 }

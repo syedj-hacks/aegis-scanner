@@ -4,6 +4,7 @@ import Layout from "./components/Layout";
 import AdminPanel from "./pages/AdminPanel";
 import Billing from "./pages/Billing";
 import Dashboard from "./pages/Dashboard";
+import Landing from "./pages/Landing";
 import Login from "./pages/Login";
 import Profiles from "./pages/Profiles";
 import Register from "./pages/Register";
@@ -26,6 +27,7 @@ function RequireAdmin({ children }: { children: JSX.Element }) {
 export default function App() {
   return (
     <Routes>
+      <Route path="/" element={<Landing />} />
       <Route path="/login" element={<Login />} />
       <Route path="/register" element={<Register />} />
       <Route
@@ -48,7 +50,7 @@ export default function App() {
           }
         />
       </Route>
-      <Route path="*" element={<Navigate to="/dashboard" replace />} />
+      <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );
 }

@@ -1,42 +1,48 @@
-import { NavLink, Outlet } from "react-router-dom";
+import { NavLink, Outlet, useNavigate } from "react-router-dom";
 
 import { useAuth } from "../lib/auth";
+import Brand from "./Brand";
+import Footer from "./Footer";
 
 export default function Layout() {
   const { email, role, logout } = useAuth();
+  const navigate = useNavigate();
 
   const linkClass = ({ isActive }: { isActive: boolean }) =>
-    `px-3 py-2 rounded-md text-sm font-medium ${
-      isActive ? "bg-cyan-600 text-white" : "text-slate-300 hover:bg-slate-800"
+    `-mb-px border-b-2 py-5 text-[0.85rem] transition-colors ${
+      isActive ? "border-brand text-on-dark" : "border-transparent text-dim-dark hover:text-on-dark"
     }`;
 
+  const signOut = () => {
+    logout();
+    navigate("/login");
+  };
+
   return (
-    <div className="min-h-screen flex flex-col">
-      <header className="border-b border-slate-800 bg-slate-900">
-        <div className="max-w-6xl mx-auto flex items-center justify-between px-4 py-3">
-          <div className="flex items-center gap-2">
-            <span className="text-cyan-400 font-bold text-lg">🛡 Aegis Shield</span>
+    <div className="flex min-h-screen flex-col">
+      <header className="sticky top-0 z-20 border-b border-dark-line bg-dark/[0.92] text-on-dark backdrop-blur-[6px]">
+        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-x-8 px-5 sm:px-8">
+          <div className="py-4">
+            <Brand to="/dashboard" />
           </div>
-          <nav className="flex items-center gap-1">
+          <nav className="order-3 flex w-full gap-7 overflow-x-auto sm:order-none sm:w-auto">
             <NavLink to="/dashboard" className={linkClass}>Dashboard</NavLink>
-            <NavLink to="/profiles" className={linkClass}>Scan</NavLink>
+            <NavLink to="/profiles" className={linkClass}>New scan</NavLink>
             <NavLink to="/billing" className={linkClass}>Billing</NavLink>
             {role === "admin" && <NavLink to="/admin" className={linkClass}>Admin</NavLink>}
           </nav>
-          <div className="flex items-center gap-3 text-sm">
-            <span className="text-slate-400">{email}</span>
-            <button
-              onClick={logout}
-              className="px-3 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200"
-            >
-              Log out
+          <div className="flex items-center gap-4 py-3">
+            <span className="hidden max-w-[22ch] truncate font-mono text-xs text-dim-dark md:inline">{email}</span>
+            <button onClick={signOut} className="btn-outline-dark btn-sm">
+              Sign out
             </button>
           </div>
         </div>
       </header>
-      <main className="flex-1 max-w-6xl w-full mx-auto px-4 py-6">
+      <main className="flex-1 bg-light">
         <Outlet />
       </main>
+      <Footer />
     </div>
   );
 }

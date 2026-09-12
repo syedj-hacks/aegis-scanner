@@ -1,9 +1,12 @@
-from fastapi import FastAPI
+import os
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func
 
 from . import aegis_bridge, models  # noqa: F401  (import order: chdir/sys.path happens here)
-from .config import CORS_ORIGINS
+from .config import CORS_ORIGINS, FRONTEND_DIST
 from .database import Base, SessionLocal, engine
 from .routers import admin, auth, billing, scans
 
@@ -16,6 +19,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+
+@app.middleware("http")
+async def allow_private_network(request: Request, call_next):
+    # Chrome's Private Network Access preflight: the hosted HTTPS frontend
+    # calling a backend on the visitor's own machine must be explicitly
+    # permitted, or the browser drops the request before CORS is evaluated.
+    response = await call_next(request)
+    if request.headers.get("access-control-request-private-network") == "true":
+        response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
+
 
 app.include_router(auth.router)
 app.include_router(billing.router)
@@ -53,3 +69,10 @@ def on_startup():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# Mounted last so every API route above wins; only unmatched paths fall
+# through to the React build. The app uses hash routing, so no SPA fallback
+# rewrite is needed.
+if os.path.isfile(os.path.join(FRONTEND_DIST, "index.html")):
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")

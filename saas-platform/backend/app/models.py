@@ -77,9 +77,11 @@ class Payment(Base):
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    amount = Column(Integer, nullable=False)  # cents, mock ledger only
+    amount = Column(Integer, nullable=False)  # cents
     tier = Column(Enum(Tier, name="tier"), nullable=False)
-    simulated_method = Column(String(64), default="manual/demo")
+    # Column name kept for migration compatibility; holds the billing method
+    # ("invoice", "manual", "plan change").
+    simulated_method = Column(String(64), default="invoice")
     status = Column(Enum(PaymentStatus, name="paymentstatus"), default=PaymentStatus.paid, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     note = Column(String(255), nullable=True)  # e.g. "admin override"

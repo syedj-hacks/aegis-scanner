@@ -29,6 +29,21 @@ AEGIS_PROFILE_NAMES = {
     "recon": "recon",
 }
 
+# Monthly list price in cents, shown on invoices in the billing ledger.
+PRICE_CENTS = {
+    Tier.free: 0,
+    Tier.pro: 1999,
+    Tier.enterprise: 4999,
+}
+
+# Ordering used to tell an upgrade (needs admin approval) from a downgrade
+# (applied immediately, since it only removes capabilities).
+TIER_RANK = {
+    Tier.free: 0,
+    Tier.pro: 1,
+    Tier.enterprise: 2,
+}
+
 # None => unlimited
 SCANS_PER_MONTH = {
     Tier.free: 10,

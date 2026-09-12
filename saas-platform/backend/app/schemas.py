@@ -31,6 +31,8 @@ class SubscriptionOut(BaseModel):
     scans_used_this_period: int
     scans_limit: Optional[int]
     period_start_date: datetime
+    # Tier of an upgrade request still awaiting admin approval, if any.
+    pending_tier: Optional[Tier] = None
 
     class Config:
         from_attributes = True
@@ -49,8 +51,18 @@ class PaymentOut(BaseModel):
         from_attributes = True
 
 
-class SimulateUpgradeRequest(BaseModel):
+class PlanChangeRequest(BaseModel):
     tier: Tier
+
+
+class UpgradeRequestOut(BaseModel):
+    id: int
+    user_id: int
+    email: str
+    current_tier: Tier
+    requested_tier: Tier
+    amount: int
+    created_at: datetime
 
 
 class ProfileInfo(BaseModel):

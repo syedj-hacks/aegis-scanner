@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from .. import aegis_bridge, models, schemas
+from .. import aegis_bridge, models, schemas, tiers
 from ..config import AEGIS_OUTPUT_DIR
 from ..database import get_db
 from ..deps import require_admin
@@ -102,13 +102,69 @@ def set_user_tier(
             user_id=user.id,
             amount=0,
             tier=body.tier,
-            simulated_method="admin/demo",
+            simulated_method="manual",
             status=models.PaymentStatus.paid,
-            note="admin override",
+            note="Plan set by administrator",
         )
     )
     _log_action(db, admin, "set_tier", user.id, f"{old_tier.value} -> {body.tier.value}")
     db.commit()
+    return {"ok": True}
+
+
+@router.get("/upgrade-requests", response_model=list[schemas.UpgradeRequestOut])
+def list_upgrade_requests(admin: models.User = Depends(require_admin), db: Session = Depends(get_db)):
+    pending = (
+        db.query(models.Payment)
+        .filter(models.Payment.status == models.PaymentStatus.pending)
+        .order_by(models.Payment.created_at.asc())
+        .all()
+    )
+    return [
+        schemas.UpgradeRequestOut(
+            id=p.id,
+            user_id=p.user_id,
+            email=p.user.email,
+            current_tier=p.user.subscription.tier,
+            requested_tier=p.tier,
+            amount=p.amount,
+            created_at=p.created_at,
+        )
+        for p in pending
+    ]
+
+
+def _pending_request_or_404(db: Session, request_id: int) -> models.Payment:
+    payment = db.query(models.Payment).get(request_id)
+    if payment is None or payment.status != models.PaymentStatus.pending:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Upgrade request not found or already handled")
+    return payment
+
+
+@router.post("/upgrade-requests/{request_id}/approve")
+def approve_upgrade_request(
+    request_id: int, admin: models.User = Depends(require_admin), db: Session = Depends(get_db)
+):
+    payment = _pending_request_or_404(db, request_id)
+    sub = payment.user.subscription
+    old_tier = sub.tier
+    sub.tier = payment.tier
+    sub.scans_used_this_period = 0
+    payment.status = models.PaymentStatus.paid
+    payment.amount = tiers.PRICE_CENTS[payment.tier]
+    payment.note = "Approved"
+    _log_action(db, admin, "approve_upgrade", payment.user_id, f"{old_tier.value} -> {payment.tier.value}")
+    return {"ok": True}
+
+
+@router.post("/upgrade-requests/{request_id}/reject")
+def reject_upgrade_request(
+    request_id: int, admin: models.User = Depends(require_admin), db: Session = Depends(get_db)
+):
+    payment = _pending_request_or_404(db, request_id)
+    payment.status = models.PaymentStatus.failed
+    payment.note = "Declined"
+    _log_action(db, admin, "reject_upgrade", payment.user_id, f"requested {payment.tier.value}")
     return {"ok": True}
 
 
