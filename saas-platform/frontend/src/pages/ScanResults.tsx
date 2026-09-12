@@ -9,6 +9,8 @@ interface Finding {
   id: number;
   port: number | null;
   service: string | null;
+  product?: string | null;
+  version?: string | null;
   severity: string | null;
   description: string | null;
   finding_type: string | null;
@@ -102,15 +104,13 @@ export default function ScanResults() {
     try {
       const res = await api.get(`/scans/jobs/${job.id}/report`, { params: { fmt }, responseType: "blob" });
       const blob = fmt === "json" ? new Blob([await res.data.text()], { type: "application/json" }) : res.data;
+      // Always saved as a file, never opened in a tab: a blob: URL inherits this
+      // app's origin, and report HTML embeds text taken from the scanned target.
       const url = URL.createObjectURL(blob);
-      if (fmt === "html") {
-        window.open(url, "_blank", "noopener");
-      } else {
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `${job.target}_${job.profile}.${fmt}`;
-        a.click();
-      }
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${job.target}_${job.profile}.${fmt}`;
+      a.click();
       setTimeout(() => URL.revokeObjectURL(url), 60_000);
     } catch (err: any) {
       let message = errorMessage(err, "Download failed");
@@ -229,9 +229,12 @@ export default function ScanResults() {
                       <tr key={f.id}>
                         <td><Severity level={f.severity} /></td>
                         <td className="font-mono text-[0.82rem]">{f.port ?? "—"}</td>
-                        <td className="whitespace-nowrap text-dim">{f.finding_type}</td>
+                        <td className="whitespace-nowrap text-dim">{f.finding_type?.replace(/_/g, " ")}</td>
                         <td className="min-w-[18rem] max-w-xl">
-                          {f.description}
+                          {f.description ||
+                            // Service-inventory records carry no description, only what's listening.
+                            [[f.product, f.version].filter(Boolean).join(" "), f.service].filter(Boolean).join(" · ") ||
+                            "—"}
                           {f.remediation && <div className="mt-1.5 text-[0.82rem] text-dim">Fix: {f.remediation}</div>}
                         </td>
                         <td className="whitespace-nowrap font-mono text-[0.82rem]">{f.cve_id || "—"}</td>

@@ -39,7 +39,7 @@ def _run_scan_job(job_id: int, auth_header: str, auth_cookie: str):
     off the event loop automatically), so this blocking call into Aegis never
     stalls other requests. A dedicated Celery worker is the production-grade
     version of this queue; BackgroundTasks is used here to keep the student
-    project's setup to one process — see SETUP.md for the tradeoff.
+    project's setup to one process — see docs/ARCHITECTURE.md for the tradeoff.
 
     Opens its own DB session because the request-scoped session used to
     create the job is already closed by the time this runs.

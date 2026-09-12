@@ -1,6 +1,12 @@
 # Aegis Scanner
 Kali Linux vulnerability assessment framework — 
 
+> ## Aegis Shield — the web platform
+> This repository also contains **Aegis Shield**, a subscription-based web app built on this engine.
+> **Start it with one click:** double-click `Start Aegis Shield.bat` on Windows, or run
+> `./start-aegis-shield.sh` on Linux. Python 3.10+ is the only requirement.
+> Full documentation: **[saas-platform/README.md](saas-platform/README.md)**
+
 ## Setup
 ```bash
 git clone https://github.com/syedj-hacks/aegis-scanner.git
