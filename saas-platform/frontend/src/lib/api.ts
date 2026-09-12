@@ -20,7 +20,7 @@ api.interceptors.response.use(
       localStorage.removeItem("aegis_token");
       localStorage.removeItem("aegis_role");
       localStorage.removeItem("aegis_email");
-      window.location.href = "/login";
+      window.location.hash = "#/login";
     }
     return Promise.reject(err);
   }

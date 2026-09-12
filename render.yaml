@@ -1,5 +1,14 @@
-# Render Blueprint for Aegis Shield (Aegis Scanner's SaaS wrapper).
+# Render Blueprint for the Aegis Shield BACKEND + database.
 # Deploy: Render dashboard -> New -> Blueprint -> point at this repo.
+#
+# The FRONTEND is NOT here -- it deploys to GitHub Pages via
+# .github/workflows/deploy-pages.yml. This blueprint provisions only the
+# FastAPI backend and its Postgres database, which GitHub Pages cannot run.
+#
+# After the backend's URL is known, do two things:
+#   1. Set the repo Actions variable VITE_API_BASE to that URL so the Pages
+#      frontend talks to it (Settings -> Secrets and variables -> Actions).
+#   2. Confirm CORS_ORIGINS below matches your GitHub Pages origin.
 #
 # ADMIN_PASSWORD and JWT_SECRET are marked sync:false (generateValue for
 # JWT_SECRET) so they are never written into this file or git history --
@@ -33,18 +42,4 @@ services:
       - key: ADMIN_PASSWORD
         sync: false
       - key: CORS_ORIGINS
-        value: https://aegis-shield.onrender.com
-
-  - type: web
-    name: aegis-shield-frontend
-    runtime: static
-    rootDir: saas-platform/frontend
-    buildCommand: npm install && npm run build
-    staticPublishPath: dist
-    envVars:
-      - key: VITE_API_BASE
-        value: https://aegis-shield-backend.onrender.com
-    routes:
-      - type: rewrite
-        source: /*
-        destination: /index.html
+        value: https://syedj-hacks.github.io

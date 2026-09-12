@@ -1,0 +1,53 @@
+name: Deploy frontend to GitHub Pages
+
+# Builds the React frontend (saas-platform/frontend) and publishes it to
+# GitHub Pages. The backend is NOT deployed here (Pages serves static files
+# only) -- host it separately (see render.yaml) and point VITE_API_BASE at it.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "saas-platform/frontend/**"
+      - ".github/workflows/deploy-pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install and build
+        working-directory: saas-platform/frontend
+        env:
+          # URL of the deployed backend (Render, etc). Set this as a repo
+          # variable: Settings -> Secrets and variables -> Actions -> Variables.
+          # Until it is set the site loads but every API call fails.
+          VITE_API_BASE: ${{ vars.VITE_API_BASE }}
+        run: |
+          npm install
+          npm run build
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: saas-platform/frontend/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
