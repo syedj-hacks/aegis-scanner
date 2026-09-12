@@ -7,17 +7,23 @@ Create Date: 2026-09-13
 """
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 revision = "0001"
 down_revision = None
 branch_labels = None
 depends_on = None
 
-role_enum = sa.Enum("user", "admin", name="role")
-tier_enum = sa.Enum("free", "pro", "enterprise", name="tier")
-substatus_enum = sa.Enum("active", "cancelled", "expired", name="substatus")
-paymentstatus_enum = sa.Enum("paid", "pending", "failed", name="paymentstatus")
-jobstatus_enum = sa.Enum("queued", "running", "done", "failed", name="jobstatus")
+# postgresql.ENUM (not generic sa.Enum) so create_type=False is honored: the
+# types are created once, explicitly, in upgrade() below via .create(checkfirst
+# =True). With generic sa.Enum the flag is ignored and op.create_table re-emits
+# CREATE TYPE for every enum column, failing with "type already exists" on a
+# fresh database (and emitting it repeatedly for types shared across tables).
+role_enum = postgresql.ENUM("user", "admin", name="role", create_type=False)
+tier_enum = postgresql.ENUM("free", "pro", "enterprise", name="tier", create_type=False)
+substatus_enum = postgresql.ENUM("active", "cancelled", "expired", name="substatus", create_type=False)
+paymentstatus_enum = postgresql.ENUM("paid", "pending", "failed", name="paymentstatus", create_type=False)
+jobstatus_enum = postgresql.ENUM("queued", "running", "done", "failed", name="jobstatus", create_type=False)
 
 
 def upgrade():

@@ -13,3 +13,8 @@ venv/
 !tests/fixtures/*.json
 hydra.restore
 database/enrich_cache/
+# The *.json rule above must not swallow the frontend's build manifests —
+# without them the GitHub Pages build has no package.json and fails.
+!saas-platform/frontend/package.json
+!saas-platform/frontend/package-lock.json
+!saas-platform/frontend/tsconfig*.json
