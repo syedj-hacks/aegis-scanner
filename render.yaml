@@ -1,0 +1,50 @@
+# Render Blueprint for Aegis Shield (Aegis Scanner's SaaS wrapper).
+# Deploy: Render dashboard -> New -> Blueprint -> point at this repo.
+#
+# ADMIN_PASSWORD and JWT_SECRET are marked sync:false (generateValue for
+# JWT_SECRET) so they are never written into this file or git history --
+# Render prompts for/creates them at blueprint-apply time.
+databases:
+  - name: aegis-shield-db
+    plan: free
+    databaseName: aegis_saas
+    user: aegis_saas
+
+services:
+  - type: web
+    name: aegis-shield-backend
+    runtime: docker
+    dockerfilePath: ./saas-platform/backend/Dockerfile
+    dockerContext: .
+    plan: starter
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: aegis-shield-db
+          property: connectionString
+      - key: AEGIS_REPO_PATH
+        value: /app
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRE_MINUTES
+        value: "1440"
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: CORS_ORIGINS
+        value: https://aegis-shield.onrender.com
+
+  - type: web
+    name: aegis-shield-frontend
+    runtime: static
+    rootDir: saas-platform/frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_BASE
+        value: https://aegis-shield-backend.onrender.com
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html

@@ -43,7 +43,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip python3-venv \
         nmap nikto gobuster whatweb nuclei sslyze \
-        sqlmap hydra dnsutils \
+        sqlmap hydra dnsutils wpscan enum4linux \
         libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 \
         libcairo2 libffi-dev \
         ca-certificates \
